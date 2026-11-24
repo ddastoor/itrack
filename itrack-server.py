@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 """
-itrack-server.py — Local-First File-Locked Issue Tracker, iQL Engine & Offline SPA Server.
-
-Architectural Laws:
-  - Law 1: Strict 3-File Repository Root (requirements.txt, itrack.py, itrack-server.py).
-  - Law 2: Git-Root Check enforced before touching disk or binding sockets.
-  - Canonical truth lives in JSON files under <repo_root>/itrack-issues/ protected by fcntl.flock,
-    paired with a rebuildable hybrid SQLite3 + FTS5 index at .runtime/index.db.
+itrack-server.py — Local-First Folder-Per-Issue Tracker, Self-Healing SQLite/FTS5 Index,
+iQL Engine & Air-Gapped Offline Web UI Daemon.
 """
 
 from __future__ import annotations
@@ -27,82 +22,129 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import uvicorn
-from fastapi import BackgroundTasks, Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
-PRIORITY_RANKS: Dict[str, int] = {
-    "none": 0,
-    "low": 1,
-    "medium": 2,
-    "high": 3,
-    "urgent": 4,
-    "critical": 4,
-}
+# ============================================================================
+# Section 1: Canonical Enums, Ranks & Constants
+# ============================================================================
 
-DEFAULT_STATUSES: List[str] = [
-    "backlog",
-    "todo",
-    "in_progress",
-    "in_review",
-    "blocked",
-    "done",
-    "canceled",
+CATEGORIES: List[str] = [
+    "epic",
+    "story",
+    "task",
+    "subtask",
+    "bug",
+    "feature",
+    "improvement",
+    "refactor",
+    "spike",
+    "incident",
+    "security",
+    "chore",
+    "docs",
 ]
 
-DEFAULT_TRANSITIONS: Dict[str, List[str]] = {
-    "backlog": ["todo", "in_progress", "blocked", "done", "canceled"],
-    "todo": ["backlog", "in_progress", "in_review", "blocked", "done", "canceled"],
-    "in_progress": ["backlog", "todo", "in_review", "blocked", "done", "canceled"],
-    "in_review": ["todo", "in_progress", "blocked", "done", "canceled"],
-    "blocked": ["backlog", "todo", "in_progress", "in_review", "done", "canceled"],
-    "done": ["backlog", "todo", "in_progress"],
-    "canceled": ["backlog", "todo"],
+STATES: List[str] = [
+    "triage",
+    "backlog",
+    "todo",
+    "ready",
+    "in-progress",
+    "in-review",
+    "in-qa",
+    "on-hold",
+    "blocked",
+    "done",
+    "cancelled",
+    "archived",
+]
+
+PRIORITIES: List[str] = ["critical", "high", "medium", "low", "trivial"]
+PRIORITY_RANKS: Dict[str, int] = {
+    "critical": 5,
+    "high": 4,
+    "medium": 3,
+    "low": 2,
+    "trivial": 1,
 }
 
-DEFAULT_PRIORITIES: List[str] = ["none", "low", "medium", "high", "urgent"]
-DEFAULT_ISSUE_TYPES: List[str] = ["epic", "story", "task", "bug", "subtask", "spike"]
+SEVERITIES: List[str] = ["sev1", "sev2", "sev3", "sev4", "sev5"]
+SEVERITY_RANKS: Dict[str, int] = {
+    "sev1": 5,
+    "sev2": 4,
+    "sev3": 3,
+    "sev4": 2,
+    "sev5": 1,
+}
+
+RESOLUTIONS: List[str] = [
+    "fixed",
+    "wont-fix",
+    "duplicate",
+    "cannot-reproduce",
+    "by-design",
+    "obsolete",
+]
+
+LINK_TYPES: List[str] = [
+    "blocks",
+    "blocked-by",
+    "relates-to",
+    "duplicates",
+    "parent-of",
+    "clones",
+]
 
 INVERSE_LINK_TYPES: Dict[str, str] = {
-    "blocks": "blocked_by",
-    "blocked_by": "blocks",
-    "duplicates": "duplicated_by",
-    "duplicated_by": "duplicates",
-    "relates_to": "relates_to",
-    "clones": "cloned_from",
-    "cloned_from": "clones",
+    "blocks": "blocked-by",
+    "blocked-by": "blocks",
+    "relates-to": "relates-to",
+    "duplicates": "duplicated-by",
+    "duplicated-by": "duplicates",
+    "parent-of": "child-of",
+    "child-of": "parent-of",
+    "clones": "cloned-from",
+    "cloned-from": "clones",
 }
 
-LINK_TYPE_ALIASES: Dict[str, str] = {
-    "blocks": "blocks",
-    "block": "blocks",
-    "blocked_by": "blocked_by",
-    "blocked-by": "blocked_by",
-    "is_blocked_by": "blocked_by",
-    "duplicates": "duplicates",
-    "duplicate": "duplicates",
-    "duplicated_by": "duplicated_by",
-    "duplicated-by": "duplicated_by",
-    "relates_to": "relates_to",
-    "relates-to": "relates_to",
-    "relates": "relates_to",
-    "clones": "clones",
-    "cloned_from": "cloned_from",
-    "cloned-from": "cloned_from",
+PRESET_TABS: List[str] = [
+    "active",
+    "open",
+    "in-progress",
+    "blocked",
+    "completed",
+    "cancelled",
+    "archived",
+    "all",
+]
+
+SWIMLANES: List[str] = ["none", "category", "priority", "assignee", "sprint"]
+
+TERMINAL_STATES: Set[str] = {"done", "cancelled", "archived"}
+
+GITIGNORE_CONTENT = ".runtime/\nindex.sqlite*\n*.tmp\n"
+
+IMAGE_EXTENSIONS: Set[str] = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico"}
+TEXT_PREVIEW_EXTENSIONS: Set[str] = {
+    ".txt", ".log", ".md", ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".svg", ".xml", ".csv", ".sql",
+    ".sh", ".bash", ".diff", ".patch", ".env", ".rst",
 }
 
 
 # ============================================================================
-# Utility & Law 2 Helpers
+# Section 2: Normalization, Validation & Pre-Flight Helpers
 # ============================================================================
 
 def now_iso() -> str:
@@ -117,68 +159,216 @@ def short_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
-def normalize_priority(val: Optional[str], default: str = "medium") -> Tuple[str, int]:
-    raw = (val or default).strip().lower()
-    if raw == "critical":
-        raw = "urgent"
+def _hyphenate(raw: str) -> str:
+    s = raw.strip().lower().replace("_", "-")
+    return re.sub(r"\s+", "-", s)
+
+
+def normalize_category(val: Optional[str], default: Optional[str] = None) -> str:
+    raw = _hyphenate(val if val is not None else (default or "task"))
+    if raw not in CATEGORIES:
+        raise ValueError(f"Invalid category '{val}'. Allowed: {', '.join(CATEGORIES)}.")
+    return raw
+
+
+def normalize_state(val: Optional[str], default: Optional[str] = None) -> str:
+    raw = _hyphenate(val if val is not None else (default or "backlog"))
+    if raw == "canceled":
+        raw = "cancelled"
+    if raw not in STATES:
+        raise ValueError(f"Invalid state '{val}'. Allowed: {', '.join(STATES)}.")
+    return raw
+
+
+def normalize_priority(val: Optional[str], default: Optional[str] = None) -> Tuple[str, int]:
+    raw = _hyphenate(val if val is not None else (default or "medium"))
     if raw not in PRIORITY_RANKS:
-        raise ValueError(
-            f"Invalid priority '{val}'. Expected one of: {', '.join(DEFAULT_PRIORITIES)} (or 'critical')."
-        )
+        raise ValueError(f"Invalid priority '{val}'. Allowed: {', '.join(PRIORITIES)}.")
     return raw, PRIORITY_RANKS[raw]
 
 
-def normalize_link_type(raw: str) -> str:
-    cleaned = (raw or "").strip().lower()
-    if cleaned not in LINK_TYPE_ALIASES:
-        raise ValueError(
-            f"Invalid link_type '{raw}'. Expected one of: {', '.join(sorted(INVERSE_LINK_TYPES.keys()))}."
-        )
-    return LINK_TYPE_ALIASES[cleaned]
+def normalize_severity(val: Optional[str], default: Optional[str] = None) -> Tuple[str, int]:
+    raw = _hyphenate(val if val is not None else (default or "sev3"))
+    if raw not in SEVERITY_RANKS:
+        raise ValueError(f"Invalid severity '{val}'. Allowed: {', '.join(SEVERITIES)}.")
+    return raw, SEVERITY_RANKS[raw]
 
 
-def parse_duration_minutes(minutes: Optional[int], duration: Optional[str]) -> int:
-    if minutes is not None:
-        if int(minutes) <= 0:
-            raise ValueError("Worklog minutes must be positive.")
-        return int(minutes)
-    if not duration or not str(duration).strip():
-        raise ValueError("Provide either 'minutes' or 'duration' (e.g. '1h 30m').")
+def normalize_resolution(val: Optional[Any]) -> Optional[str]:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s or s.lower() in ("none", "null", "unset", "clear"):
+        return None
+    norm = _hyphenate(s)
+    if norm == "wontfix":
+        norm = "wont-fix"
+    if norm not in RESOLUTIONS:
+        raise ValueError(f"Invalid resolution '{val}'. Allowed: {', '.join(RESOLUTIONS)}.")
+    return norm
+
+
+def normalize_link_type(val: Optional[str]) -> str:
+    if not val or not str(val).strip():
+        raise ValueError(f"Link type is required. Allowed: {', '.join(LINK_TYPES)}.")
+    norm = _hyphenate(str(val))
+    if norm not in LINK_TYPES:
+        raise ValueError(f"Invalid link type '{val}'. Allowed: {', '.join(LINK_TYPES)}.")
+    return norm
+
+
+def normalize_tab(val: Optional[str]) -> str:
+    if not val or not str(val).strip():
+        return "all"
+    norm = _hyphenate(str(val))
+    if norm == "canceled":
+        norm = "cancelled"
+    if norm not in PRESET_TABS:
+        raise ValueError(f"Invalid tab '{val}'. Allowed: {', '.join(PRESET_TABS)}.")
+    return norm
+
+
+def normalize_swimlane(val: Optional[str]) -> str:
+    if not val or not str(val).strip():
+        return "none"
+    norm = _hyphenate(str(val))
+    if norm not in SWIMLANES:
+        raise ValueError(f"Invalid swimlane '{val}'. Allowed: {', '.join(SWIMLANES)}.")
+    return norm
+
+
+def validate_issue_name(raw_name: Any) -> str:
+    if raw_name is None or not isinstance(raw_name, str):
+        raise ValueError("Issue name is required.")
+    name = raw_name.strip()
+    if not name:
+        raise ValueError("Issue name cannot be empty.")
+    if len(name) > 180:
+        raise ValueError("Issue name must be at most 180 characters.")
+    if name in (".", "..") or ".." in name:
+        raise ValueError("Issue name cannot contain '..' path traversal sequences.")
+    if "/" in name or "\\" in name or "\x00" in name:
+        raise ValueError("Issue name cannot contain path separators ('/' or '\\') or null bytes.")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        raise ValueError("Issue name cannot contain control characters.")
+    if name.startswith(".rename_tmp_"):
+        raise ValueError("Issue name uses reserved prefix.")
+    return name
+
+
+def validate_calendar_date(val: Any, field_name: str = "date") -> Optional[str]:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s or s.lower() in ("none", "null", "clear", ""):
+        return None
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        raise ValueError(f"Invalid {field_name} '{val}'. Expected YYYY-MM-DD.")
+    try:
+        dt.date.fromisoformat(s)
+    except ValueError as exc:
+        raise ValueError(f"Invalid calendar {field_name} '{val}': {exc}") from exc
+    return s
+
+
+def validate_story_points(val: Any) -> Optional[float]:
+    if val is None or (isinstance(val, str) and val.strip().lower() in ("", "none", "null", "clear")):
+        return None
+    try:
+        num = float(val)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid story_points '{val}'. Must be a non-negative number.") from exc
+    if num < 0 or num != num or num in (float("inf"), float("-inf")):
+        raise ValueError(f"story_points must be >= 0 (got {val}).")
+    return round(num, 2)
+
+
+def validate_estimate_minutes(val: Any) -> Optional[int]:
+    if val is None or (isinstance(val, str) and val.strip().lower() in ("", "none", "null", "clear")):
+        return None
+    if isinstance(val, str) and re.search(r"[wdhm]", val.lower()):
+        mins = parse_duration_minutes(None, val)
+        return mins
+    try:
+        fv = float(val)
+        if not fv.is_integer():
+            raise ValueError("estimate_minutes must be an integer.")
+        iv = int(fv)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid estimate_minutes '{val}'. Must be a non-negative integer.") from exc
+    if iv < 0:
+        raise ValueError(f"estimate_minutes must be >= 0 (got {val}).")
+    return iv
+
+
+def parse_duration_minutes(minutes: Optional[Any], duration: Optional[Any]) -> int:
+    if minutes is not None and str(minutes).strip() != "":
+        try:
+            m_int = int(float(minutes))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid worklog minutes '{minutes}'.") from exc
+        if m_int <= 0:
+            raise ValueError("Worklog minutes must be > 0.")
+        return m_int
+    if duration is None or not str(duration).strip():
+        raise ValueError("Provide positive 'minutes' or 'duration' (e.g. '1h 30m', '45m', '90').")
     s = str(duration).strip().lower()
-    if re.fullmatch(r"\d+", s):
+    if re.fullmatch(r"[+-]?\d+", s):
         val = int(s)
         if val <= 0:
-            raise ValueError("Worklog duration must be positive.")
+            raise ValueError("Worklog duration must be > 0.")
         return val
     tokens = re.findall(r"(\d+(?:\.\d+)?)\s*([wdhm])", s)
     if not tokens:
-        raise ValueError(f"Cannot parse duration '{duration}'. Expected format like '1h 30m', '2d', '45m', or '90'.")
-    reconstructed = "".join(f"{num}{unit}" for num, unit in tokens)
-    stripped_s = re.sub(r"\s+", "", s)
-    if reconstructed != stripped_s:
-        # Double-check float preservation
-        check = re.sub(r"(\d+(?:\.\d+)?)\s*([wdhm])", "", s).strip()
-        if check:
-            raise ValueError(f"Invalid trailing text '{check}' in duration '{duration}'.")
+        raise ValueError(f"Invalid duration '{duration}'. Expected e.g. '1h 30m', '2d', '45m', or '90'.")
+    rem = re.sub(r"(\d+(?:\.\d+)?)\s*([wdhm])", "", s).strip()
+    if rem:
+        raise ValueError(f"Unexpected text '{rem}' in duration '{duration}'.")
     mult = {"w": 5 * 8 * 60, "d": 8 * 60, "h": 60, "m": 1}
-    total = int(round(sum(float(num) * mult[unit] for num, unit in tokens)))
+    total = int(round(sum(float(num) * mult[u] for num, u in tokens)))
     if total <= 0:
         raise ValueError("Worklog duration must be > 0 minutes.")
     return total
 
 
-def sanitize_filename(name: Optional[str]) -> str:
-    base = Path(name or "attachment.bin").name
-    cleaned = re.sub(r"[^A-Za-z0-9._ -]", "_", base).strip(" .")
-    if not cleaned:
-        cleaned = "attachment.bin"
-    return cleaned[:180]
+def sanitize_filename(raw_name: Optional[str]) -> Tuple[str, str]:
+    """Returns (display_filename, safe_stored_suffix) preserving spaces safely."""
+    raw = (raw_name or "attachment.bin").replace("\\", "/").split("/")[-1]
+    raw = "".join(ch for ch in raw if ord(ch) >= 32 and ch not in ('\x00', '/', '\\'))
+    display_name = raw.strip() or "attachment.bin"
+    if display_name in (".", ".."):
+        display_name = "attachment.bin"
+    display_name = display_name[:160]
+    safe_suffix = re.sub(r"[^A-Za-z0-9._ ()\[\]+-]", "_", display_name).strip(" .")
+    if not safe_suffix or ".." in safe_suffix:
+        safe_suffix = "attachment.bin"
+    return display_name, safe_suffix[:160]
+
+
+def is_image_file(filename: str, mime_type: str) -> bool:
+    if mime_type and mime_type.lower().startswith("image/"):
+        return True
+    ext = Path(filename).suffix.lower()
+    return ext in IMAGE_EXTENSIONS
+
+
+def is_text_previewable(filename: str, mime_type: str) -> bool:
+    m = (mime_type or "").lower()
+    if m.startswith("text/") or m in (
+        "application/json",
+        "application/javascript",
+        "application/xml",
+        "image/svg+xml",
+        "application/x-yaml",
+    ):
+        return True
+    return Path(filename).suffix.lower() in TEXT_PREVIEW_EXTENSIONS
 
 
 def detect_default_user(repo_root: Path) -> str:
-    env_user = os.environ.get("ITRACK_USER")
-    if env_user and env_user.strip():
-        return env_user.strip()
+    env_u = os.environ.get("ITRACK_USER")
+    if env_u and env_u.strip():
+        return env_u.strip()
     try:
         proc = subprocess.run(
             ["git", "-C", str(repo_root), "config", "user.name"],
@@ -190,46 +380,196 @@ def detect_default_user(repo_root: Path) -> str:
             return proc.stdout.strip()
     except Exception:
         pass
-    return os.environ.get("USER") or "system"
+    return os.environ.get("USER") or "user"
 
 
-def resolve_repo_root(cli_root: Optional[str]) -> Path:
+def resolve_raw_root_arg(cli_root: Optional[str]) -> Path:
     if cli_root:
-        return Path(cli_root).expanduser().resolve()
+        return Path(cli_root).expanduser()
     env_root = os.environ.get("ITRACK_ROOT")
     if env_root:
-        return Path(env_root).expanduser().resolve()
-    return Path.cwd().resolve()
+        return Path(env_root).expanduser()
+    return Path.cwd()
 
 
-def enforce_law2_git_root(repo_root: Path) -> None:
-    """Law 2: Verify .git exists in repo_root BEFORE creating any directories or files."""
-    if (repo_root / ".git").exists():
-        return
+def check_and_resolve_git_root(raw_path: Path) -> Path:
+    """
+    Law 2: Accept a Git root directory, a Git worktree root (.git file), or a symlink
+    pointing directly to a Git root. Reject non-Git dirs and Git subdirectories with exit code 2.
+    """
+    try:
+        abs_raw = raw_path if raw_path.is_absolute() else (Path.cwd() / raw_path)
+    except Exception:
+        abs_raw = raw_path
+
+    has_git_direct = False
+    has_git_resolved = False
+    try:
+        has_git_direct = (abs_raw / ".git").exists()
+    except Exception:
+        has_git_direct = False
+    try:
+        resolved = abs_raw.resolve()
+        has_git_resolved = (resolved / ".git").exists()
+    except Exception:
+        resolved = abs_raw
+        has_git_resolved = False
+
+    if has_git_direct or has_git_resolved:
+        return resolved
+
     msg = (
-        f"Error [Law 2 - Git-Root Check]: '{repo_root}' is not a Git repository root "
-        f"(.git not found). Run from the root of a Git repository."
+        f"Error [Law 2 - Git-Root Check]: '{raw_path}' is not a Git repository root "
+        f"(.git directory or worktree file not found at target root)."
     )
     try:
-        if repo_root.exists():
+        if resolved.exists():
             proc = subprocess.run(
-                ["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"],
+                ["git", "-C", str(resolved), "rev-parse", "--show-toplevel"],
                 capture_output=True,
                 text=True,
                 timeout=1.5,
             )
             if proc.returncode == 0 and proc.stdout.strip():
                 top = Path(proc.stdout.strip()).resolve()
-                if top != repo_root:
-                    msg += f"\nHint: cd {top}"
+                if top != resolved:
+                    msg += f"\nHint: Run from repository root '{top}' (not a subdirectory)."
     except Exception:
         pass
     print(msg, file=sys.stderr, flush=True)
     sys.exit(2)
 
 
+def default_config_dict(prefix: str = "ITR", title: str = "iTrack Workspace") -> Dict[str, Any]:
+    clean_prefix = re.sub(r"[^A-Z0-9]", "", (prefix or "ITR").strip().upper()) or "ITR"
+    if not clean_prefix[0].isalpha():
+        clean_prefix = "ITR"
+    clean_title = (title or "iTrack Workspace").strip() or "iTrack Workspace"
+    ts = now_iso()
+    return {
+        "project_prefix": clean_prefix,
+        "project_title": clean_title,
+        "default_state": "backlog",
+        "default_priority": "medium",
+        "default_category": "task",
+        "default_severity": "sev3",
+        "default_assignee": None,
+        "wip_limits": {},
+        "preferences": {
+            "theme": "dark",
+            "page_size": 25,
+            "default_swimlane": "none",
+        },
+        "next_issue_seq": 1,
+        "next_att_seq": 1,
+        "next_comment_seq": 1,
+        "next_link_seq": 1,
+        "next_worklog_seq": 1,
+        "next_history_seq": 1,
+        "next_sprint_seq": 1,
+        "next_milestone_seq": 1,
+        "next_view_seq": 1,
+        "created_at": ts,
+        "updated_at": ts,
+    }
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{threading.get_ident()}.{short_id()}.tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+    os.replace(tmp, path)
+
+
+def _atomic_write_json_standalone(path: Path, obj: Any) -> None:
+    payload = (json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+    _atomic_write_bytes(path, payload)
+
+
+def init_workspace_on_disk(
+    repo_root: Path,
+    prefix: str = "ITR",
+    title: str = "iTrack Workspace",
+) -> Dict[str, Any]:
+    """Idempotently initialize <repo_root>/itrack-issues/ layout and build index.sqlite."""
+    issues_root = repo_root / "itrack-issues"
+    runtime_dir = issues_root / ".runtime"
+    issues_dir = issues_root / "issues"
+    for d in (issues_root, runtime_dir, issues_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    lock_path = runtime_dir / "storage.lock"
+    with open(lock_path, "a+", encoding="utf-8") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            gitignore_path = issues_root / ".gitignore"
+            if not gitignore_path.exists() or gitignore_path.read_text(encoding="utf-8", errors="ignore") != GITIGNORE_CONTENT:
+                _atomic_write_bytes(gitignore_path, GITIGNORE_CONTENT.encode("utf-8"))
+
+            cfg_path = issues_root / "config.json"
+            already_existed = cfg_path.exists()
+            if not already_existed:
+                cfg = default_config_dict(prefix=prefix, title=title)
+                _atomic_write_json_standalone(cfg_path, cfg)
+            else:
+                with open(cfg_path, "r", encoding="utf-8") as cf:
+                    cfg = json.load(cf)
+                changed = False
+                defaults = default_config_dict(prefix=cfg.get("project_prefix", prefix), title=cfg.get("project_title", title))
+                for k, v in defaults.items():
+                    if k not in cfg:
+                        cfg[k] = v
+                        changed = True
+                if changed:
+                    _atomic_write_json_standalone(cfg_path, cfg)
+
+            for fname, root_key in (
+                ("tags.json", "tags"),
+                ("sprints.json", "sprints"),
+                ("milestones.json", "milestones"),
+                ("views.json", "views"),
+            ):
+                fpath = issues_root / fname
+                if not fpath.exists():
+                    _atomic_write_json_standalone(fpath, {root_key: []})
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+    engine = StorageEngine(repo_root)
+    engine.reindex()
+    engine.close()
+    return {
+        "initialized": True,
+        "already_initialized": already_existed,
+        "repo_root": str(repo_root),
+        "issues_root": str(issues_root),
+        "config": cfg,
+    }
+
+
+def record_surface_event(event: Dict[str, Any]) -> None:
+    log_path = os.environ.get("ITRACK_SURFACE_LOG")
+    if not log_path:
+        return
+    try:
+        p = Path(log_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(event, sort_keys=True) + "\n"
+        with open(p, "a", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(line)
+                f.flush()
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+
+
 # ============================================================================
-# Recursive-Descent iQL Engine (Lexer -> AST -> Validator -> SQLite/FTS5)
+# Section 3: Recursive-Descent iQL Engine (Lexer -> AST -> SQLite + FTS5)
 # ============================================================================
 
 class IQLError(Exception):
@@ -248,118 +588,95 @@ class Token:
         self.pos = pos
         self.quoted = quoted
 
-    def __repr__(self) -> str:
-        return f"Token({self.kind!r}, {self.value!r}, pos={self.pos})"
-
 
 IQL_KEYWORDS: Set[str] = {
-    "AND",
-    "OR",
-    "NOT",
-    "IN",
-    "IS",
-    "EMPTY",
-    "NULL",
-    "ORDER",
-    "BY",
-    "ASC",
-    "DESC",
-    "LIMIT",
-    "OFFSET",
+    "AND", "OR", "NOT", "IN", "IS", "EMPTY", "NULL", "ORDER", "BY", "ASC", "DESC",
 }
 
 FIELD_ALIASES: Dict[str, str] = {
     "key": "key",
     "id": "key",
-    "type": "type",
-    "issuetype": "type",
-    "issue_type": "type",
-    "status": "status",
-    "state": "status",
+    "seq": "seq",
+    "name": "name",
+    "title": "name",
+    "summary": "name",
+    "category": "category",
+    "type": "category",
+    "state": "state",
+    "status": "state",
     "priority": "priority",
+    "severity": "severity",
+    "resolution": "resolution",
     "assignee": "assignee",
     "owner": "assignee",
     "reporter": "reporter",
     "creator": "reporter",
-    "claimed_by": "claimed_by",
-    "epic": "epic_id",
-    "epic_id": "epic_id",
-    "parent": "parent_id",
-    "parent_id": "parent_id",
-    "sprint": "sprint_id",
-    "sprint_id": "sprint_id",
-    "milestone": "milestone_id",
-    "milestone_id": "milestone_id",
-    "release": "milestone_id",
-    "label": "labels",
-    "labels": "labels",
-    "tag": "labels",
-    "tags": "labels",
+    "tag": "tags",
+    "tags": "tags",
+    "label": "tags",
+    "labels": "tags",
     "component": "components",
     "components": "components",
+    "parent": "parent",
+    "epic": "parent",
+    "sprint": "sprint",
+    "milestone": "milestone",
     "points": "story_points",
     "story_points": "story_points",
-    "estimate": "story_points",
-    "title": "title",
-    "summary": "title",
-    "description": "description",
-    "body": "description",
-    "comment": "comments",
-    "comments": "comments",
-    "text": "text",
-    "q": "text",
+    "estimate": "estimate_minutes",
+    "estimate_minutes": "estimate_minutes",
+    "logged": "logged_minutes",
+    "logged_minutes": "logged_minutes",
+    "due": "due_date",
+    "due_date": "due_date",
     "created": "created_at",
     "created_at": "created_at",
     "updated": "updated_at",
     "updated_at": "updated_at",
-    "due": "due_date",
-    "due_date": "due_date",
-    "resolved": "resolved_at",
-    "resolved_at": "resolved_at",
-    "started": "started_at",
-    "started_at": "started_at",
-    "closed": "closed_at",
-    "closed_at": "closed_at",
+    "archived": "archived",
     "blocked": "is_blocked",
     "is_blocked": "is_blocked",
-    "resolution": "resolution",
-    "environment": "environment",
-    "seq": "seq",
+    "overdue": "is_overdue",
+    "is_overdue": "is_overdue",
+    "description": "description",
+    "body": "description",
+    "ac": "ac_text",
+    "acceptance_criteria": "ac_text",
+    "comment": "comments_text",
+    "comments": "comments_text",
+    "attachment": "attachments_text",
+    "attachments": "attachments_text",
+    "text": "text",
+    "q": "text",
 }
 
 ORDER_SQL_MAP: Dict[str, str] = {
     "key": "issues.seq",
     "seq": "issues.seq",
-    "type": "issues.type",
-    "status": "issues.status",
+    "name": "LOWER(issues.name)",
+    "category": "issues.category",
+    "state": "issues.state",
     "priority": "issues.priority_rank",
-    "assignee": "issues.assignee",
-    "reporter": "issues.reporter",
-    "claimed_by": "issues.claimed_by",
-    "epic_id": "issues.epic_id",
-    "parent_id": "issues.parent_id",
-    "sprint_id": "issues.sprint_id",
-    "milestone_id": "issues.milestone_id",
+    "severity": "issues.severity_rank",
+    "resolution": "issues.resolution",
+    "assignee": "LOWER(issues.assignee)",
+    "reporter": "LOWER(issues.reporter)",
+    "parent": "issues.parent",
+    "sprint": "issues.sprint",
+    "milestone": "issues.milestone",
     "story_points": "issues.story_points",
-    "title": "LOWER(issues.title)",
+    "estimate_minutes": "issues.estimate_minutes",
+    "logged_minutes": "issues.logged_minutes",
+    "due_date": "issues.due_date",
     "created_at": "issues.created_at",
     "updated_at": "issues.updated_at",
-    "due_date": "issues.due_date",
-    "resolved_at": "issues.resolved_at",
-    "started_at": "issues.started_at",
-    "closed_at": "issues.closed_at",
-    "resolution": "issues.resolution",
 }
 
 
 class IQLLexer:
-    WORD_START = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@+-.")
-    WORD_CONT = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@+.:/-")
-
     def __init__(self, text: str) -> None:
         self.text = text
         self.n = len(text)
-        self.pos = 0
 
     def tokenize(self) -> List[Token]:
         tokens: List[Token] = []
@@ -371,14 +688,11 @@ class IQLLexer:
             if ch in " \t\r\n":
                 i += 1
                 continue
-            # Two-char operators
             two = s[i : i + 2]
             if two in ("!=", ">=", "<=", "!~", "<>"):
-                op_val = "!=" if two == "<>" else two
-                tokens.append(Token("OP", op_val, i))
+                tokens.append(Token("OP", "!=" if two == "<>" else two, i))
                 i += 2
                 continue
-            # Single-char operators & punctuation
             if ch in ("=", ">", "<", "~"):
                 tokens.append(Token("OP", ch, i))
                 i += 1
@@ -395,7 +709,6 @@ class IQLLexer:
                 tokens.append(Token("COMMA", ch, i))
                 i += 1
                 continue
-            # Quoted string
             if ch in ('"', "'"):
                 quote = ch
                 start = i
@@ -406,8 +719,8 @@ class IQLLexer:
                     c = s[i]
                     if c == "\\" and i + 1 < n:
                         nxt = s[i + 1]
-                        esc_map = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"', "'": "'"}
-                        buf.append(esc_map.get(nxt, nxt))
+                        esc = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"', "'": "'"}
+                        buf.append(esc.get(nxt, nxt))
                         i += 2
                         continue
                     if c == quote:
@@ -417,25 +730,84 @@ class IQLLexer:
                     buf.append(c)
                     i += 1
                 if not closed:
-                    raise IQLError(f"Unterminated string literal starting at position {start}", start)
+                    raise IQLError(f"Unterminated string literal at position {start}", start)
                 tokens.append(Token("STRING", "".join(buf), start, quoted=True))
                 continue
-            # Word / identifier / number / relative date / @me
-            if ch in self.WORD_START:
+            if ch.isalnum() or ch in "_@+-.:#":
                 start = i
                 i += 1
-                while i < n and s[i] in self.WORD_CONT:
+                while i < n and (s[i].isalnum() or s[i] in "_@+.:/#-"):
                     i += 1
                 word = s[start:i]
-                upper = word.upper()
-                if upper in IQL_KEYWORDS:
-                    tokens.append(Token("KW", upper, start))
+                up = word.upper()
+                if up in IQL_KEYWORDS:
+                    tokens.append(Token("KW", up, start))
                 else:
                     tokens.append(Token("WORD", word, start))
                 continue
             raise IQLError(f"Unexpected character '{ch}' at position {i}", i)
         tokens.append(Token("EOF", "", n))
         return tokens
+
+
+def resolve_iql_date(raw: str, date_only: bool = False, pos: Optional[int] = None) -> str:
+    s = raw.strip()
+    low = s.lower()
+    now = dt.datetime.now(dt.timezone.utc)
+    if low == "now":
+        return now.strftime("%Y-%m-%d") if date_only else now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if low == "today":
+        return now.strftime("%Y-%m-%d") if date_only else now.strftime("%Y-%m-%dT00:00:00Z")
+    if low == "yesterday":
+        d = now - dt.timedelta(days=1)
+        return d.strftime("%Y-%m-%d") if date_only else d.strftime("%Y-%m-%dT00:00:00Z")
+    if low == "tomorrow":
+        d = now + dt.timedelta(days=1)
+        return d.strftime("%Y-%m-%d") if date_only else d.strftime("%Y-%m-%dT00:00:00Z")
+    m = re.fullmatch(r"([+-]?\d+(?:\.\d+)?)\s*([mhdw])", low)
+    if m:
+        amt = float(m.group(1))
+        unit = m.group(2)
+        delta = {
+            "m": dt.timedelta(minutes=amt),
+            "h": dt.timedelta(hours=amt),
+            "d": dt.timedelta(days=amt),
+            "w": dt.timedelta(weeks=amt),
+        }[unit]
+        t = now + delta
+        return t.strftime("%Y-%m-%d") if date_only else t.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        try:
+            dt.date.fromisoformat(s)
+        except ValueError as exc:
+            raise IQLError(f"Invalid calendar date '{raw}'", pos) from exc
+        return s if date_only else f"{s}T00:00:00Z"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?", s):
+        return s[:10] if date_only else s.replace(" ", "T")
+    raise IQLError(f"Invalid date expression '{raw}'", pos)
+
+
+def build_fts_match_expr(raw: str, column: Optional[str] = None) -> Optional[str]:
+    if not raw or not raw.strip():
+        return None
+    phrases: List[str] = []
+    for pm in re.finditer(r'"([^"]+)"', raw):
+        inner = pm.group(1).strip()
+        if any(c.isalnum() for c in inner):
+            safe = inner.replace('"', '""')
+            phrases.append(f'"{safe}"')
+    rem = re.sub(r'"[^"]+"', " ", raw)
+    for tok in rem.split():
+        sub_tokens = re.findall(r"[A-Za-z0-9_\u0080-\uffff]+(?:-[A-Za-z0-9_\u0080-\uffff]+)*", tok)
+        for st in sub_tokens:
+            safe_st = st.replace('"', '""')
+            phrases.append(f'"{safe_st}"*')
+    if not phrases:
+        return None
+    joined = " AND ".join(phrases)
+    if column:
+        return f"{column} : ({joined})"
+    return joined
 
 
 class IQLParser:
@@ -453,685 +825,404 @@ class IQLParser:
     def consume(self, kind: Optional[str] = None, val: Optional[str] = None) -> Token:
         t = self.cur()
         if kind and t.kind != kind:
-            raise IQLError(f"Expected {kind} but got '{t.value or t.kind}' at position {t.pos}", t.pos)
+            raise IQLError(f"Expected {kind} but got '{t.value or t.kind}' at pos {t.pos}", t.pos)
         if val and t.value != val:
-            raise IQLError(f"Expected '{val}' but got '{t.value}' at position {t.pos}", t.pos)
+            raise IQLError(f"Expected '{val}' but got '{t.value}' at pos {t.pos}", t.pos)
         self.idx += 1
         return t
-
-    def parse(self) -> Dict[str, Any]:
-        where_expr: Optional[Dict[str, Any]] = None
-        order_by: List[Dict[str, str]] = []
-        limit_val: Optional[int] = None
-        offset_val: Optional[int] = None
-
-        if self.cur().kind != "EOF" and not self.peek_kw("ORDER") and not self.peek_kw("LIMIT") and not self.peek_kw("OFFSET"):
-            where_expr = self.parse_or()
-
-        if self.peek_kw("ORDER"):
-            self.consume("KW", "ORDER")
-            if not self.peek_kw("BY"):
-                t = self.cur()
-                raise IQLError(f"Expected 'BY' after 'ORDER' at position {t.pos}", t.pos)
-            self.consume("KW", "BY")
-            order_by.append(self.parse_order_item())
-            while self.cur().kind == "COMMA":
-                self.consume("COMMA")
-                order_by.append(self.parse_order_item())
-
-        if self.peek_kw("LIMIT"):
-            self.consume("KW", "LIMIT")
-            num_tok = self.cur()
-            if num_tok.kind not in ("WORD", "STRING") or not re.fullmatch(r"\d+", num_tok.value):
-                raise IQLError(f"Expected non-negative integer after LIMIT at position {num_tok.pos}", num_tok.pos)
-            self.idx += 1
-            limit_val = int(num_tok.value)
-
-        if self.peek_kw("OFFSET"):
-            self.consume("KW", "OFFSET")
-            num_tok = self.cur()
-            if num_tok.kind not in ("WORD", "STRING") or not re.fullmatch(r"\d+", num_tok.value):
-                raise IQLError(f"Expected non-negative integer after OFFSET at position {num_tok.pos}", num_tok.pos)
-            self.idx += 1
-            offset_val = int(num_tok.value)
-
-        if self.cur().kind != "EOF":
-            t = self.cur()
-            raise IQLError(f"Unexpected token '{t.value}' at position {t.pos}", t.pos)
-
-        return {
-            "type": "query",
-            "where": where_expr,
-            "order_by": order_by,
-            "limit": limit_val,
-            "offset": offset_val,
-        }
-
-    def parse_order_item(self) -> Dict[str, str]:
-        tok = self.cur()
-        if tok.kind not in ("WORD", "KW", "STRING") or not tok.value:
-            raise IQLError(f"Expected field name in ORDER BY at position {tok.pos}", tok.pos)
-        self.idx += 1
-        canonical = self._resolve_field(tok.value, tok.pos)
-        if canonical not in ORDER_SQL_MAP:
-            raise IQLError(f"Field '{tok.value}' cannot be used in ORDER BY at position {tok.pos}", tok.pos)
-        direction = "ASC"
-        if self.peek_kw("ASC"):
-            self.consume("KW", "ASC")
-            direction = "ASC"
-        elif self.peek_kw("DESC"):
-            self.consume("KW", "DESC")
-            direction = "DESC"
-        return {"field": canonical, "raw_field": tok.value, "direction": direction}
-
-    def parse_or(self) -> Dict[str, Any]:
-        left = self.parse_and()
-        children = [left]
-        while self.peek_kw("OR"):
-            self.consume("KW", "OR")
-            children.append(self.parse_and())
-        if len(children) == 1:
-            return children[0]
-        return {"type": "or", "children": children}
-
-    def parse_and(self) -> Dict[str, Any]:
-        left = self.parse_not()
-        children = [left]
-        while self.peek_kw("AND"):
-            self.consume("KW", "AND")
-            children.append(self.parse_not())
-        if len(children) == 1:
-            return children[0]
-        return {"type": "and", "children": children}
-
-    def parse_not(self) -> Dict[str, Any]:
-        if self.peek_kw("NOT"):
-            self.consume("KW", "NOT")
-            child = self.parse_not()
-            return {"type": "not", "child": child}
-        if self.cur().kind == "LPAREN":
-            lparen = self.consume("LPAREN")
-            if self.cur().kind == "RPAREN":
-                raise IQLError(f"Empty parentheses at position {lparen.pos}", lparen.pos)
-            expr = self.parse_or()
-            if self.cur().kind != "RPAREN":
-                t = self.cur()
-                raise IQLError(f"Expected closing ')' at position {t.pos}", t.pos)
-            self.consume("RPAREN")
-            return expr
-        return self.parse_predicate()
 
     def _resolve_field(self, raw_field: str, pos: int) -> str:
         low = raw_field.lower()
         if low in FIELD_ALIASES:
             return FIELD_ALIASES[low]
-        if low.startswith("cf.") or low.startswith("custom."):
-            sub = raw_field.split(".", 1)[1]
+        if low.startswith("cf.") or low.startswith("custom.") or low.startswith("custom_fields."):
+            sub = raw_field.split(".", 1)[1].strip()
             if not sub:
-                raise IQLError(f"Invalid custom field '{raw_field}' at position {pos}", pos)
+                raise IQLError(f"Invalid custom field '{raw_field}' at pos {pos}", pos)
             return f"custom.{sub}"
-        raise IQLError(f"Unknown field '{raw_field}' at position {pos}", pos)
+        raise IQLError(f"Unknown iQL field '{raw_field}' at pos {pos}", pos)
 
-    def _parse_value_token(self) -> Tuple[Any, int]:
+    def parse(self) -> Dict[str, Any]:
+        where_expr: Optional[Dict[str, Any]] = None
+        order_by: List[Dict[str, str]] = []
+        if self.cur().kind != "EOF" and not self.peek_kw("ORDER"):
+            where_expr = self.parse_or()
+        if self.peek_kw("ORDER"):
+            self.consume("KW", "ORDER")
+            self.consume("KW", "BY")
+            order_by.append(self.parse_order_item())
+            while self.cur().kind == "COMMA":
+                self.consume("COMMA")
+                order_by.append(self.parse_order_item())
+        if self.cur().kind != "EOF":
+            t = self.cur()
+            raise IQLError(f"Unexpected token '{t.value}' at pos {t.pos}", t.pos)
+        return {"where": where_expr, "order_by": order_by}
+
+    def parse_order_item(self) -> Dict[str, str]:
+        tok = self.cur()
+        if tok.kind not in ("WORD", "KW", "STRING") or not tok.value:
+            raise IQLError(f"Expected field in ORDER BY at pos {tok.pos}", tok.pos)
+        self.idx += 1
+        canonical = self._resolve_field(tok.value, tok.pos)
+        if canonical not in ORDER_SQL_MAP:
+            raise IQLError(f"Field '{tok.value}' is not sortable in ORDER BY", tok.pos)
+        direction = "ASC"
+        if self.peek_kw("ASC"):
+            self.consume("KW", "ASC")
+        elif self.peek_kw("DESC"):
+            self.consume("KW", "DESC")
+            direction = "DESC"
+        return {"field": canonical, "direction": direction}
+
+    def parse_or(self) -> Dict[str, Any]:
+        items = [self.parse_and()]
+        while self.peek_kw("OR"):
+            self.consume("KW", "OR")
+            items.append(self.parse_and())
+        return items[0] if len(items) == 1 else {"type": "or", "children": items}
+
+    def parse_and(self) -> Dict[str, Any]:
+        items = [self.parse_not()]
+        while self.peek_kw("AND"):
+            self.consume("KW", "AND")
+            items.append(self.parse_not())
+        return items[0] if len(items) == 1 else {"type": "and", "children": items}
+
+    def parse_not(self) -> Dict[str, Any]:
+        if self.peek_kw("NOT"):
+            self.consume("KW", "NOT")
+            return {"type": "not", "child": self.parse_not()}
+        if self.cur().kind == "LPAREN":
+            lp = self.consume("LPAREN")
+            if self.cur().kind == "RPAREN":
+                raise IQLError(f"Empty parentheses at pos {lp.pos}", lp.pos)
+            expr = self.parse_or()
+            self.consume("RPAREN")
+            return expr
+        return self.parse_predicate()
+
+    def _parse_val(self) -> Tuple[str, int]:
         t = self.cur()
-        if t.kind == "STRING":
+        if t.kind in ("STRING", "WORD") or (t.kind == "KW" and t.value in ("EMPTY", "NULL")):
             self.idx += 1
             return t.value, t.pos
-        if t.kind == "WORD":
-            self.idx += 1
-            return t.value, t.pos
-        if t.kind == "KW" and t.value in ("EMPTY", "NULL"):
-            self.idx += 1
-            return t.value, t.pos
-        raise IQLError(f"Expected value at position {t.pos}, got '{t.value or t.kind}'", t.pos)
+        raise IQLError(f"Expected value at pos {t.pos}, got '{t.value or t.kind}'", t.pos)
+
+    def _validate_val(self, field: str, op: str, val: str, pos: int) -> None:
+        if field == "category":
+            try:
+                normalize_category(val)
+            except ValueError as e:
+                raise IQLError(str(e), pos) from e
+        elif field == "state":
+            try:
+                normalize_state(val)
+            except ValueError as e:
+                raise IQLError(str(e), pos) from e
+        elif field == "priority":
+            if val.lower() not in PRIORITY_RANKS and not re.fullmatch(r"[1-5]", val):
+                raise IQLError(f"Invalid priority '{val}' in iQL", pos)
+        elif field == "severity":
+            if val.lower() not in SEVERITY_RANKS and not re.fullmatch(r"[1-5]", val):
+                raise IQLError(f"Invalid severity '{val}' in iQL", pos)
+        elif field == "resolution":
+            if val.lower() not in ("none", "null") and _hyphenate(val) not in RESOLUTIONS:
+                raise IQLError(f"Invalid resolution '{val}' in iQL", pos)
+        elif field in ("story_points", "estimate_minutes", "logged_minutes", "seq"):
+            try:
+                float(val)
+            except ValueError as e:
+                raise IQLError(f"Numeric value required for '{field}', got '{val}'", pos) from e
+        elif field in ("is_blocked", "is_overdue", "archived"):
+            if val.lower() not in ("true", "false", "1", "0", "yes", "no"):
+                raise IQLError(f"Boolean value required for '{field}', got '{val}'", pos)
+        elif field in ("due_date", "created_at", "updated_at"):
+            resolve_iql_date(val, date_only=(field == "due_date"), pos=pos)
 
     def parse_predicate(self) -> Dict[str, Any]:
         ftok = self.cur()
         if ftok.kind not in ("WORD", "STRING"):
-            raise IQLError(f"Expected field name at position {ftok.pos}, got '{ftok.value or ftok.kind}'", ftok.pos)
+            raise IQLError(f"Expected field name at pos {ftok.pos}", ftok.pos)
         self.idx += 1
         canonical = self._resolve_field(ftok.value, ftok.pos)
 
-        # IS [NOT] (EMPTY | NULL)
         if self.peek_kw("IS"):
-            is_tok = self.consume("KW", "IS")
-            negated = False
+            self.consume("KW", "IS")
+            neg = False
             if self.peek_kw("NOT"):
                 self.consume("KW", "NOT")
-                negated = True
+                neg = True
             t = self.cur()
             if t.kind == "KW" and t.value in ("EMPTY", "NULL"):
                 self.idx += 1
-                if canonical == "is_blocked":
-                    raise IQLError(
-                        f"Operator 'IS EMPTY' is not supported for boolean field '{ftok.value}' at position {is_tok.pos}; use '= true' or '= false'.",
-                        is_tok.pos,
-                    )
-                if canonical in ("priority", "seq"):
-                    raise IQLError(
-                        f"Operator 'IS EMPTY' is not supported for required field '{ftok.value}' at position {is_tok.pos}.",
-                        is_tok.pos,
-                    )
-                return {
-                    "type": "empty",
-                    "field": canonical,
-                    "raw_field": ftok.value,
-                    "negated": negated,
-                }
-            raise IQLError(f"Expected EMPTY or NULL after IS at position {t.pos}", t.pos)
+                return {"type": "empty", "field": canonical, "negated": neg}
+            raise IQLError(f"Expected EMPTY or NULL after IS at pos {t.pos}", t.pos)
 
-        # [NOT] IN (...)
         if self.peek_kw("NOT") or self.peek_kw("IN"):
-            op_start = self.cur().pos
-            negated = False
+            neg = False
             if self.peek_kw("NOT"):
                 self.consume("KW", "NOT")
-                negated = True
-            if not self.peek_kw("IN"):
-                t = self.cur()
-                raise IQLError(f"Expected 'IN' after 'NOT' at position {t.pos}", t.pos)
+                neg = True
             self.consume("KW", "IN")
-            if canonical == "is_blocked":
-                raise IQLError(
-                    f"Operator 'IN' is not supported for boolean field '{ftok.value}' at position {op_start}; use '= true' or '= false'.",
-                    op_start,
-                )
             self.consume("LPAREN")
-            values: List[Any] = []
             if self.cur().kind == "RPAREN":
-                t = self.cur()
-                raise IQLError(f"IN list cannot be empty at position {t.pos}", t.pos)
-            v, vpos = self._parse_value_token()
-            self._validate_field_value(canonical, "IN", v, vpos)
-            values.append(v)
+                raise IQLError("IN list cannot be empty", self.cur().pos)
+            vals: List[str] = []
+            v, vp = self._parse_val()
+            self._validate_val(canonical, "IN", v, vp)
+            vals.append(v)
             while self.cur().kind == "COMMA":
                 self.consume("COMMA")
-                v, vpos = self._parse_value_token()
-                self._validate_field_value(canonical, "IN", v, vpos)
-                values.append(v)
+                v, vp = self._parse_val()
+                self._validate_val(canonical, "IN", v, vp)
+                vals.append(v)
             self.consume("RPAREN")
-            return {
-                "type": "in",
-                "field": canonical,
-                "raw_field": ftok.value,
-                "negated": negated,
-                "values": values,
-            }
+            return {"type": "in", "field": canonical, "negated": neg, "values": vals}
 
-        # Standard binary comparison operator
         optok = self.cur()
         if optok.kind != "OP":
-            raise IQLError(
-                f"Expected comparison operator (=, !=, >, >=, <, <=, ~, !~, IN, IS) at position {optok.pos}",
-                optok.pos,
-            )
+            raise IQLError(f"Expected operator at pos {optok.pos}, got '{optok.value or optok.kind}'", optok.pos)
         self.idx += 1
-        val, vpos = self._parse_value_token()
-        self._validate_field_value(canonical, optok.value, val, vpos)
-        return {
-            "type": "cmp",
-            "field": canonical,
-            "raw_field": ftok.value,
-            "op": optok.value,
-            "value": val,
-        }
-
-    def _validate_field_value(self, field: str, op: str, val: Any, pos: int) -> None:
-        sval = str(val)
-        if field == "priority":
-            low = sval.lower()
-            if low not in PRIORITY_RANKS and not re.fullmatch(r"[0-4]", low):
-                raise IQLError(
-                    f"Unknown priority '{sval}' at position {pos}. Expected none, low, medium, high, urgent.",
-                    pos,
-                )
-            if op in ("~", "!~"):
-                raise IQLError(f"Operator '{op}' is not supported for field 'priority' at position {pos}", pos)
-        elif field in ("story_points", "seq"):
-            if op in ("~", "!~"):
-                raise IQLError(f"Operator '{op}' is not supported for numeric field '{field}' at position {pos}", pos)
-            try:
-                float(sval)
-            except ValueError:
-                raise IQLError(f"Expected numeric value for '{field}', got '{sval}' at position {pos}", pos)
-        elif field == "is_blocked":
-            if op not in ("=", "!="):
-                raise IQLError(f"Operator '{op}' is not supported for boolean field 'blocked' at position {pos}", pos)
-            if sval.lower() not in ("true", "false", "1", "0", "yes", "no"):
-                raise IQLError(f"Expected boolean true/false for 'blocked', got '{sval}' at position {pos}", pos)
-        elif field in ("created_at", "updated_at", "due_date", "resolved_at", "started_at", "closed_at"):
-            if op in ("~", "!~"):
-                raise IQLError(f"Operator '{op}' is not supported for date field '{field}' at position {pos}", pos)
-            # Validate date/relative expression
-            resolve_relative_date(sval, date_only=(field == "due_date"), pos=pos)
-        elif field in ("text", "comments", "title", "description", "labels", "components"):
-            if op in (">", ">=", "<", "<="):
-                raise IQLError(f"Operator '{op}' is not supported for field '{field}' at position {pos}", pos)
-        elif field.startswith("custom."):
-            if op in (">", ">=", "<", "<=", "!~"):
-                raise IQLError(f"Operator '{op}' is not supported for custom field '{field}' at position {pos}", pos)
-
-
-def resolve_relative_date(raw: str, date_only: bool = False, pos: Optional[int] = None) -> str:
-    s = raw.strip()
-    low = s.lower()
-    now = dt.datetime.now(dt.timezone.utc)
-    if low == "now":
-        return now.strftime("%Y-%m-%d") if date_only else now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    if low == "today":
-        return now.strftime("%Y-%m-%d") if date_only else now.strftime("%Y-%m-%dT00:00:00Z")
-    if low == "yesterday":
-        target = now - dt.timedelta(days=1)
-        return target.strftime("%Y-%m-%d") if date_only else target.strftime("%Y-%m-%dT00:00:00Z")
-    if low == "tomorrow":
-        target = now + dt.timedelta(days=1)
-        return target.strftime("%Y-%m-%d") if date_only else target.strftime("%Y-%m-%dT00:00:00Z")
-
-    m = re.fullmatch(r"([+-]?\d+(?:\.\d+)?)\s*([mhdw])", low)
-    if m:
-        amt = float(m.group(1))
-        unit = m.group(2)
-        delta_map = {
-            "m": dt.timedelta(minutes=amt),
-            "h": dt.timedelta(hours=amt),
-            "d": dt.timedelta(days=amt),
-            "w": dt.timedelta(weeks=amt),
-        }
-        target = now + delta_map[unit]
-        return target.strftime("%Y-%m-%d") if date_only else target.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
-        return s if date_only else f"{s}T00:00:00Z"
-
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?", s):
-        if date_only:
-            return s[:10]
-        cleaned = s.replace(" ", "T")
-        if not cleaned.endswith("Z") and "+" not in cleaned[10:] and "-" not in cleaned[10:]:
-            cleaned += "Z"
-        return cleaned
-
-    raise IQLError(
-        f"Invalid date/time expression '{raw}'. Expected YYYY-MM-DD, ISO timestamp, 'today', 'now', or relative offset like '-7d', '+3d', '-24h', '-2w'.",
-        pos,
-    )
-
-
-def build_fts_match_expr(raw: str, column: Optional[str] = None) -> Optional[str]:
-    """Build a safe SQLite FTS5 MATCH query from arbitrary user text."""
-    if not raw or not raw.strip():
-        return None
-    phrases: List[str] = []
-    # Extract double-quoted exact phrases first
-    rem = raw
-    for pm in re.finditer(r'"([^"]+)"', raw):
-        inner = pm.group(1).strip()
-        if re.search(r"[A-Za-z0-9]", inner):
-            safe_inner = inner.replace('"', '""')
-            phrases.append(f'"{safe_inner}"')
-    rem = re.sub(r'"[^"]+"', " ", rem)
-    # Extract alphanumeric/hyphen tokens
-    for tok in rem.split():
-        # Split on characters FTS5 treats specially except keep alphanumeric sequences
-        sub_tokens = re.findall(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)*", tok)
-        for st in sub_tokens:
-            safe_st = st.replace('"', '""')
-            phrases.append(f'"{safe_st}"*')
-    if not phrases:
-        return None
-    joined = " AND ".join(phrases)
-    if column:
-        return f"{column} : ({joined})"
-    return joined
+        v, vp = self._parse_val()
+        self._validate_val(canonical, optok.value, v, vp)
+        return {"type": "cmp", "field": canonical, "op": optok.value, "value": v}
 
 
 def parse_iql(iql: str) -> Dict[str, Any]:
-    lexer = IQLLexer(iql or "")
-    tokens = lexer.tokenize()
-    parser = IQLParser(tokens)
-    return parser.parse()
+    tokens = IQLLexer(iql or "").tokenize()
+    return IQLParser(tokens).parse()
 
 
 class IQLCompiler:
     BLOCKED_SQL = """(
-        issues.status = 'blocked'
+        issues.state IN ('blocked', 'on-hold')
         OR EXISTS (
-            SELECT 1 FROM issue_links blk_l
-            JOIN issues blk_i ON (
-                (blk_l.link_type = 'blocks' AND blk_l.target_key = issues.key AND blk_i.key = blk_l.source_key)
-                OR (blk_l.link_type = 'blocked_by' AND blk_l.source_key = issues.key AND blk_i.key = blk_l.target_key)
-            )
-            WHERE blk_i.status NOT IN ('done', 'canceled')
+            SELECT 1 FROM issue_links bl
+            JOIN issues bi ON bi.key = bl.blocker_key
+            WHERE bl.blocked_key = issues.key
+              AND bi.state NOT IN ('done', 'cancelled', 'archived')
         )
     )"""
 
     def __init__(
         self,
-        current_user: str,
-        active_sprint_ids: List[str],
-        sprint_name_to_id: Dict[str, str],
+        current_user: str = "user",
+        sprint_map: Optional[Dict[str, str]] = None,
+        milestone_map: Optional[Dict[str, str]] = None,
+        active_sprint_ids: Optional[List[str]] = None,
     ) -> None:
         self.current_user = current_user
-        self.active_sprint_ids = [s.upper() for s in active_sprint_ids]
-        self.sprint_name_to_id = {k.lower(): v.upper() for k, v in sprint_name_to_id.items()}
+        self.sprint_map = {k.lower(): v for k, v in (sprint_map or {}).items()}
+        self.milestone_map = {k.lower(): v for k, v in (milestone_map or {}).items()}
+        self.active_sprint_ids = list(active_sprint_ids or [])
 
     def compile_where(self, node: Optional[Dict[str, Any]]) -> Tuple[str, List[Any]]:
         if node is None:
             return "1 = 1", []
-        ntype = node["type"]
-        if ntype == "or":
+        nt = node["type"]
+        if nt in ("and", "or"):
+            joiner = " AND " if nt == "and" else " OR "
             parts: List[str] = []
             params: List[Any] = []
             for ch in node["children"]:
                 s, p = self.compile_where(ch)
                 parts.append(f"({s})")
                 params.extend(p)
-            return " OR ".join(parts), params
-        if ntype == "and":
-            parts = []
-            params = []
-            for ch in node["children"]:
-                s, p = self.compile_where(ch)
-                parts.append(f"({s})")
-                params.extend(p)
-            return " AND ".join(parts), params
-        if ntype == "not":
+            return joiner.join(parts), params
+        if nt == "not":
             s, p = self.compile_where(node["child"])
             return f"NOT ({s})", p
-        if ntype == "empty":
+        if nt == "empty":
             return self._compile_empty(node["field"], node["negated"])
-        if ntype == "in":
+        if nt == "in":
             return self._compile_in(node["field"], node["negated"], node["values"])
-        if ntype == "cmp":
+        if nt == "cmp":
             return self._compile_cmp(node["field"], node["op"], node["value"])
-        raise IQLError(f"Unsupported AST node '{ntype}'")
+        raise IQLError(f"Unsupported iQL node '{nt}'")
 
-    def _resolve_user_val(self, val: Any) -> str:
-        s = str(val)
-        if s.lower() == "@me":
-            return self.current_user
-        return s
-
-    def _compile_empty(self, field: str, negated: bool) -> Tuple[str, List[Any]]:
-        if field == "is_blocked":
-            raise IQLError("Operator 'IS EMPTY' is not supported for boolean field 'blocked'; use '= true' or '= false'.")
-        if field == "text":
-            if negated:
-                return (
-                    "((issues.title IS NOT NULL AND issues.title != '') "
-                    "OR (issues.description IS NOT NULL AND issues.description != '') "
-                    "OR (issues.comments_text IS NOT NULL AND issues.comments_text != ''))",
-                    [],
-                )
-            return (
-                "((issues.title IS NULL OR issues.title = '') "
-                "AND (issues.description IS NULL OR issues.description = '') "
-                "AND (issues.comments_text IS NULL OR issues.comments_text = ''))",
-                [],
-            )
-        if field == "labels":
-            op = "EXISTS" if negated else "NOT EXISTS"
-            return f"{op} (SELECT 1 FROM issue_labels il WHERE il.issue_key = issues.key)", []
+    def _compile_empty(self, field: str, neg: bool) -> Tuple[str, List[Any]]:
+        if field == "tags":
+            kw = "EXISTS" if neg else "NOT EXISTS"
+            return f"{kw} (SELECT 1 FROM issue_tags it WHERE it.issue_key = issues.key)", []
         if field == "components":
-            op = "EXISTS" if negated else "NOT EXISTS"
-            return f"{op} (SELECT 1 FROM issue_components ic WHERE ic.issue_key = issues.key)", []
-        if field == "comments":
-            if negated:
-                return "(issues.comments_text IS NOT NULL AND issues.comments_text != '')", []
-            return "(issues.comments_text IS NULL OR issues.comments_text = '')", []
-        if field == "story_points":
-            return ("issues.story_points IS NOT NULL" if negated else "issues.story_points IS NULL"), []
+            kw = "EXISTS" if neg else "NOT EXISTS"
+            return f"{kw} (SELECT 1 FROM issue_components ic WHERE ic.issue_key = issues.key)", []
+        if field in ("story_points", "estimate_minutes"):
+            return (f"issues.{field} IS NOT NULL" if neg else f"issues.{field} IS NULL"), []
+        if field == "logged_minutes":
+            return ("issues.logged_minutes > 0" if neg else "issues.logged_minutes = 0"), []
         if field.startswith("custom."):
-            cf_key = field.split(".", 1)[1]
-            path = f"$.custom_fields.{cf_key}"
-            if negated:
-                return "(json_extract(issues.raw_json, ?) IS NOT NULL AND json_extract(issues.raw_json, ?) != '')", [path, path]
-            return "(json_extract(issues.raw_json, ?) IS NULL OR json_extract(issues.raw_json, ?) = '')", [path, path]
+            cf = field.split(".", 1)[1]
+            p = f"$.{cf}"
+            if neg:
+                return "(json_extract(issues.custom_fields_json, ?) IS NOT NULL AND json_extract(issues.custom_fields_json, ?) != '')", [p, p]
+            return "(json_extract(issues.custom_fields_json, ?) IS NULL OR json_extract(issues.custom_fields_json, ?) = '')", [p, p]
         col = f"issues.{field}"
-        if negated:
+        if neg:
             return f"({col} IS NOT NULL AND {col} != '')", []
         return f"({col} IS NULL OR {col} = '')", []
 
-    def _compile_in(self, field: str, negated: bool, values: List[Any]) -> Tuple[str, List[Any]]:
-        if field == "is_blocked":
-            raise IQLError("Operator 'IN' is not supported for boolean field 'blocked'; use '= true' or '= false'.")
-        if field in ("text", "comments"):
-            sub_clauses: List[str] = []
-            sub_params: List[Any] = []
-            for v in values:
-                sc, sp = self._compile_cmp(field, "~", v)
-                sub_clauses.append(f"({sc})")
-                sub_params.extend(sp)
-            joined = " OR ".join(sub_clauses)
-            return (f"NOT ({joined})" if negated else f"({joined})"), sub_params
-        if field.startswith("custom."):
-            sub_clauses = []
-            sub_params = []
-            for v in values:
-                sc, sp = self._compile_cmp(field, "=", v)
-                sub_clauses.append(f"({sc})")
-                sub_params.extend(sp)
-            joined = " OR ".join(sub_clauses)
-            return (f"NOT ({joined})" if negated else f"({joined})"), sub_params
-        if field in ("created_at", "updated_at", "due_date", "resolved_at", "started_at", "closed_at"):
-            dates = [resolve_relative_date(str(v), date_only=(field == "due_date")) for v in values]
-            placeholders = ", ".join("?" for _ in dates)
-            if negated:
-                return f"(issues.{field} IS NULL OR issues.{field} NOT IN ({placeholders}))", dates
-            return f"issues.{field} IN ({placeholders})", dates
-        if field == "labels":
-            placeholders = ", ".join("LOWER(?)" for _ in values)
-            kw = "NOT EXISTS" if negated else "EXISTS"
-            return (
-                f"{kw} (SELECT 1 FROM issue_labels il WHERE il.issue_key = issues.key AND LOWER(il.label) IN ({placeholders}))",
-                [str(v) for v in values],
-            )
-        if field == "components":
-            placeholders = ", ".join("LOWER(?)" for _ in values)
-            kw = "NOT EXISTS" if negated else "EXISTS"
-            return (
-                f"{kw} (SELECT 1 FROM issue_components ic WHERE ic.issue_key = issues.key AND LOWER(ic.component) IN ({placeholders}))",
-                [str(v) for v in values],
-            )
-        if field == "priority":
-            ranks: List[int] = []
-            for v in values:
-                sv = str(v).lower()
-                ranks.append(int(sv) if re.fullmatch(r"[0-4]", sv) else PRIORITY_RANKS[sv])
-            placeholders = ", ".join("?" for _ in ranks)
-            op = "NOT IN" if negated else "IN"
-            return f"issues.priority_rank {op} ({placeholders})", ranks
-        if field in ("story_points", "seq"):
-            nums = [float(v) for v in values]
-            placeholders = ", ".join("?" for _ in nums)
-            if negated:
-                return f"(issues.{field} IS NULL OR issues.{field} NOT IN ({placeholders}))", nums
-            return f"issues.{field} IN ({placeholders})", nums
-        if field in ("assignee", "reporter", "claimed_by"):
-            resolved = [self._resolve_user_val(v) for v in values]
-            placeholders = ", ".join("LOWER(?)" for _ in resolved)
-            if negated:
-                return f"(issues.{field} IS NULL OR LOWER(issues.{field}) NOT IN ({placeholders}))", resolved
-            return f"LOWER(issues.{field}) IN ({placeholders})", resolved
-        if field == "sprint_id":
-            expanded: List[str] = []
-            for v in values:
-                sv = str(v)
-                if sv.lower() == "active":
-                    expanded.extend(self.active_sprint_ids)
-                elif sv.lower() in self.sprint_name_to_id:
-                    expanded.append(self.sprint_name_to_id[sv.lower()])
-                else:
-                    expanded.append(sv.upper())
-            if not expanded:
-                return ("1 = 1" if negated else "1 = 0"), []
-            placeholders = ", ".join("?" for _ in expanded)
-            if negated:
-                return f"(issues.sprint_id IS NULL OR UPPER(issues.sprint_id) NOT IN ({placeholders}))", expanded
-            return f"UPPER(issues.sprint_id) IN ({placeholders})", expanded
-        # General string columns
-        strs = [str(v) for v in values]
-        placeholders = ", ".join("LOWER(?)" for _ in strs)
-        if negated:
-            return f"(issues.{field} IS NULL OR LOWER(issues.{field}) NOT IN ({placeholders}))", strs
-        return f"LOWER(issues.{field}) IN ({placeholders})", strs
+    def _compile_in(self, field: str, neg: bool, values: List[str]) -> Tuple[str, List[Any]]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        for v in values:
+            op = "~" if field in ("text", "comments_text", "attachments_text", "ac_text") else "="
+            sc, sp = self._compile_cmp(field, op, v)
+            clauses.append(f"({sc})")
+            params.extend(sp)
+        joined = " OR ".join(clauses)
+        return (f"NOT ({joined})" if neg else f"({joined})"), params
 
-    def _compile_cmp(self, field: str, op: str, raw_val: Any) -> Tuple[str, List[Any]]:
+    def _compile_cmp(self, field: str, op: str, raw_val: str) -> Tuple[str, List[Any]]:
         sval = str(raw_val)
-
+        if field == "archived":
+            truthy = sval.lower() in ("true", "1", "yes")
+            if op == "!=":
+                truthy = not truthy
+            return ("(issues.archived = 1 OR issues.state = 'archived')" if truthy else "(issues.archived = 0 AND issues.state != 'archived')"), []
         if field == "is_blocked":
             truthy = sval.lower() in ("true", "1", "yes")
             if op == "!=":
                 truthy = not truthy
-            if truthy:
-                return self.BLOCKED_SQL, []
-            return f"NOT {self.BLOCKED_SQL}", []
-
+            return (self.BLOCKED_SQL if truthy else f"NOT {self.BLOCKED_SQL}"), []
+        if field == "is_overdue":
+            today = today_iso()
+            ov_sql = "(issues.due_date IS NOT NULL AND issues.due_date < ? AND issues.state NOT IN ('done', 'cancelled', 'archived'))"
+            truthy = sval.lower() in ("true", "1", "yes")
+            if op == "!=":
+                truthy = not truthy
+            return (ov_sql if truthy else f"NOT {ov_sql}"), [today]
+        if field == "state":
+            st = normalize_state(sval)
+            if op == "=":
+                return "issues.state = ?", [st]
+            if op == "!=":
+                return "issues.state != ?", [st]
+            if op == "~":
+                return "issues.state LIKE ?", [f"%{st}%"]
+            if op == "!~":
+                return "issues.state NOT LIKE ?", [f"%{st}%"]
+            raise IQLError(f"Operator '{op}' unsupported for state")
+        if field == "category":
+            cat = normalize_category(sval)
+            if op == "=":
+                return "issues.category = ?", [cat]
+            if op == "!=":
+                return "issues.category != ?", [cat]
+            raise IQLError(f"Operator '{op}' unsupported for category")
         if field == "priority":
-            low = sval.lower()
-            rank = int(low) if re.fullmatch(r"[0-4]", low) else PRIORITY_RANKS[low]
+            rank = int(sval) if re.fullmatch(r"[1-5]", sval) else PRIORITY_RANKS[sval.lower()]
             return f"issues.priority_rank {op} ?", [rank]
-
-        if field in ("story_points", "seq"):
+        if field == "severity":
+            rank = int(sval) if re.fullmatch(r"[1-5]", sval) else SEVERITY_RANKS[sval.lower()]
+            return f"issues.severity_rank {op} ?", [rank]
+        if field == "resolution":
+            res = normalize_resolution(sval)
+            if res is None:
+                return ("issues.resolution IS NULL" if op == "=" else "issues.resolution IS NOT NULL"), []
+            return (f"issues.resolution = ?" if op == "=" else "(issues.resolution IS NULL OR issues.resolution != ?)"), [res]
+        if field in ("story_points", "estimate_minutes", "logged_minutes", "seq"):
             num = float(sval)
             if op == "!=":
                 return f"(issues.{field} IS NULL OR issues.{field} != ?)", [num]
             return f"(issues.{field} IS NOT NULL AND issues.{field} {op} ?)", [num]
-
-        if field in ("created_at", "updated_at", "due_date", "resolved_at", "started_at", "closed_at"):
-            resolved_dt = resolve_relative_date(sval, date_only=(field == "due_date"))
+        if field in ("due_date", "created_at", "updated_at"):
+            dt_str = resolve_iql_date(sval, date_only=(field == "due_date"))
             if op == "!=":
-                return f"(issues.{field} IS NULL OR issues.{field} != ?)", [resolved_dt]
-            return f"(issues.{field} IS NOT NULL AND issues.{field} {op} ?)", [resolved_dt]
-
-        if field == "labels":
+                return f"(issues.{field} IS NULL OR issues.{field} != ?)", [dt_str]
+            return f"(issues.{field} IS NOT NULL AND issues.{field} {op} ?)", [dt_str]
+        if field in ("assignee", "reporter"):
+            u = self.current_user if sval.lower() == "@me" else sval
+            if u.lower() in ("unassigned", "none", "null"):
+                return (f"(issues.{field} IS NULL OR issues.{field} = '')" if op == "=" else f"(issues.{field} IS NOT NULL AND issues.{field} != '')"), []
             if op == "=":
-                return "EXISTS (SELECT 1 FROM issue_labels il WHERE il.issue_key = issues.key AND LOWER(il.label) = LOWER(?))", [sval]
+                return f"LOWER(issues.{field}) = LOWER(?)", [u]
             if op == "!=":
-                return "NOT EXISTS (SELECT 1 FROM issue_labels il WHERE il.issue_key = issues.key AND LOWER(il.label) = LOWER(?))", [sval]
+                return f"(issues.{field} IS NULL OR LOWER(issues.{field}) != LOWER(?))", [u]
             if op == "~":
-                return "EXISTS (SELECT 1 FROM issue_labels il WHERE il.issue_key = issues.key AND LOWER(il.label) LIKE LOWER(?))", [f"%{sval}%"]
+                return f"LOWER(issues.{field}) LIKE LOWER(?)", [f"%{u}%"]
             if op == "!~":
-                return "NOT EXISTS (SELECT 1 FROM issue_labels il WHERE il.issue_key = issues.key AND LOWER(il.label) LIKE LOWER(?))", [f"%{sval}%"]
-            raise IQLError(f"Operator '{op}' not supported for 'labels'")
-
+                return f"(issues.{field} IS NULL OR LOWER(issues.{field}) NOT LIKE LOWER(?))", [f"%{u}%"]
+        if field == "tags":
+            if op in ("=", "!="):
+                kw = "EXISTS" if op == "=" else "NOT EXISTS"
+                return f"{kw} (SELECT 1 FROM issue_tags it WHERE it.issue_key = issues.key AND LOWER(it.tag) = LOWER(?))", [sval]
+            if op in ("~", "!~"):
+                kw = "EXISTS" if op == "~" else "NOT EXISTS"
+                return f"{kw} (SELECT 1 FROM issue_tags it WHERE it.issue_key = issues.key AND LOWER(it.tag) LIKE LOWER(?))", [f"%{sval}%"]
         if field == "components":
-            if op == "=":
-                return "EXISTS (SELECT 1 FROM issue_components ic WHERE ic.issue_key = issues.key AND LOWER(ic.component) = LOWER(?))", [sval]
-            if op == "!=":
-                return "NOT EXISTS (SELECT 1 FROM issue_components ic WHERE ic.issue_key = issues.key AND LOWER(ic.component) = LOWER(?))", [sval]
-            if op == "~":
-                return "EXISTS (SELECT 1 FROM issue_components ic WHERE ic.issue_key = issues.key AND LOWER(ic.component) LIKE LOWER(?))", [f"%{sval}%"]
-            if op == "!~":
-                return "NOT EXISTS (SELECT 1 FROM issue_components ic WHERE ic.issue_key = issues.key AND LOWER(ic.component) LIKE LOWER(?))", [f"%{sval}%"]
-            raise IQLError(f"Operator '{op}' not supported for 'components'")
-
-        if field == "sprint_id":
+            if op in ("=", "!="):
+                kw = "EXISTS" if op == "=" else "NOT EXISTS"
+                return f"{kw} (SELECT 1 FROM issue_components ic WHERE ic.issue_key = issues.key AND LOWER(ic.component) = LOWER(?))", [sval]
+            if op in ("~", "!~"):
+                kw = "EXISTS" if op == "~" else "NOT EXISTS"
+                return f"{kw} (SELECT 1 FROM issue_components ic WHERE ic.issue_key = issues.key AND LOWER(ic.component) LIKE LOWER(?))", [f"%{sval}%"]
+        if field == "sprint":
             low = sval.lower()
             if low == "active":
                 if not self.active_sprint_ids:
                     return ("1 = 1" if op == "!=" else "1 = 0"), []
-                placeholders = ", ".join("?" for _ in self.active_sprint_ids)
-                if op == "=":
-                    return f"UPPER(issues.sprint_id) IN ({placeholders})", list(self.active_sprint_ids)
-                if op == "!=":
-                    return f"(issues.sprint_id IS NULL OR UPPER(issues.sprint_id) NOT IN ({placeholders}))", list(self.active_sprint_ids)
-            if low in ("backlog", "none", "unassigned"):
-                if op == "=":
-                    return "(issues.sprint_id IS NULL OR issues.sprint_id = '')", []
-                if op == "!=":
-                    return "(issues.sprint_id IS NOT NULL AND issues.sprint_id != '')", []
-            target_spr = self.sprint_name_to_id.get(low, sval.upper())
-            if op == "=":
-                return "UPPER(issues.sprint_id) = ?", [target_spr]
-            if op == "!=":
-                return "(issues.sprint_id IS NULL OR UPPER(issues.sprint_id) != ?)", [target_spr]
-            if op == "~":
-                return "UPPER(issues.sprint_id) LIKE UPPER(?)", [f"%{sval}%"]
-            raise IQLError(f"Operator '{op}' not supported for 'sprint'")
-
-        if field in ("assignee", "reporter", "claimed_by"):
-            uval = self._resolve_user_val(sval)
-            if field == "assignee" and uval.lower() in ("unassigned", "none"):
-                if op == "=":
-                    return "(issues.assignee IS NULL OR issues.assignee = '')", []
-                if op == "!=":
-                    return "(issues.assignee IS NOT NULL AND issues.assignee != '')", []
-            if op == "=":
-                return f"LOWER(issues.{field}) = LOWER(?)", [uval]
-            if op == "!=":
-                return f"(issues.{field} IS NULL OR LOWER(issues.{field}) != LOWER(?))", [uval]
-            if op == "~":
-                return f"LOWER(issues.{field}) LIKE LOWER(?)", [f"%{uval}%"]
-            if op == "!~":
-                return f"(issues.{field} IS NULL OR LOWER(issues.{field}) NOT LIKE LOWER(?))", [f"%{uval}%"]
-            raise IQLError(f"Operator '{op}' not supported for '{field}'")
-
+                ph = ", ".join("?" for _ in self.active_sprint_ids)
+                return (f"UPPER(issues.sprint) IN ({ph})" if op == "=" else f"(issues.sprint IS NULL OR UPPER(issues.sprint) NOT IN ({ph}))"), list(self.active_sprint_ids)
+            if low in ("none", "null", "backlog", "unassigned"):
+                return ("(issues.sprint IS NULL OR issues.sprint = '')" if op == "=" else "(issues.sprint IS NOT NULL AND issues.sprint != '')"), []
+            sid = self.sprint_map.get(low, sval.upper())
+            return ("UPPER(issues.sprint) = ?" if op == "=" else "(issues.sprint IS NULL OR UPPER(issues.sprint) != ?)"), [sid]
+        if field == "milestone":
+            low = sval.lower()
+            if low in ("none", "null", "unassigned"):
+                return ("(issues.milestone IS NULL OR issues.milestone = '')" if op == "=" else "(issues.milestone IS NOT NULL AND issues.milestone != '')"), []
+            mid = self.milestone_map.get(low, sval.upper())
+            return ("UPPER(issues.milestone) = ?" if op == "=" else "(issues.milestone IS NULL OR UPPER(issues.milestone) != ?)"), [mid]
         if field == "text":
-            fts_q = build_fts_match_expr(sval)
-            like_pat = f"%{sval}%"
-            if fts_q:
-                base_sql = (
+            fts = build_fts_match_expr(sval)
+            lk = f"%{sval}%"
+            if fts:
+                sql = (
                     "(issues.key IN (SELECT key FROM issues_fts WHERE issues_fts MATCH ?) "
                     "OR LOWER(issues.key) LIKE LOWER(?) "
-                    "OR LOWER(issues.title) LIKE LOWER(?) "
+                    "OR LOWER(issues.name) LIKE LOWER(?) "
                     "OR LOWER(issues.description) LIKE LOWER(?) "
-                    "OR LOWER(issues.comments_text) LIKE LOWER(?))"
+                    "OR LOWER(issues.ac_text) LIKE LOWER(?) "
+                    "OR LOWER(issues.comments_text) LIKE LOWER(?) "
+                    "OR LOWER(issues.attachments_text) LIKE LOWER(?))"
                 )
-                base_params: List[Any] = [fts_q, like_pat, like_pat, like_pat, like_pat]
+                prms: List[Any] = [fts, lk, lk, lk, lk, lk, lk]
             else:
-                base_sql = (
-                    "(LOWER(issues.key) LIKE LOWER(?) "
-                    "OR LOWER(issues.title) LIKE LOWER(?) "
-                    "OR LOWER(issues.description) LIKE LOWER(?) "
-                    "OR LOWER(issues.comments_text) LIKE LOWER(?))"
+                sql = (
+                    "(LOWER(issues.key) LIKE LOWER(?) OR LOWER(issues.name) LIKE LOWER(?) "
+                    "OR LOWER(issues.description) LIKE LOWER(?) OR LOWER(issues.comments_text) LIKE LOWER(?) "
+                    "OR LOWER(issues.attachments_text) LIKE LOWER(?))"
                 )
-                base_params = [like_pat, like_pat, like_pat, like_pat]
-            if op in ("~", "="):
-                return base_sql, base_params
-            if op in ("!~", "!="):
-                return f"NOT {base_sql}", base_params
-            raise IQLError(f"Operator '{op}' not supported for 'text'")
-
-        if field in ("title", "description", "comments"):
-            db_col = "comments_text" if field == "comments" else field
-            fts_col = "comments_text" if field == "comments" else field
-            if op == "~":
-                fts_q = build_fts_match_expr(sval, column=fts_col)
-                like_pat = f"%{sval}%"
-                if fts_q:
-                    return (
-                        f"(issues.key IN (SELECT key FROM issues_fts WHERE issues_fts MATCH ?) OR LOWER(issues.{db_col}) LIKE LOWER(?))",
-                        [fts_q, like_pat],
-                    )
-                return f"LOWER(issues.{db_col}) LIKE LOWER(?)", [like_pat]
-            if op == "!~":
-                fts_q = build_fts_match_expr(sval, column=fts_col)
-                like_pat = f"%{sval}%"
-                if fts_q:
-                    return (
-                        f"NOT (issues.key IN (SELECT key FROM issues_fts WHERE issues_fts MATCH ?) OR LOWER(issues.{db_col}) LIKE LOWER(?))",
-                        [fts_q, like_pat],
-                    )
-                return f"LOWER(issues.{db_col}) NOT LIKE LOWER(?)", [like_pat]
+                prms = [lk, lk, lk, lk, lk]
+            return (sql if op in ("~", "=") else f"NOT {sql}"), prms
+        if field in ("name", "description", "ac_text", "comments_text", "attachments_text"):
+            if op in ("~", "!~"):
+                fts = build_fts_match_expr(sval, column=field)
+                lk = f"%{sval}%"
+                if fts:
+                    sql = f"(issues.key IN (SELECT key FROM issues_fts WHERE issues_fts MATCH ?) OR LOWER(issues.{field}) LIKE LOWER(?))"
+                    prms = [fts, lk]
+                else:
+                    sql = f"LOWER(issues.{field}) LIKE LOWER(?)"
+                    prms = [lk]
+                return (sql if op == "~" else f"NOT {sql}"), prms
             if op == "=":
-                return f"LOWER(issues.{db_col}) = LOWER(?)", [sval]
+                return f"LOWER(issues.{field}) = LOWER(?)", [sval]
             if op == "!=":
-                return f"LOWER(issues.{db_col}) != LOWER(?)", [sval]
-            raise IQLError(f"Operator '{op}' not supported for '{field}'")
-
+                return f"LOWER(issues.{field}) != LOWER(?)", [sval]
         if field.startswith("custom."):
-            cf_key = field.split(".", 1)[1]
-            path = f"$.custom_fields.{cf_key}"
+            cf = field.split(".", 1)[1]
+            p = f"$.{cf}"
             if op == "=":
-                return "LOWER(CAST(json_extract(issues.raw_json, ?) AS TEXT)) = LOWER(?)", [path, sval]
+                return "LOWER(CAST(json_extract(issues.custom_fields_json, ?) AS TEXT)) = LOWER(?)", [p, sval]
             if op == "!=":
-                return "(json_extract(issues.raw_json, ?) IS NULL OR LOWER(CAST(json_extract(issues.raw_json, ?) AS TEXT)) != LOWER(?))", [path, path, sval]
+                return "(json_extract(issues.custom_fields_json, ?) IS NULL OR LOWER(CAST(json_extract(issues.custom_fields_json, ?) AS TEXT)) != LOWER(?))", [p, p, sval]
             if op == "~":
-                return "LOWER(CAST(json_extract(issues.raw_json, ?) AS TEXT)) LIKE LOWER(?)", [path, f"%{sval}%"]
-            raise IQLError(f"Operator '{op}' not supported for custom field '{field}'")
-
-        # Standard scalar text fields (key, type, status, epic_id, parent_id, milestone_id, resolution, environment)
+                return "LOWER(CAST(json_extract(issues.custom_fields_json, ?) AS TEXT)) LIKE LOWER(?)", [p, f"%{sval}%"]
+            if op == "!~":
+                return "(json_extract(issues.custom_fields_json, ?) IS NULL OR LOWER(CAST(json_extract(issues.custom_fields_json, ?) AS TEXT)) NOT LIKE LOWER(?))", [p, p, f"%{sval}%"]
         if op == "=":
             return f"LOWER(issues.{field}) = LOWER(?)", [sval]
         if op == "!=":
@@ -1142,47 +1233,46 @@ class IQLCompiler:
             return f"(issues.{field} IS NULL OR LOWER(issues.{field}) NOT LIKE LOWER(?))", [f"%{sval}%"]
         if op in (">", ">=", "<", "<="):
             return f"(issues.{field} IS NOT NULL AND LOWER(issues.{field}) {op} LOWER(?))", [sval]
-        raise IQLError(f"Unsupported operator '{op}' for field '{field}'")
+        raise IQLError(f"Unsupported operator '{op}' for '{field}'")
 
-    def compile_order_by(self, order_items: List[Dict[str, str]], default_sort: Optional[str] = None) -> str:
-        if order_items:
-            clauses: List[str] = []
-            for item in order_items:
-                f = item["field"]
-                d = item["direction"]
-                sql_col = ORDER_SQL_MAP[f]
-                if f in ("story_points", "due_date", "resolved_at", "assignee", "sprint_id", "milestone_id"):
-                    clauses.append(f"({sql_col} IS NULL) ASC, {sql_col} {d}")
+    def compile_order_by(
+        self,
+        order_items: List[Dict[str, str]],
+        sort_field: Optional[str] = None,
+        sort_order: Optional[str] = None,
+    ) -> str:
+        clauses: List[str] = []
+        if sort_field and sort_field.strip():
+            sf = sort_field.strip()
+            d = (sort_order or "asc").strip().upper()
+            if sf.startswith("-"):
+                sf = sf[1:]
+                d = "DESC"
+            if d not in ("ASC", "DESC"):
+                raise IQLError(f"Invalid sort order '{sort_order}'. Expected asc or desc.")
+            canonical = FIELD_ALIASES.get(sf.lower(), sf.lower())
+            if canonical not in ORDER_SQL_MAP:
+                raise IQLError(f"Unknown sort field '{sort_field}'.")
+            col = ORDER_SQL_MAP[canonical]
+            if canonical in ("story_points", "estimate_minutes", "due_date", "assignee", "reporter", "sprint", "milestone", "resolution", "parent"):
+                clauses.append(f"({col} IS NULL OR {col} = '') ASC, {col} {d}")
+            else:
+                clauses.append(f"{col} {d}")
+        elif order_items:
+            for it in order_items:
+                f = it["field"]
+                d = it["direction"]
+                col = ORDER_SQL_MAP[f]
+                if f in ("story_points", "estimate_minutes", "due_date", "assignee", "reporter", "sprint", "milestone", "resolution", "parent"):
+                    clauses.append(f"({col} IS NULL OR {col} = '') ASC, {col} {d}")
                 else:
-                    clauses.append(f"{sql_col} {d}")
-            clauses.append("issues.seq ASC")
-            return ", ".join(clauses)
-        if default_sort:
-            parts = [p.strip() for p in default_sort.split(",") if p.strip()]
-            clauses = []
-            for p in parts:
-                direction = "ASC"
-                fname = p
-                if p.startswith("-"):
-                    direction = "DESC"
-                    fname = p[1:]
-                elif " " in p:
-                    sp = p.split()
-                    fname = sp[0]
-                    if len(sp) > 1 and sp[1].upper() in ("ASC", "DESC"):
-                        direction = sp[1].upper()
-                low = fname.lower()
-                canonical = FIELD_ALIASES.get(low, low)
-                if canonical in ORDER_SQL_MAP:
-                    clauses.append(f"{ORDER_SQL_MAP[canonical]} {direction}")
-            if clauses:
-                clauses.append("issues.seq ASC")
-                return ", ".join(clauses)
-        return "issues.seq ASC"
+                    clauses.append(f"{col} {d}")
+        clauses.append("issues.seq ASC")
+        return ", ".join(clauses)
 
 
 # ============================================================================
-# File-Locked Storage + Hybrid SQLite3/FTS5 Index Engine
+# Section 4: StorageEngine — Self-Healing Hybrid Index & Folder-Per-Issue Core
 # ============================================================================
 
 class StorageEngine:
@@ -1190,2588 +1280,3606 @@ class StorageEngine:
         self.repo_root = repo_root
         self.issues_root = repo_root / "itrack-issues"
         self.issues_dir = self.issues_root / "issues"
-        self.sprints_dir = self.issues_root / "sprints"
-        self.milestones_dir = self.issues_root / "milestones"
-        self.views_dir = self.issues_root / "views"
-        self.attachments_dir = self.issues_root / "attachments"
         self.runtime_dir = self.issues_root / ".runtime"
 
         self.config_path = self.issues_root / "config.json"
-        self.labels_path = self.issues_root / "labels.json"
-        self.components_path = self.issues_root / "components.json"
-        self.users_path = self.issues_root / "users.json"
+        self.tags_path = self.issues_root / "tags.json"
+        self.sprints_path = self.issues_root / "sprints.json"
+        self.milestones_path = self.issues_root / "milestones.json"
+        self.views_path = self.issues_root / "views.json"
         self.gitignore_path = self.issues_root / ".gitignore"
 
         self.lock_path = self.runtime_dir / "storage.lock"
-        self.db_path = self.runtime_dir / "index.db"
+        self.db_path = self.runtime_dir / "index.sqlite"
+        self.stray_db_path = self.issues_root / "index.sqlite"
         self.daemon_path = self.runtime_dir / "daemon.json"
 
         self._rlock = threading.RLock()
         self._lock_depth = 0
         self._lock_fd: Optional[Any] = None
         self._lock_exclusive = False
+        self._db: Optional[sqlite3.Connection] = None
         self.default_user = detect_default_user(repo_root)
 
-        self._initialize_layout()
-        self._db = self._connect_db()
-        self._init_db_schema()
-        self.reindex()
+        if self.is_initialized():
+            self.runtime_dir.mkdir(parents=True, exist_ok=True)
+            self.issues_dir.mkdir(parents=True, exist_ok=True)
+            with self.write_lock():
+                pass
 
-    def _initialize_layout(self) -> None:
-        for d in (
-            self.issues_root,
-            self.issues_dir,
-            self.sprints_dir,
-            self.milestones_dir,
-            self.views_dir,
-            self.attachments_dir,
-            self.runtime_dir,
-        ):
-            d.mkdir(parents=True, exist_ok=True)
+    def is_initialized(self) -> bool:
+        return self.config_path.exists()
 
-        with self.write_lock():
-            if not self.gitignore_path.exists():
-                self._atomic_write_text(self.gitignore_path, ".runtime/\n")
+    def require_initialized(self) -> None:
+        if not self.is_initialized():
+            raise HTTPException(
+                status_code=503,
+                detail="Workspace is not initialized (itrack-issues/config.json missing). Run 'itrack init' first.",
+            )
 
-            if not self.config_path.exists():
-                ts = now_iso()
-                default_cfg = {
-                    "project_key": "ITK",
-                    "project_name": self.repo_root.name or "itrack Workspace",
-                    "next_seq": 1,
-                    "next_sprint_seq": 1,
-                    "next_milestone_seq": 1,
-                    "next_view_seq": 1,
-                    "next_attachment_seq": 1,
-                    "default_type": "task",
-                    "default_priority": "medium",
-                    "statuses": list(DEFAULT_STATUSES),
-                    "transitions": {k: list(v) for k, v in DEFAULT_TRANSITIONS.items()},
-                    "priorities": list(DEFAULT_PRIORITIES),
-                    "issue_types": list(DEFAULT_ISSUE_TYPES),
-                    "wip_limits": {},
-                    "custom_fields": {},
-                    "created_at": ts,
-                    "updated_at": ts,
-                }
-                self._atomic_write_json(self.config_path, default_cfg)
+    def close(self) -> None:
+        with self._rlock:
+            if self._db is not None:
+                with contextlib.suppress(Exception):
+                    self._db.close()
+                self._db = None
 
-            if not self.labels_path.exists():
-                self._atomic_write_json(self.labels_path, {"labels": []})
+    def _acquire_flock(self, exclusive: bool) -> None:
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        f = open(self.lock_path, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        except Exception:
+            f.close()
+            raise
+        self._lock_fd = f
+        self._lock_exclusive = exclusive
 
-            if not self.components_path.exists():
-                self._atomic_write_json(self.components_path, {"components": []})
-
-            if not self.users_path.exists():
-                self._atomic_write_json(self.users_path, {"users": []})
+    def _release_flock(self) -> None:
+        if self._lock_fd is not None:
+            try:
+                fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._lock_fd.close()
+                self._lock_fd = None
+                self._lock_exclusive = False
 
     @contextlib.contextmanager
     def write_lock(self) -> Iterator[None]:
+        self.require_initialized()
         with self._rlock:
+            upgraded_from_sh = False
             if self._lock_depth == 0:
-                f = open(self.lock_path, "a+", encoding="utf-8")
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                self._lock_fd = f
-                self._lock_exclusive = True
-            elif not self._lock_exclusive and self._lock_fd is not None:
-                fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_EX)
-                self._lock_exclusive = True
+                self._acquire_flock(exclusive=True)
+            elif not self._lock_exclusive:
+                # Safe lock upgrade: release SH then acquire EX
+                self._release_flock()
+                self._acquire_flock(exclusive=True)
+                upgraded_from_sh = True
             self._lock_depth += 1
             try:
+                self._ensure_healthy_index_locked(can_write=True)
                 yield
             finally:
                 self._lock_depth -= 1
-                if self._lock_depth == 0 and self._lock_fd is not None:
-                    try:
-                        fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_UN)
-                    finally:
-                        self._lock_fd.close()
-                        self._lock_fd = None
-                        self._lock_exclusive = False
+                if self._lock_depth == 0:
+                    self._release_flock()
+                elif upgraded_from_sh:
+                    pass
 
     @contextlib.contextmanager
     def read_lock(self) -> Iterator[None]:
+        self.require_initialized()
         with self._rlock:
             if self._lock_depth == 0:
-                f = open(self.lock_path, "a+", encoding="utf-8")
-                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-                self._lock_fd = f
-                self._lock_exclusive = False
+                self._acquire_flock(exclusive=False)
+                if not self._check_index_quick_locked():
+                    self._release_flock()
+                    self._acquire_flock(exclusive=True)
+                    self._ensure_healthy_index_locked(can_write=True)
             self._lock_depth += 1
             try:
                 yield
             finally:
                 self._lock_depth -= 1
-                if self._lock_depth == 0 and self._lock_fd is not None:
-                    try:
-                        fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_UN)
-                    finally:
-                        self._lock_fd.close()
-                        self._lock_fd = None
-                        self._lock_exclusive = False
+                if self._lock_depth == 0:
+                    self._release_flock()
+
+    # ------------------------------------------------------------------------
+    # Disk Atomic I/O & Signature Fingerprinting
+    # ------------------------------------------------------------------------
 
     def _atomic_write_text(self, path: Path, content: str) -> None:
-        tmp = path.parent / f".{path.name}.{os.getpid()}.{threading.get_ident()}.{short_id()}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(content)
-            f.flush()
-        os.replace(tmp, path)
+        _atomic_write_bytes(path, content.encode("utf-8"))
 
     def _atomic_write_json(self, path: Path, data: Any) -> None:
-        payload = json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-        self._atomic_write_text(path, payload)
+        _atomic_write_json_standalone(path, data)
 
-    def _read_json(self, path: Path) -> Any:
+    def _read_json(self, path: Path, default: Any = None) -> Any:
+        if not path.exists():
+            if default is not None:
+                return default
+            raise FileNotFoundError(str(path))
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    def _connect_db(self) -> sqlite3.Connection:
+    def _compute_disk_signature(self) -> str:
+        parts: List[str] = []
+        for meta_p in (self.config_path, self.tags_path, self.sprints_path, self.milestones_path, self.views_path):
+            if meta_p.exists():
+                st = meta_p.stat()
+                parts.append(f"{meta_p.name}:{st.st_mtime_ns}:{st.st_size}")
+            else:
+                parts.append(f"{meta_p.name}:0:0")
+
+        if self.issues_dir.exists():
+            entries = sorted(
+                (e for e in os.scandir(self.issues_dir) if e.is_dir(follow_symlinks=False) and not e.name.startswith(".")),
+                key=lambda e: e.name,
+            )
+            parts.append(f"dirs:{len(entries)}")
+            for ent in entries:
+                dpath = Path(ent.path)
+                ij = dpath / "issue.json"
+                ij_sig = "0:0"
+                if ij.exists():
+                    ist = ij.stat()
+                    ij_sig = f"{ist.st_mtime_ns}:{ist.st_size}"
+                cdir = dpath / "comments"
+                c_sigs: List[str] = []
+                if cdir.exists():
+                    for cent in sorted(os.scandir(cdir), key=lambda x: x.name):
+                        if cent.is_dir(follow_symlinks=False) and not cent.name.startswith("."):
+                            cj = Path(cent.path) / "comment.json"
+                            if cj.exists():
+                                cst = cj.stat()
+                                c_sigs.append(f"{cent.name}:{cst.st_mtime_ns}:{cst.st_size}")
+                parts.append(f"I:{ent.name}|{ij_sig}|C:{','.join(c_sigs)}")
+        raw = "\n".join(parts).encode("utf-8", errors="replace")
+        return hashlib.sha256(raw).hexdigest()
+
+    # ------------------------------------------------------------------------
+    # Self-Healing SQLite3 + FTS5 Lifecycle
+    # ------------------------------------------------------------------------
+
+    def _cleanup_stray_root_sqlite(self) -> None:
+        for p in self.issues_root.glob("index.sqlite*"):
+            with contextlib.suppress(Exception):
+                if p.is_file():
+                    p.unlink(missing_ok=True)
+
+    def _wipe_runtime_sqlite(self) -> None:
+        if self._db is not None:
+            with contextlib.suppress(Exception):
+                self._db.close()
+            self._db = None
+        for p in self.runtime_dir.glob("index.sqlite*"):
+            with contextlib.suppress(Exception):
+                if p.is_file():
+                    p.unlink(missing_ok=True)
+        self._cleanup_stray_root_sqlite()
+
+    def _open_sqlite(self) -> sqlite3.Connection:
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         return conn
 
-    def _init_db_schema(self) -> None:
-        with self._rlock:
-            self._db.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS issues (
-                    key TEXT PRIMARY KEY,
-                    seq INTEGER NOT NULL,
-                    title TEXT NOT NULL,
-                    description TEXT NOT NULL DEFAULT '',
-                    type TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    priority TEXT NOT NULL,
-                    priority_rank INTEGER NOT NULL,
-                    resolution TEXT,
-                    assignee TEXT,
-                    reporter TEXT,
-                    claimed_by TEXT,
-                    claimed_at TEXT,
-                    epic_id TEXT,
-                    parent_id TEXT,
-                    sprint_id TEXT,
-                    milestone_id TEXT,
-                    story_points REAL,
-                    due_date TEXT,
-                    environment TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    started_at TEXT,
-                    resolved_at TEXT,
-                    closed_at TEXT,
-                    comments_text TEXT NOT NULL DEFAULT '',
-                    labels_text TEXT NOT NULL DEFAULT '',
-                    components_text TEXT NOT NULL DEFAULT '',
-                    raw_json TEXT NOT NULL
-                );
+    def _init_db_schema(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
 
-                CREATE INDEX IF NOT EXISTS idx_issues_status ON issues(status);
-                CREATE INDEX IF NOT EXISTS idx_issues_priority ON issues(priority_rank);
-                CREATE INDEX IF NOT EXISTS idx_issues_assignee ON issues(assignee);
-                CREATE INDEX IF NOT EXISTS idx_issues_sprint ON issues(sprint_id);
-                CREATE INDEX IF NOT EXISTS idx_issues_epic ON issues(epic_id);
-                CREATE INDEX IF NOT EXISTS idx_issues_parent ON issues(parent_id);
+            CREATE TABLE IF NOT EXISTS issues (
+                key TEXT PRIMARY KEY,
+                seq INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                folder TEXT NOT NULL,
+                category TEXT NOT NULL,
+                state TEXT NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0,
+                priority TEXT NOT NULL,
+                priority_rank INTEGER NOT NULL,
+                severity TEXT NOT NULL,
+                severity_rank INTEGER NOT NULL,
+                resolution TEXT,
+                description TEXT NOT NULL DEFAULT '',
+                ac_text TEXT NOT NULL DEFAULT '',
+                comments_text TEXT NOT NULL DEFAULT '',
+                attachments_text TEXT NOT NULL DEFAULT '',
+                assignee TEXT,
+                reporter TEXT,
+                parent TEXT,
+                sprint TEXT,
+                milestone TEXT,
+                story_points REAL,
+                estimate_minutes INTEGER,
+                logged_minutes INTEGER NOT NULL DEFAULT 0,
+                due_date TEXT,
+                custom_fields_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
 
-                CREATE TABLE IF NOT EXISTS issue_labels (
-                    issue_key TEXT NOT NULL,
-                    label TEXT NOT NULL,
-                    PRIMARY KEY (issue_key, label)
-                );
-                CREATE INDEX IF NOT EXISTS idx_issue_labels_label ON issue_labels(LOWER(label));
+            CREATE INDEX IF NOT EXISTS idx_issues_seq ON issues(seq);
+            CREATE INDEX IF NOT EXISTS idx_issues_name_low ON issues(LOWER(name));
+            CREATE INDEX IF NOT EXISTS idx_issues_state ON issues(state);
+            CREATE INDEX IF NOT EXISTS idx_issues_category ON issues(category);
+            CREATE INDEX IF NOT EXISTS idx_issues_priority ON issues(priority_rank);
+            CREATE INDEX IF NOT EXISTS idx_issues_severity ON issues(severity_rank);
+            CREATE INDEX IF NOT EXISTS idx_issues_assignee ON issues(LOWER(assignee));
+            CREATE INDEX IF NOT EXISTS idx_issues_sprint ON issues(sprint);
+            CREATE INDEX IF NOT EXISTS idx_issues_milestone ON issues(milestone);
+            CREATE INDEX IF NOT EXISTS idx_issues_parent ON issues(parent);
 
-                CREATE TABLE IF NOT EXISTS issue_components (
-                    issue_key TEXT NOT NULL,
-                    component TEXT NOT NULL,
-                    PRIMARY KEY (issue_key, component)
-                );
-                CREATE INDEX IF NOT EXISTS idx_issue_components_comp ON issue_components(LOWER(component));
+            CREATE TABLE IF NOT EXISTS issue_tags (
+                issue_key TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                PRIMARY KEY (issue_key, tag)
+            );
+            CREATE INDEX IF NOT EXISTS idx_issue_tags_tag ON issue_tags(LOWER(tag));
 
-                CREATE TABLE IF NOT EXISTS issue_links (
-                    id TEXT PRIMARY KEY,
-                    source_key TEXT NOT NULL,
-                    target_key TEXT NOT NULL,
-                    link_type TEXT NOT NULL,
-                    created_by TEXT,
-                    created_at TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_links_source ON issue_links(source_key);
-                CREATE INDEX IF NOT EXISTS idx_links_target ON issue_links(target_key);
+            CREATE TABLE IF NOT EXISTS issue_components (
+                issue_key TEXT NOT NULL,
+                component TEXT NOT NULL,
+                PRIMARY KEY (issue_key, component)
+            );
+            CREATE INDEX IF NOT EXISTS idx_issue_components_comp ON issue_components(LOWER(component));
 
-                CREATE VIRTUAL TABLE IF NOT EXISTS issues_fts USING fts5(
-                    key,
-                    title,
-                    description,
-                    comments_text,
-                    labels_text,
-                    components_text
-                );
-                """
-            )
-            self._db.commit()
+            CREATE TABLE IF NOT EXISTS issue_links (
+                id TEXT NOT NULL,
+                blocker_key TEXT NOT NULL,
+                blocked_key TEXT NOT NULL,
+                PRIMARY KEY (id, blocker_key, blocked_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_issue_links_blocked ON issue_links(blocked_key);
 
-    def _index_issue_in_tx(self, cur: sqlite3.Cursor, issue: Dict[str, Any]) -> None:
+            CREATE VIRTUAL TABLE IF NOT EXISTS issues_fts USING fts5(
+                key,
+                name,
+                description,
+                ac_text,
+                comments_text,
+                attachments_text
+            );
+            """
+        )
+        conn.commit()
+
+    def _check_index_quick_locked(self) -> bool:
+        if self.stray_db_path.exists():
+            return False
+        if not self.db_path.exists() or self.db_path.stat().st_size == 0:
+            return False
+        try:
+            if self._db is not None:
+                self._db.close()
+                self._db = None
+            self._db = self._open_sqlite()
+            qc = self._db.execute("PRAGMA quick_check(1);").fetchone()
+            if not qc or str(qc[0]).lower() != "ok":
+                return False
+            # Also touch issues_fts to detect FTS shadow table corruption
+            self._db.execute("SELECT count(*) FROM issues_fts;").fetchone()
+            row = self._db.execute("SELECT value FROM meta WHERE key = 'disk_sig';").fetchone()
+            if not row:
+                return False
+            return row["value"] == self._compute_disk_signature()
+        except Exception:
+            return False
+
+    def _ensure_healthy_index_locked(self, can_write: bool = True) -> None:
+        if self._check_index_quick_locked():
+            return
+        if not can_write:
+            return
+        try:
+            self._cleanup_stray_root_sqlite()
+            if self._db is None:
+                self._db = self._open_sqlite()
+            qc = self._db.execute("PRAGMA quick_check(1);").fetchone()
+            if not qc or str(qc[0]).lower() != "ok":
+                raise sqlite3.DatabaseError("quick_check failed")
+            self._init_db_schema(self._db)
+            self._rebuild_index_unlocked()
+        except Exception:
+            self._wipe_runtime_sqlite()
+            self._db = self._open_sqlite()
+            self._init_db_schema(self._db)
+            self._rebuild_index_unlocked()
+
+    def _update_disk_sig_in_db(self) -> None:
+        assert self._db is not None
+        sig = self._compute_disk_signature()
+        self._db.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('disk_sig', ?)",
+            (sig,),
+        )
+        self._db.commit()
+
+    def _load_raw_comments_from_dir(self, issue_dir: Path) -> List[Dict[str, Any]]:
+        c_root = issue_dir / "comments"
+        if not c_root.exists():
+            return []
+        comments: List[Dict[str, Any]] = []
+        for entry in os.scandir(c_root):
+            if not entry.is_dir(follow_symlinks=False) or entry.name.startswith("."):
+                continue
+            c_json = Path(entry.path) / "comment.json"
+            if c_json.exists():
+                with contextlib.suppress(Exception):
+                    comments.append(self._read_json(c_json))
+        comments.sort(key=lambda c: (int(c.get("seq", 0)), str(c.get("created_at", "")), str(c.get("id", ""))))
+        return comments
+
+    def _index_issue_in_tx(self, cur: sqlite3.Cursor, issue: Dict[str, Any], issue_dir: Path) -> None:
         key = issue["key"]
-        comments_text = "\n".join(c.get("body", "") for c in issue.get("comments", []))
-        labels = issue.get("labels", [])
-        components = issue.get("components", [])
-        labels_text = " ".join(labels)
-        components_text = " ".join(components)
-        _, p_rank = normalize_priority(issue.get("priority", "medium"))
-        issue["priority_rank"] = p_rank
-        raw_json = json.dumps(issue, sort_keys=True, ensure_ascii=False)
+        comments = self._load_raw_comments_from_dir(issue_dir)
+        ac_text = "\n".join(str(item.get("text", "")) for item in issue.get("acceptance_criteria", []) if isinstance(item, dict))
+        comments_text = "\n".join(str(c.get("body", "")) for c in comments)
 
-        cur.execute("DELETE FROM issue_labels WHERE issue_key = ?", (key,))
+        att_names: List[str] = []
+        for a in issue.get("attachments", []):
+            if isinstance(a, dict) and a.get("filename"):
+                att_names.append(str(a["filename"]))
+        for emb in issue.get("description_embeds", []):
+            if isinstance(emb, dict) and emb.get("filename"):
+                att_names.append(str(emb["filename"]))
+        for c in comments:
+            for emb in c.get("embeds", []):
+                if isinstance(emb, dict) and emb.get("filename"):
+                    att_names.append(str(emb["filename"]))
+            for ca in c.get("attachments", []):
+                if isinstance(ca, dict) and ca.get("filename"):
+                    att_names.append(str(ca["filename"]))
+        attachments_text = " ".join(att_names)
+
+        prio, p_rank = normalize_priority(issue.get("priority"), "medium")
+        sev, s_rank = normalize_severity(issue.get("severity"), "sev3")
+        state = normalize_state(issue.get("state"), "backlog")
+        archived = 1 if (issue.get("archived") or state == "archived") else 0
+
+        cur.execute("DELETE FROM issue_tags WHERE issue_key = ?", (key,))
         cur.execute("DELETE FROM issue_components WHERE issue_key = ?", (key,))
-        cur.execute("DELETE FROM issue_links WHERE source_key = ?", (key,))
+        cur.execute("DELETE FROM issue_links WHERE blocker_key = ? OR blocked_key = ?", (key, key))
         cur.execute("DELETE FROM issues_fts WHERE key = ?", (key,))
 
         cur.execute(
             """
             INSERT OR REPLACE INTO issues (
-                key, seq, title, description, type, status, priority, priority_rank,
-                resolution, assignee, reporter, claimed_by, claimed_at,
-                epic_id, parent_id, sprint_id, milestone_id, story_points,
-                due_date, environment, created_at, updated_at, started_at,
-                resolved_at, closed_at, comments_text, labels_text, components_text, raw_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                key, seq, name, folder, category, state, archived,
+                priority, priority_rank, severity, severity_rank, resolution,
+                description, ac_text, comments_text, attachments_text,
+                assignee, reporter, parent, sprint, milestone,
+                story_points, estimate_minutes, logged_minutes, due_date,
+                custom_fields_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 key,
                 int(issue.get("seq", 0)),
-                issue.get("title", ""),
-                issue.get("description", "") or "",
-                issue.get("type", "task"),
-                issue.get("status", "todo"),
-                issue.get("priority", "medium"),
+                issue["name"],
+                issue_dir.name,
+                issue.get("category", "task"),
+                state,
+                archived,
+                prio,
                 p_rank,
+                sev,
+                s_rank,
                 issue.get("resolution"),
+                issue.get("description", "") or "",
+                ac_text,
+                comments_text,
+                attachments_text,
                 issue.get("assignee"),
                 issue.get("reporter"),
-                issue.get("claimed_by"),
-                issue.get("claimed_at"),
-                issue.get("epic_id"),
-                issue.get("parent_id"),
-                issue.get("sprint_id"),
-                issue.get("milestone_id"),
+                issue.get("parent"),
+                issue.get("sprint"),
+                issue.get("milestone"),
                 issue.get("story_points"),
+                issue.get("estimate_minutes"),
+                int(issue.get("logged_minutes") or 0),
                 issue.get("due_date"),
-                issue.get("environment"),
+                json.dumps(issue.get("custom_fields") or {}, sort_keys=True, ensure_ascii=False),
                 issue.get("created_at") or now_iso(),
                 issue.get("updated_at") or now_iso(),
-                issue.get("started_at"),
-                issue.get("resolved_at"),
-                issue.get("closed_at"),
-                comments_text,
-                labels_text,
-                components_text,
-                raw_json,
             ),
         )
 
-        for lb in labels:
-            cur.execute("INSERT OR IGNORE INTO issue_labels (issue_key, label) VALUES (?, ?)", (key, lb))
-        for cp in components:
+        for tg in issue.get("tags", []):
+            cur.execute("INSERT OR IGNORE INTO issue_tags (issue_key, tag) VALUES (?, ?)", (key, tg))
+        for cp in issue.get("components", []):
             cur.execute("INSERT OR IGNORE INTO issue_components (issue_key, component) VALUES (?, ?)", (key, cp))
+
         for lnk in issue.get("links", []):
-            cur.execute(
-                "INSERT OR REPLACE INTO issue_links (id, source_key, target_key, link_type, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    lnk["id"],
-                    lnk["source_key"],
-                    lnk["target_key"],
-                    lnk["link_type"],
-                    lnk.get("created_by"),
-                    lnk.get("created_at"),
-                ),
-            )
+            lt = lnk.get("type")
+            lid = lnk.get("id", f"LNK-{short_id()}")
+            tgt = lnk.get("target_key")
+            if not tgt:
+                continue
+            if lt == "blocks":
+                cur.execute("INSERT OR IGNORE INTO issue_links (id, blocker_key, blocked_key) VALUES (?, ?, ?)", (lid, key, tgt))
+            elif lt == "blocked-by":
+                cur.execute("INSERT OR IGNORE INTO issue_links (id, blocker_key, blocked_key) VALUES (?, ?, ?)", (lid, tgt, key))
+
         cur.execute(
-            "INSERT INTO issues_fts (key, title, description, comments_text, labels_text, components_text) VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                key,
-                issue.get("title", ""),
-                issue.get("description", "") or "",
-                comments_text,
-                labels_text,
-                components_text,
-            ),
+            """
+            INSERT INTO issues_fts (key, name, description, ac_text, comments_text, attachments_text)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (key, issue["name"], issue.get("description", "") or "", ac_text, comments_text, attachments_text),
         )
 
-    def _remove_issue_from_index(self, key: str) -> None:
-        cur = self._db.cursor()
-        cur.execute("DELETE FROM issues WHERE key = ?", (key,))
-        cur.execute("DELETE FROM issue_labels WHERE issue_key = ?", (key,))
-        cur.execute("DELETE FROM issue_components WHERE issue_key = ?", (key,))
-        cur.execute("DELETE FROM issue_links WHERE source_key = ? OR target_key = ?", (key, key))
-        cur.execute("DELETE FROM issues_fts WHERE key = ?", (key,))
-        self._db.commit()
-
-    def _save_issue(self, issue: Dict[str, Any]) -> None:
-        path = self.issues_dir / f"{issue['key']}.json"
-        self._atomic_write_json(path, issue)
-        cur = self._db.cursor()
-        self._index_issue_in_tx(cur, issue)
-        self._db.commit()
-
-    def reindex(self) -> Dict[str, Any]:
-        """Rebuild SQLite3 + FTS5 index completely from canonical JSON files on disk."""
+    def _rebuild_index_unlocked(self) -> Dict[str, Any]:
         t0 = time.perf_counter()
-        with self.write_lock():
-            cur = self._db.cursor()
-            cur.execute("DELETE FROM issues;")
-            cur.execute("DELETE FROM issue_labels;")
-            cur.execute("DELETE FROM issue_components;")
-            cur.execute("DELETE FROM issue_links;")
-            cur.execute("DELETE FROM issues_fts;")
+        assert self._db is not None
+        cur = self._db.cursor()
+        cur.execute("DELETE FROM issues;")
+        cur.execute("DELETE FROM issue_tags;")
+        cur.execute("DELETE FROM issue_components;")
+        cur.execute("DELETE FROM issue_links;")
+        cur.execute("DELETE FROM issues_fts;")
 
-            count = 0
-            max_seq = 0
-            max_att_seq = 0
-            for p in sorted(self.issues_dir.glob("*.json")):
-                if p.name.startswith("."):
+        count = 0
+        max_issue_seq = 0
+        max_att_seq = 0
+        max_cmt_seq = 0
+        max_lnk_seq = 0
+        max_wl_seq = 0
+
+        if self.issues_dir.exists():
+            for entry in sorted(os.scandir(self.issues_dir), key=lambda e: e.name):
+                if not entry.is_dir(follow_symlinks=False) or entry.name.startswith("."):
                     continue
-                issue = self._read_json(p)
-                if not isinstance(issue, dict) or "key" not in issue:
+                idir = Path(entry.path)
+                ij = idir / "issue.json"
+                if not ij.exists():
                     continue
-                # Ensure seq exists even if manually edited on disk
-                m_key = re.search(r"-(\d+)$", str(issue["key"]))
-                if "seq" not in issue:
-                    issue["seq"] = int(m_key.group(1)) if m_key else (count + 1)
-                max_seq = max(max_seq, int(issue["seq"]), int(m_key.group(1)) if m_key else 0)
-                for att in issue.get("attachments", []):
-                    if isinstance(att, dict):
-                        m_att = re.search(r"-(\d+)$", str(att.get("id", "")))
-                        if m_att:
-                            max_att_seq = max(max_att_seq, int(m_att.group(1)))
-                self._index_issue_in_tx(cur, issue)
+                try:
+                    iss = self._read_json(ij)
+                except Exception:
+                    continue
+                if not isinstance(iss, dict) or "key" not in iss:
+                    continue
+                if iss.get("name") != idir.name:
+                    iss["name"] = idir.name
+                    iss["folder"] = idir.name
+                    self._atomic_write_json(ij, iss)
+                m_k = re.search(r"-(\d+)$", str(iss["key"]))
+                seq = int(iss.get("seq") or (int(m_k.group(1)) if m_k else (count + 1)))
+                iss["seq"] = seq
+                max_issue_seq = max(max_issue_seq, seq)
+
+                for a in list(iss.get("attachments", [])) + list(iss.get("description_embeds", [])):
+                    m_a = re.search(r"-(\d+)$", str(a.get("id", "")))
+                    if m_a:
+                        max_att_seq = max(max_att_seq, int(m_a.group(1)))
+                for d_id in (iss.get("deleted_attachments") or {}).keys():
+                    m_da = re.search(r"-(\d+)$", str(d_id))
+                    if m_da:
+                        max_att_seq = max(max_att_seq, int(m_da.group(1)))
+                for lnk in iss.get("links", []):
+                    m_l = re.search(r"-(\d+)$", str(lnk.get("id", "")))
+                    if m_l:
+                        max_lnk_seq = max(max_lnk_seq, int(m_l.group(1)))
+                for wl in iss.get("worklogs", []):
+                    m_w = re.search(r"-(\d+)$", str(wl.get("id", "")))
+                    if m_w:
+                        max_wl_seq = max(max_wl_seq, int(m_w.group(1)))
+
+                for c in self._load_raw_comments_from_dir(idir):
+                    m_c = re.search(r"-(\d+)$", str(c.get("id", "")))
+                    if m_c:
+                        max_cmt_seq = max(max_cmt_seq, int(m_c.group(1)))
+                    for a in list(c.get("embeds", [])) + list(c.get("attachments", [])):
+                        m_ca = re.search(r"-(\d+)$", str(a.get("id", "")))
+                        if m_ca:
+                            max_att_seq = max(max_att_seq, int(m_ca.group(1)))
+
+                self._index_issue_in_tx(cur, iss, idir)
                 count += 1
 
-            # Also scan attachment files on disk in case any exist
-            for att_p in self.attachments_dir.rglob("*"):
-                if att_p.is_file() and not att_p.name.startswith("."):
-                    m_f = re.match(r"ATT-(\d+)_", att_p.name, re.IGNORECASE)
-                    if m_f:
-                        max_att_seq = max(max_att_seq, int(m_f.group(1)))
-
-            max_spr_seq = 0
-            for sp_p in self.sprints_dir.glob("*.json"):
-                if sp_p.name.startswith("."):
+        # Re-add blocking links across all issues because each issue index clears links touching it
+        cur.execute("DELETE FROM issue_links;")
+        if self.issues_dir.exists():
+            for entry in os.scandir(self.issues_dir):
+                if not entry.is_dir(follow_symlinks=False) or entry.name.startswith("."):
                     continue
-                sp = self._read_json(sp_p)
-                if isinstance(sp, dict):
-                    m_sp = re.search(r"-(\d+)$", str(sp.get("id", "")))
-                    max_spr_seq = max(max_spr_seq, int(sp.get("seq") or 0), int(m_sp.group(1)) if m_sp else 0)
-
-            max_mil_seq = 0
-            for ms_p in self.milestones_dir.glob("*.json"):
-                if ms_p.name.startswith("."):
+                ij = Path(entry.path) / "issue.json"
+                if not ij.exists():
                     continue
-                ms = self._read_json(ms_p)
-                if isinstance(ms, dict):
-                    m_ms = re.search(r"-(\d+)$", str(ms.get("id", "")))
-                    max_mil_seq = max(max_mil_seq, int(ms.get("seq") or 0), int(m_ms.group(1)) if m_ms else 0)
+                with contextlib.suppress(Exception):
+                    iss = self._read_json(ij)
+                    key = iss["key"]
+                    for lnk in iss.get("links", []):
+                        lt = lnk.get("type")
+                        lid = lnk.get("id", f"LNK-{short_id()}")
+                        tgt = lnk.get("target_key")
+                        if tgt and lt == "blocks":
+                            cur.execute("INSERT OR IGNORE INTO issue_links (id, blocker_key, blocked_key) VALUES (?, ?, ?)", (lid, key, tgt))
+                        elif tgt and lt == "blocked-by":
+                            cur.execute("INSERT OR IGNORE INTO issue_links (id, blocker_key, blocked_key) VALUES (?, ?, ?)", (lid, tgt, key))
 
-            max_view_seq = 0
-            for vw_p in self.views_dir.glob("*.json"):
-                if vw_p.name.startswith("."):
-                    continue
-                vw = self._read_json(vw_p)
-                if isinstance(vw, dict):
-                    m_vw = re.search(r"-(\d+)$", str(vw.get("id", "")))
-                    max_view_seq = max(max_view_seq, int(vw.get("seq") or 0), int(m_vw.group(1)) if m_vw else 0)
+        self._db.commit()
 
-            self._db.commit()
-
+        # Sync monotonic sequence counters in config.json if disk items had higher IDs (e.g. after git pull)
+        if self.config_path.exists():
             cfg = self._read_json(self.config_path)
+            max_spr = max((int(re.search(r"-(\d+)$", str(s.get("id", "0"))).group(1)) for s in self._read_json(self.sprints_path, {"sprints": []}).get("sprints", []) if re.search(r"-(\d+)$", str(s.get("id", "")))), default=0)
+            max_mil = max((int(re.search(r"-(\d+)$", str(m.get("id", "0"))).group(1)) for m in self._read_json(self.milestones_path, {"milestones": []}).get("milestones", []) if re.search(r"-(\d+)$", str(m.get("id", "")))), default=0)
+            max_vw = max((int(re.search(r"-(\d+)$", str(v.get("id", "0"))).group(1)) for v in self._read_json(self.views_path, {"views": []}).get("views", []) if re.search(r"-(\d+)$", str(v.get("id", "")))), default=0)
             dirty = False
-            for seq_key, max_val in (
-                ("next_seq", max_seq),
-                ("next_attachment_seq", max_att_seq),
-                ("next_sprint_seq", max_spr_seq),
-                ("next_milestone_seq", max_mil_seq),
-                ("next_view_seq", max_view_seq),
+            for k_seq, mval in (
+                ("next_issue_seq", max_issue_seq),
+                ("next_att_seq", max_att_seq),
+                ("next_comment_seq", max_cmt_seq),
+                ("next_link_seq", max_lnk_seq),
+                ("next_worklog_seq", max_wl_seq),
+                ("next_sprint_seq", max_spr),
+                ("next_milestone_seq", max_mil),
+                ("next_view_seq", max_vw),
             ):
-                if max_val >= int(cfg.get(seq_key, 1)):
-                    cfg[seq_key] = max_val + 1
+                if mval >= int(cfg.get(k_seq, 1)):
+                    cfg[k_seq] = mval + 1
                     dirty = True
             if dirty:
-                cfg["updated_at"] = now_iso()
                 self._atomic_write_json(self.config_path, cfg)
 
+        self._update_disk_sig_in_db()
         dur_ms = round((time.perf_counter() - t0) * 1000.0, 2)
         return {"status": "reindexed", "indexed_issues": count, "duration_ms": dur_ms}
 
+    def reindex(self) -> Dict[str, Any]:
+        with self.write_lock():
+            return self._rebuild_index_unlocked()
+
+    def _next_seq(self, cfg: Dict[str, Any], counter_key: str) -> int:
+        val = int(cfg.get(counter_key, 1))
+        cfg[counter_key] = val + 1
+        cfg["updated_at"] = now_iso()
+        return val
+
+    def _append_history(
+        self,
+        issue_dir: Path,
+        cfg: Dict[str, Any],
+        actor: str,
+        action: str,
+        diffs: List[Dict[str, Any]],
+        timestamp: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        h_seq = self._next_seq(cfg, "next_history_seq")
+        entry = {
+            "id": f"HST-{h_seq}",
+            "timestamp": timestamp or now_iso(),
+            "actor": actor or self.default_user,
+            "action": action,
+            "diffs": diffs,
+        }
+        h_path = issue_dir / "history.jsonl"
+        line = json.dumps(entry, ensure_ascii=False) + "\n"
+        with open(h_path, "a", encoding="utf-8") as hf:
+            hf.write(line)
+            hf.flush()
+        return entry
+
+    def _save_issue_unlocked(self, issue: Dict[str, Any], issue_dir: Path) -> None:
+        assert self._db is not None
+        issue["folder"] = issue_dir.name
+        self._atomic_write_json(issue_dir / "issue.json", issue)
+        cur = self._db.cursor()
+        self._index_issue_in_tx(cur, issue, issue_dir)
+        # Re-ensure peer blocking links pointing at this issue remain in issue_links
+        for entry in os.scandir(self.issues_dir):
+            if not entry.is_dir(follow_symlinks=False) or entry.name.startswith(".") or entry.name == issue_dir.name:
+                continue
+            p_json = Path(entry.path) / "issue.json"
+            if p_json.exists():
+                with contextlib.suppress(Exception):
+                    peer = self._read_json(p_json)
+                    pk = peer["key"]
+                    for lnk in peer.get("links", []):
+                        tgt = lnk.get("target_key")
+                        if tgt == issue["key"]:
+                            lt = lnk.get("type")
+                            lid = lnk.get("id", f"LNK-{short_id()}")
+                            if lt == "blocks":
+                                cur.execute("INSERT OR IGNORE INTO issue_links (id, blocker_key, blocked_key) VALUES (?, ?, ?)", (lid, pk, tgt))
+                            elif lt == "blocked-by":
+                                cur.execute("INSERT OR IGNORE INTO issue_links (id, blocker_key, blocked_key) VALUES (?, ?, ?)", (lid, tgt, pk))
+        self._db.commit()
+        self._update_disk_sig_in_db()
+
     # ------------------------------------------------------------------------
-    # Enrichment & Computed Fields
+    # Dual Addressing & Enrichment
     # ------------------------------------------------------------------------
 
-    def _enrich_issues(self, raw_issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not raw_issues:
-            return []
-        with self._rlock:
-            # Fetch all links and status map from SQLite for O(1) enrichment
-            status_rows = self._db.execute("SELECT key, seq, status, parent_id FROM issues ORDER BY seq ASC").fetchall()
-            status_by_key: Dict[str, str] = {}
-            subtasks_by_parent: Dict[str, List[str]] = {}
-            seq_by_key: Dict[str, int] = {}
-            for r in status_rows:
-                k = r["key"]
-                status_by_key[k] = r["status"]
-                seq_by_key[k] = r["seq"]
-                pid = r["parent_id"]
-                if pid:
-                    subtasks_by_parent.setdefault(pid, []).append(k)
+    def _resolve_issue_unlocked(self, issue_ref: str) -> Tuple[Dict[str, Any], Path]:
+        if issue_ref is None:
+            raise HTTPException(status_code=404, detail="Issue reference is empty.")
+        decoded = urllib.parse.unquote(str(issue_ref)).strip()
+        if not decoded:
+            raise HTTPException(status_code=404, detail="Issue reference is empty.")
 
-            link_rows = self._db.execute(
-                "SELECT id, source_key, target_key, link_type, created_by, created_at FROM issue_links"
-            ).fetchall()
+        # 1. Exact folder match (supports spaces, symbols, Unicode)
+        if "/" not in decoded and "\\" not in decoded and decoded not in (".", ".."):
+            exact_dir = self.issues_dir / decoded
+            if (exact_dir / "issue.json").exists():
+                return self._read_json(exact_dir / "issue.json"), exact_dir
 
-            inbound_by_target: Dict[str, List[sqlite3.Row]] = {}
-            for lr in link_rows:
-                inbound_by_target.setdefault(lr["target_key"], []).append(lr)
+        ref_clean = decoded[1:] if (decoded.startswith("#") and re.fullmatch(r"#[A-Za-z][A-Za-z0-9]*-\d+", decoded)) else decoded
 
-            enriched: List[Dict[str, Any]] = []
-            for item in raw_issues:
-                iss = dict(item)
-                key = iss["key"]
-                outbound = list(iss.get("links", []))
-                all_links: List[Dict[str, Any]] = []
-                seen_triples: Set[Tuple[str, str, str]] = set()
-                blockers: Set[str] = set()
-
-                for lnk in outbound:
-                    ltype = lnk["link_type"]
-                    tgt = lnk["target_key"]
-                    entry = {
-                        "id": lnk["id"],
-                        "source_key": key,
-                        "target_key": tgt,
-                        "link_type": ltype,
-                        "direction": "outbound",
-                        "created_by": lnk.get("created_by"),
-                        "created_at": lnk.get("created_at"),
-                    }
-                    all_links.append(entry)
-                    seen_triples.add((key, tgt, ltype))
-                    if ltype == "blocked_by":
-                        st = status_by_key.get(tgt)
-                        if st and st not in ("done", "canceled"):
-                            blockers.add(tgt)
-
-                for in_lnk in inbound_by_target.get(key, []):
-                    src = in_lnk["source_key"]
-                    if src == key:
-                        continue
-                    orig_type = in_lnk["link_type"]
-                    inv_type = INVERSE_LINK_TYPES.get(orig_type, orig_type)
-                    if (key, src, inv_type) not in seen_triples:
-                        seen_triples.add((key, src, inv_type))
-                        all_links.append(
-                            {
-                                "id": in_lnk["id"],
-                                "source_key": key,
-                                "target_key": src,
-                                "link_type": inv_type,
-                                "direction": "inbound",
-                                "origin_source_key": src,
-                                "created_by": in_lnk["created_by"],
-                                "created_at": in_lnk["created_at"],
-                            }
-                        )
-                    if orig_type == "blocks":
-                        st = status_by_key.get(src)
-                        if st and st not in ("done", "canceled"):
-                            blockers.add(src)
-
-                sorted_blockers = sorted(blockers, key=lambda bk: (seq_by_key.get(bk, 10**9), bk))
-                iss["all_links"] = all_links
-                iss["unresolved_blockers"] = sorted_blockers
-                iss["is_blocked"] = (iss.get("status") == "blocked") or (len(sorted_blockers) > 0)
-                iss["subtask_keys"] = subtasks_by_parent.get(key, [])
-                iss["total_worklog_minutes"] = sum(int(w.get("minutes", 0)) for w in iss.get("worklogs", []))
-                enriched.append(iss)
-            return enriched
-
-    def _get_raw_issue_or_404(self, key: str) -> Dict[str, Any]:
-        norm_key = key.strip().upper()
-        path = self.issues_dir / f"{norm_key}.json"
-        if not path.exists():
-            # Case-insensitive fallback scan if custom casing existed
-            row = self._db.execute("SELECT key FROM issues WHERE UPPER(key) = ?", (norm_key,)).fetchone()
+        # 2. SQLite index lookup by key (case-insensitive) or exact name
+        if self._db is not None:
+            row = self._db.execute(
+                "SELECT folder FROM issues WHERE UPPER(key) = UPPER(?) OR name = ? LIMIT 1",
+                (ref_clean, decoded),
+            ).fetchone()
             if row:
-                path = self.issues_dir / f"{row['key']}.json"
-            if not path.exists():
-                raise HTTPException(status_code=404, detail=f"Issue '{norm_key}' not found.")
-        return self._read_json(path)
+                idir = self.issues_dir / row["folder"]
+                if (idir / "issue.json").exists():
+                    return self._read_json(idir / "issue.json"), idir
 
-    def get_issue(self, key: str) -> Dict[str, Any]:
+        # 3. Direct filesystem fallback scan
+        if self.issues_dir.exists():
+            for entry in os.scandir(self.issues_dir):
+                if not entry.is_dir(follow_symlinks=False) or entry.name.startswith("."):
+                    continue
+                ij = Path(entry.path) / "issue.json"
+                if ij.exists():
+                    with contextlib.suppress(Exception):
+                        iss = self._read_json(ij)
+                        if str(iss.get("key", "")).upper() == ref_clean.upper() or iss.get("name") == decoded:
+                            return iss, Path(entry.path)
+
+        raise HTTPException(status_code=404, detail=f"Issue '{decoded}' not found.")
+
+    def _enrich_comment(self, raw_cmt: Dict[str, Any], issue: Dict[str, Any]) -> Dict[str, Any]:
+        cmt = dict(raw_cmt)
+        att_by_id = {a["id"].upper(): a for a in issue.get("attachments", []) if isinstance(a, dict) and "id" in a}
+        del_by_id = {k.upper(): v for k, v in (issue.get("deleted_attachments") or {}).items()}
+        linked_resolved: List[Dict[str, Any]] = []
+        for lid in cmt.get("linked_attachment_ids", []):
+            up = str(lid).upper()
+            if up in att_by_id:
+                item = dict(att_by_id[up])
+                item["linked"] = True
+                item["deleted"] = False
+                linked_resolved.append(item)
+            elif up in del_by_id:
+                d = del_by_id[up]
+                linked_resolved.append({
+                    "id": d.get("id", up),
+                    "filename": d.get("filename", up),
+                    "linked": True,
+                    "deleted": True,
+                    "deleted_at": d.get("deleted_at"),
+                })
+            else:
+                linked_resolved.append({
+                    "id": up,
+                    "filename": up,
+                    "linked": True,
+                    "deleted": True,
+                })
+        cmt["linked_attachments"] = linked_resolved
+        return cmt
+
+    def _enrich_issues_unlocked(self, items: List[Tuple[Dict[str, Any], Path]]) -> List[Dict[str, Any]]:
+        if not items:
+            return []
+        assert self._db is not None
+        rows = self._db.execute(
+            "SELECT key, seq, name, state, priority, assignee, parent FROM issues ORDER BY seq ASC"
+        ).fetchall()
+        by_key: Dict[str, sqlite3.Row] = {r["key"]: r for r in rows}
+        children_by_parent: Dict[str, List[sqlite3.Row]] = {}
+        for r in rows:
+            if r["parent"]:
+                children_by_parent.setdefault(r["parent"], []).append(r)
+
+        link_rows = self._db.execute("SELECT blocker_key, blocked_key FROM issue_links").fetchall()
+        blockers_of: Dict[str, List[str]] = {}
+        for lr in link_rows:
+            bk = lr["blocker_key"]
+            b_row = by_key.get(bk)
+            if b_row and b_row["state"] not in TERMINAL_STATES:
+                if bk not in blockers_of.setdefault(lr["blocked_key"], []):
+                    blockers_of[lr["blocked_key"]].append(bk)
+
+        today = today_iso()
+        out: List[Dict[str, Any]] = []
+        for raw_iss, idir in items:
+            iss = dict(raw_iss)
+            key = iss["key"]
+            state = iss.get("state", "backlog")
+            due = iss.get("due_date")
+            iss["is_overdue"] = bool(due and due < today and state not in TERMINAL_STATES)
+
+            unres = list(blockers_of.get(key, []))
+            for lnk in iss.get("links", []):
+                if lnk.get("type") == "blocked-by":
+                    tk = lnk.get("target_key")
+                    t_row = by_key.get(tk) if tk else None
+                    if tk and t_row and t_row["state"] not in TERMINAL_STATES and tk not in unres:
+                        unres.append(tk)
+            iss["unresolved_blockers"] = unres
+            iss["is_blocked"] = (state in ("blocked", "on-hold")) or (len(unres) > 0 and state not in TERMINAL_STATES)
+
+            subs_rows = children_by_parent.get(key, [])
+            subs: List[Dict[str, Any]] = []
+            sub_done = 0
+            for sr in subs_rows:
+                done = sr["state"] == "done"
+                if done:
+                    sub_done += 1
+                subs.append({
+                    "key": sr["key"],
+                    "name": sr["name"],
+                    "state": sr["state"],
+                    "priority": sr["priority"],
+                    "assignee": sr["assignee"],
+                    "completed": done,
+                })
+            iss["subtasks"] = subs
+            iss["subtask_progress"] = {
+                "total": len(subs),
+                "completed": sub_done,
+                "pct": round(sub_done / len(subs) * 100.0, 1) if subs else 0.0,
+            }
+
+            acs = iss.get("acceptance_criteria") or []
+            ac_checked = sum(1 for a in acs if isinstance(a, dict) and a.get("checked"))
+            iss["ac_progress"] = {
+                "total": len(acs),
+                "checked": ac_checked,
+                "pct": round(ac_checked / len(acs) * 100.0, 1) if acs else 0.0,
+            }
+
+            logged = sum(int(w.get("minutes", 0)) for w in (iss.get("worklogs") or []))
+            iss["logged_minutes"] = logged
+            est = iss.get("estimate_minutes")
+            iss["time_progress"] = {
+                "estimate_minutes": est,
+                "logged_minutes": logged,
+                "pct": round(min(100.0, logged / est * 100.0), 1) if (est and est > 0) else (100.0 if logged > 0 else 0.0),
+            }
+
+            raw_comments = self._load_raw_comments_from_dir(idir)
+            iss["comments"] = [self._enrich_comment(c, iss) for c in raw_comments]
+            iss["comment_count"] = len(iss["comments"])
+            out.append(iss)
+        return out
+
+    def get_issue(self, issue_ref: str) -> Dict[str, Any]:
         with self.read_lock():
-            raw = self._get_raw_issue_or_404(key)
-            return self._enrich_issues([raw])[0]
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            return self._enrich_issues_unlocked([(iss, idir)])[0]
 
     def issue_count(self) -> int:
-        with self._rlock:
+        if not self.is_initialized():
+            return 0
+        with self.read_lock():
+            assert self._db is not None
             row = self._db.execute("SELECT COUNT(*) AS c FROM issues").fetchone()
             return int(row["c"]) if row else 0
 
     # ------------------------------------------------------------------------
-    # Config & Workflows
+    # Config, Status, Stats & Hierarchy Tree
     # ------------------------------------------------------------------------
 
     def get_config(self) -> Dict[str, Any]:
         with self.read_lock():
             return self._read_json(self.config_path)
 
-    def update_config(self, patch: Dict[str, Any]) -> Dict[str, Any]:
+    def update_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(payload, dict) or not payload:
+            raise HTTPException(status_code=400, detail="Configuration update payload cannot be empty.")
+        # Normalize {"key": k, "value": v} into flat/nested updates
+        updates: Dict[str, Any] = {}
+        if "key" in payload and "value" in payload and len(payload) <= 3:
+            k_str = str(payload["key"]).strip()
+            if not k_str:
+                raise HTTPException(status_code=400, detail="Config key cannot be empty.")
+            updates[k_str] = payload["value"]
+        else:
+            updates = dict(payload)
+
         with self.write_lock():
             cfg = self._read_json(self.config_path)
-            if "project_key" in patch and patch["project_key"] is not None:
-                pk = str(patch["project_key"]).strip().upper()
-                if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,11}", pk):
-                    raise HTTPException(
-                        status_code=400,
-                        detail="project_key must start with a letter and contain 1-12 uppercase letters/digits/underscores.",
-                    )
-                cfg["project_key"] = pk
-            if "project_name" in patch and patch["project_name"] is not None:
-                cfg["project_name"] = str(patch["project_name"]).strip() or cfg["project_name"]
-            if "default_type" in patch and patch["default_type"] is not None:
-                dt_val = str(patch["default_type"]).strip().lower()
-                if dt_val not in cfg["issue_types"]:
-                    raise HTTPException(status_code=400, detail=f"Invalid default_type '{dt_val}'.")
-                cfg["default_type"] = dt_val
-            if "default_priority" in patch and patch["default_priority"] is not None:
-                try:
-                    dp, _ = normalize_priority(str(patch["default_priority"]))
-                except ValueError as e:
-                    raise HTTPException(status_code=400, detail=str(e))
-                cfg["default_priority"] = dp
-            if "wip_limits" in patch and patch["wip_limits"] is not None:
-                cfg["wip_limits"] = dict(patch["wip_limits"])
-            if "custom_fields" in patch and patch["custom_fields"] is not None:
-                cfg["custom_fields"] = dict(patch["custom_fields"])
+            for raw_k, val in updates.items():
+                k = str(raw_k).strip()
+                if k in ("project_prefix", "prefix"):
+                    s = str(val or "").strip().upper()
+                    if not re.fullmatch(r"[A-Z][A-Z0-9]{0,9}", s):
+                        raise HTTPException(status_code=400, detail=f"Invalid project_prefix '{val}'. Must match ^[A-Z][A-Z0-9]{{0,9}}$.")
+                    cfg["project_prefix"] = s
+                elif k in ("project_title", "title", "project_name"):
+                    s = str(val or "").strip()
+                    if not s:
+                        raise HTTPException(status_code=400, detail="project_title cannot be empty.")
+                    cfg["project_title"] = s
+                elif k == "default_state":
+                    try:
+                        cfg["default_state"] = normalize_state(str(val))
+                    except ValueError as e:
+                        raise HTTPException(status_code=400, detail=str(e))
+                elif k == "default_priority":
+                    try:
+                        p, _ = normalize_priority(str(val))
+                        cfg["default_priority"] = p
+                    except ValueError as e:
+                        raise HTTPException(status_code=400, detail=str(e))
+                elif k == "default_category":
+                    try:
+                        cfg["default_category"] = normalize_category(str(val))
+                    except ValueError as e:
+                        raise HTTPException(status_code=400, detail=str(e))
+                elif k == "default_severity":
+                    try:
+                        sv, _ = normalize_severity(str(val))
+                        cfg["default_severity"] = sv
+                    except ValueError as e:
+                        raise HTTPException(status_code=400, detail=str(e))
+                elif k == "default_assignee":
+                    s = str(val).strip() if val is not None else ""
+                    cfg["default_assignee"] = None if s.lower() in ("", "none", "null") else s
+                elif k == "wip_limits":
+                    if not isinstance(val, dict):
+                        raise HTTPException(status_code=400, detail="wip_limits must be an object mapping state -> limit.")
+                    clean_wip: Dict[str, int] = {}
+                    for wk, wv in val.items():
+                        try:
+                            wst = normalize_state(str(wk))
+                        except ValueError as e:
+                            raise HTTPException(status_code=400, detail=str(e))
+                        if wv is None or str(wv).strip() in ("", "none", "null", "0"):
+                            continue
+                        try:
+                            lim = int(wv)
+                        except (TypeError, ValueError):
+                            raise HTTPException(status_code=400, detail=f"Invalid WIP limit '{wv}' for '{wst}'.")
+                        if lim < 0:
+                            raise HTTPException(status_code=400, detail="WIP limit must be >= 0.")
+                        if lim > 0:
+                            clean_wip[wst] = lim
+                    cfg["wip_limits"] = clean_wip
+                elif k.startswith("wip_limits."):
+                    sub_st_raw = k.split(".", 1)[1]
+                    try:
+                        wst = normalize_state(sub_st_raw)
+                    except ValueError as e:
+                        raise HTTPException(status_code=400, detail=str(e))
+                    cfg.setdefault("wip_limits", {})
+                    if val is None or str(val).strip().lower() in ("", "none", "null", "0"):
+                        cfg["wip_limits"].pop(wst, None)
+                    else:
+                        try:
+                            lim = int(val)
+                        except (TypeError, ValueError):
+                            raise HTTPException(status_code=400, detail=f"Invalid WIP limit '{val}'.")
+                        if lim < 0:
+                            raise HTTPException(status_code=400, detail="WIP limit must be >= 0.")
+                        cfg["wip_limits"][wst] = lim
+                elif k == "preferences":
+                    if not isinstance(val, dict):
+                        raise HTTPException(status_code=400, detail="preferences must be an object.")
+                    prefs = dict(cfg.get("preferences") or {})
+                    prefs.update(val)
+                    cfg["preferences"] = prefs
+                elif k.startswith("preferences."):
+                    pk = k.split(".", 1)[1].strip()
+                    if not pk:
+                        raise HTTPException(status_code=400, detail="Invalid preferences key.")
+                    if pk == "theme" and str(val).lower() not in ("dark", "light"):
+                        raise HTTPException(status_code=400, detail="preferences.theme must be 'dark' or 'light'.")
+                    if pk == "page_size":
+                        try:
+                            ps = int(val)
+                            if ps <= 0 or ps > 500:
+                                raise ValueError()
+                            val = ps
+                        except ValueError:
+                            raise HTTPException(status_code=400, detail="preferences.page_size must be 1..500.")
+                    if pk == "default_swimlane":
+                        try:
+                            val = normalize_swimlane(str(val))
+                        except ValueError as e:
+                            raise HTTPException(status_code=400, detail=str(e))
+                    cfg.setdefault("preferences", {})[pk] = val
+                else:
+                    raise HTTPException(status_code=400, detail=f"Unknown or read-only configuration key '{k}'.")
+
             cfg["updated_at"] = now_iso()
             self._atomic_write_json(self.config_path, cfg)
+            self._update_disk_sig_in_db()
             return cfg
 
-    def get_workflows(self) -> Dict[str, Any]:
-        cfg = self.get_config()
-        return {"statuses": cfg["statuses"], "transitions": cfg["transitions"]}
-
-    def set_workflows(self, statuses: List[str], transitions: Dict[str, List[str]]) -> Dict[str, Any]:
-        if not statuses or not all(isinstance(s, str) and s.strip() for s in statuses):
-            raise HTTPException(status_code=400, detail="statuses must be a non-empty list of status strings.")
-        clean_statuses = [s.strip().lower() for s in statuses]
-        clean_transitions: Dict[str, List[str]] = {}
-        for src, targets in transitions.items():
-            s_clean = src.strip().lower()
-            clean_transitions[s_clean] = [t.strip().lower() for t in targets if t.strip()]
-        with self.write_lock():
-            cfg = self._read_json(self.config_path)
-            cfg["statuses"] = clean_statuses
-            cfg["transitions"] = clean_transitions
-            cfg["updated_at"] = now_iso()
-            self._atomic_write_json(self.config_path, cfg)
-            return {"statuses": clean_statuses, "transitions": clean_transitions}
-
-    # ------------------------------------------------------------------------
-    # Sprints, Milestones, Labels, Components, Users, Views
-    # ------------------------------------------------------------------------
-
-    def _list_dir_json(self, directory: Path) -> List[Dict[str, Any]]:
-        items: List[Dict[str, Any]] = []
-        for p in sorted(directory.glob("*.json")):
-            if p.name.startswith("."):
-                continue
-            items.append(self._read_json(p))
-        return items
-
-    def list_sprints(self, state: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_status(self) -> Dict[str, Any]:
         with self.read_lock():
-            sprints = self._list_dir_json(self.sprints_dir)
-            if state:
-                st = state.strip().lower()
-                sprints = [s for s in sprints if s.get("state") == st]
-            sprints.sort(key=lambda s: int(s.get("seq", 0)))
-            return sprints
-
-    def create_sprint(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        name = (data.get("name") or "").strip()
-        if not name:
-            raise HTTPException(status_code=400, detail="Sprint name is required.")
-        with self.write_lock():
+            assert self._db is not None
             cfg = self._read_json(self.config_path)
-            seq = int(cfg.get("next_sprint_seq", 1))
-            cfg["next_sprint_seq"] = seq + 1
-            cfg["updated_at"] = now_iso()
-            sprint_id = f"SPR-{seq}"
-            ts = now_iso()
-            sprint = {
-                "id": sprint_id,
-                "seq": seq,
-                "name": name,
-                "goal": (data.get("goal") or "").strip(),
-                "state": "planned",
-                "start_date": data.get("start_date") or None,
-                "end_date": data.get("end_date") or None,
-                "started_at": None,
-                "completed_at": None,
-                "created_at": ts,
-                "updated_at": ts,
-            }
-            self._atomic_write_json(self.config_path, cfg)
-            self._atomic_write_json(self.sprints_dir / f"{sprint_id}.json", sprint)
-            return sprint
-
-    def _get_sprint_or_404(self, sprint_id: str) -> Dict[str, Any]:
-        sid = sprint_id.strip().upper()
-        p = self.sprints_dir / f"{sid}.json"
-        if not p.exists():
-            raise HTTPException(status_code=404, detail=f"Sprint '{sid}' not found.")
-        return self._read_json(p)
-
-    def get_sprint_detail(self, sprint_id: str) -> Dict[str, Any]:
-        with self.read_lock():
-            sprint = self._get_sprint_or_404(sprint_id)
-            sid = sprint["id"]
-            rows = self._db.execute(
-                "SELECT raw_json FROM issues WHERE UPPER(sprint_id) = ? ORDER BY priority_rank DESC, seq ASC",
-                (sid,),
-            ).fetchall()
-            issues = self._enrich_issues([json.loads(r["raw_json"]) for r in rows])
-            total_issues = len(issues)
-            done_issues = sum(1 for i in issues if i["status"] == "done")
-            total_pts = round(sum(float(i.get("story_points") or 0.0) for i in issues), 2)
-            done_pts = round(sum(float(i.get("story_points") or 0.0) for i in issues if i["status"] == "done"), 2)
-            pct = round((done_issues / total_issues * 100.0), 1) if total_issues > 0 else 0.0
+            total = int(self._db.execute("SELECT COUNT(*) FROM issues").fetchone()[0])
+            by_state_rows = self._db.execute("SELECT state, COUNT(*) AS c FROM issues GROUP BY state").fetchall()
+            by_state = {r["state"]: int(r["c"]) for r in by_state_rows}
+            active_cnt = sum(c for st, c in by_state.items() if st not in TERMINAL_STATES)
+            sprints = self._read_json(self.sprints_path, {"sprints": []}).get("sprints", [])
+            milestones = self._read_json(self.milestones_path, {"milestones": []}).get("milestones", [])
+            tags = self._read_json(self.tags_path, {"tags": []}).get("tags", [])
+            views = self._read_json(self.views_path, {"views": []}).get("views", [])
+            active_sprints = [s for s in sprints if s.get("state") == "active"]
             return {
-                "sprint": sprint,
-                "issues": issues,
-                "metrics": {
-                    "total_issues": total_issues,
-                    "done_issues": done_issues,
-                    "total_points": total_pts,
-                    "done_points": done_pts,
-                    "progress_pct": pct,
-                },
+                "initialized": True,
+                "repo_root": str(self.repo_root),
+                "issues_root": str(self.issues_root),
+                "project_prefix": cfg.get("project_prefix", "ITR"),
+                "project_title": cfg.get("project_title", "iTrack Workspace"),
+                "total_issues": total,
+                "active_issues": active_cnt,
+                "by_state": by_state,
+                "tag_count": len(tags),
+                "sprint_count": len(sprints),
+                "active_sprints": active_sprints,
+                "milestone_count": len(milestones),
+                "view_count": len(views),
+                "index_db": str(self.db_path),
+                "version": VERSION,
             }
 
-    def update_sprint(self, sprint_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
-        with self.write_lock():
-            sprint = self._get_sprint_or_404(sprint_id)
-            for k in ("name", "goal", "start_date", "end_date"):
-                if k in patch:
-                    sprint[k] = patch[k]
-            if "state" in patch and patch["state"] is not None:
-                st = str(patch["state"]).strip().lower()
-                if st not in ("planned", "active", "completed"):
-                    raise HTTPException(status_code=400, detail="Invalid sprint state. Expected planned, active, or completed.")
-                sprint["state"] = st
-            sprint["updated_at"] = now_iso()
-            self._atomic_write_json(self.sprints_dir / f"{sprint['id']}.json", sprint)
-            return sprint
-
-    def start_sprint(self, sprint_id: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> Dict[str, Any]:
-        with self.write_lock():
-            sprint = self._get_sprint_or_404(sprint_id)
-            if sprint["state"] == "completed":
-                raise HTTPException(status_code=400, detail=f"Sprint '{sprint['id']}' is already completed.")
-            ts = now_iso()
-            sprint["state"] = "active"
-            sprint["started_at"] = sprint.get("started_at") or ts
-            sprint["start_date"] = start_date or sprint.get("start_date") or today_iso()
-            if end_date is not None:
-                sprint["end_date"] = end_date
-            elif not sprint.get("end_date"):
-                sprint["end_date"] = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=14)).strftime("%Y-%m-%d")
-            sprint["updated_at"] = ts
-            self._atomic_write_json(self.sprints_dir / f"{sprint['id']}.json", sprint)
-            return sprint
-
-    def complete_sprint(self, sprint_id: str, rollover_to: Optional[str] = None) -> Dict[str, Any]:
-        with self.write_lock():
-            sprint = self._get_sprint_or_404(sprint_id)
-            sid = sprint["id"]
-            target_sprint: Optional[str] = None
-            if rollover_to and rollover_to.strip().lower() not in ("backlog", "none", "null", ""):
-                target_sprint = rollover_to.strip().upper()
-                if target_sprint == sid:
-                    raise HTTPException(status_code=400, detail="Cannot rollover unfinished issues into the same sprint.")
-                self._get_sprint_or_404(target_sprint)
-
-            ts = now_iso()
-            sprint["state"] = "completed"
-            sprint["completed_at"] = ts
-            sprint["updated_at"] = ts
-            self._atomic_write_json(self.sprints_dir / f"{sid}.json", sprint)
-
-            rows = self._db.execute(
-                "SELECT key FROM issues WHERE UPPER(sprint_id) = ? AND status NOT IN ('done', 'canceled') ORDER BY seq ASC",
-                (sid,),
-            ).fetchall()
-            rolled_keys: List[str] = []
-            for r in rows:
-                iss = self._get_raw_issue_or_404(r["key"])
-                old_sp = iss.get("sprint_id")
-                iss["sprint_id"] = target_sprint
-                iss["updated_at"] = ts
-                iss.setdefault("history", []).append(
-                    {
-                        "id": f"EVT-{short_id()}",
-                        "actor": self.default_user,
-                        "action": "sprint_rollover",
-                        "changes": {"sprint_id": {"from": old_sp, "to": target_sprint}},
-                        "timestamp": ts,
-                    }
-                )
-                self._save_issue(iss)
-                rolled_keys.append(iss["key"])
-
-            return {"sprint": sprint, "rolled_over_keys": rolled_keys}
-
-    def delete_sprint(self, sprint_id: str) -> Dict[str, Any]:
-        with self.write_lock():
-            sprint = self._get_sprint_or_404(sprint_id)
-            sid = sprint["id"]
-            rows = self._db.execute("SELECT key FROM issues WHERE UPPER(sprint_id) = ?", (sid,)).fetchall()
-            ts = now_iso()
-            for r in rows:
-                iss = self._get_raw_issue_or_404(r["key"])
-                iss["sprint_id"] = None
-                iss["updated_at"] = ts
-                self._save_issue(iss)
-            (self.sprints_dir / f"{sid}.json").unlink(missing_ok=True)
-            return {"deleted": True, "id": sid}
-
-    # Milestones
-    def _enrich_milestone(self, ms: Dict[str, Any]) -> Dict[str, Any]:
-        out = dict(ms)
-        mid = ms["id"]
-        rows = self._db.execute("SELECT status FROM issues WHERE UPPER(milestone_id) = ?", (mid,)).fetchall()
-        total = len(rows)
-        done = sum(1 for r in rows if r["status"] == "done")
-        out["total_issues"] = total
-        out["done_issues"] = done
-        out["progress_pct"] = round((done / total * 100.0), 1) if total > 0 else 0.0
-        return out
-
-    def list_milestones(self) -> List[Dict[str, Any]]:
+    def get_stats(self) -> Dict[str, Any]:
         with self.read_lock():
-            items = self._list_dir_json(self.milestones_dir)
-            items.sort(key=lambda m: int(m.get("seq", 0)))
-            return [self._enrich_milestone(m) for m in items]
+            assert self._db is not None
+            folders = [r["folder"] for r in self._db.execute("SELECT folder FROM issues ORDER BY seq ASC").fetchall()]
+            raw_pairs = [(self._read_json(self.issues_dir / f / "issue.json"), self.issues_dir / f) for f in folders if (self.issues_dir / f / "issue.json").exists()]
+            issues = self._enrich_issues_unlocked(raw_pairs)
 
-    def create_milestone(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        name = (data.get("name") or "").strip()
-        if not name:
-            raise HTTPException(status_code=400, detail="Milestone name is required.")
-        status = (data.get("status") or "unreleased").strip().lower()
-        if status not in ("unreleased", "released", "archived"):
-            raise HTTPException(status_code=400, detail="Invalid milestone status.")
-        with self.write_lock():
-            cfg = self._read_json(self.config_path)
-            seq = int(cfg.get("next_milestone_seq", 1))
-            cfg["next_milestone_seq"] = seq + 1
-            cfg["updated_at"] = now_iso()
-            mid = f"MIL-{seq}"
-            ts = now_iso()
-            ms = {
-                "id": mid,
-                "seq": seq,
-                "name": name,
-                "description": (data.get("description") or "").strip(),
-                "target_date": data.get("target_date") or None,
-                "status": status,
-                "created_at": ts,
-                "updated_at": ts,
-            }
-            self._atomic_write_json(self.config_path, cfg)
-            self._atomic_write_json(self.milestones_dir / f"{mid}.json", ms)
-            return self._enrich_milestone(ms)
+            by_state: Dict[str, int] = {st: 0 for st in STATES}
+            by_category: Dict[str, int] = {c: 0 for c in CATEGORIES}
+            by_priority: Dict[str, int] = {p: 0 for p in PRIORITIES}
+            by_severity: Dict[str, int] = {s: 0 for s in SEVERITIES}
+            by_assignee: Dict[str, int] = {}
+            by_tag: Dict[str, int] = {}
 
-    def update_milestone(self, milestone_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
-        with self.write_lock():
-            mid = milestone_id.strip().upper()
-            p = self.milestones_dir / f"{mid}.json"
-            if not p.exists():
-                raise HTTPException(status_code=404, detail=f"Milestone '{mid}' not found.")
-            ms = self._read_json(p)
-            for k in ("name", "description", "target_date"):
-                if k in patch:
-                    ms[k] = patch[k]
-            if "status" in patch and patch["status"] is not None:
-                st = str(patch["status"]).strip().lower()
-                if st not in ("unreleased", "released", "archived"):
-                    raise HTTPException(status_code=400, detail="Invalid milestone status.")
-                ms["status"] = st
-            ms["updated_at"] = now_iso()
-            self._atomic_write_json(p, ms)
-            return self._enrich_milestone(ms)
+            total_points = 0.0
+            completed_points = 0.0
+            total_estimate_minutes = 0
+            total_logged_minutes = 0
+            overdue_count = 0
+            blocked_count = 0
+            archived_count = 0
 
-    def delete_milestone(self, milestone_id: str) -> Dict[str, Any]:
-        with self.write_lock():
-            mid = milestone_id.strip().upper()
-            p = self.milestones_dir / f"{mid}.json"
-            if not p.exists():
-                raise HTTPException(status_code=404, detail=f"Milestone '{mid}' not found.")
-            rows = self._db.execute("SELECT key FROM issues WHERE UPPER(milestone_id) = ?", (mid,)).fetchall()
-            ts = now_iso()
-            for r in rows:
-                iss = self._get_raw_issue_or_404(r["key"])
-                iss["milestone_id"] = None
-                iss["updated_at"] = ts
-                self._save_issue(iss)
-            p.unlink(missing_ok=True)
-            return {"deleted": True, "id": mid}
+            for iss in issues:
+                st = iss.get("state", "backlog")
+                by_state[st] = by_state.get(st, 0) + 1
+                cat = iss.get("category", "task")
+                by_category[cat] = by_category.get(cat, 0) + 1
+                pr = iss.get("priority", "medium")
+                by_priority[pr] = by_priority.get(pr, 0) + 1
+                sv = iss.get("severity", "sev3")
+                by_severity[sv] = by_severity.get(sv, 0) + 1
+                asg = iss.get("assignee") or "unassigned"
+                by_assignee[asg] = by_assignee.get(asg, 0) + 1
+                for tg in iss.get("tags", []):
+                    by_tag[tg] = by_tag.get(tg, 0) + 1
 
-    # Labels & Components
-    def list_labels(self) -> List[Dict[str, Any]]:
-        with self.read_lock():
-            return self._read_json(self.labels_path).get("labels", [])
+                pts = float(iss.get("story_points") or 0.0)
+                total_points += pts
+                if st == "done":
+                    completed_points += pts
+                total_estimate_minutes += int(iss.get("estimate_minutes") or 0)
+                total_logged_minutes += int(iss.get("logged_minutes") or 0)
+                if iss.get("is_overdue"):
+                    overdue_count += 1
+                if iss.get("is_blocked"):
+                    blocked_count += 1
+                if iss.get("archived") or st == "archived":
+                    archived_count += 1
 
-    def add_label(self, name: str, color: Optional[str] = None, description: Optional[str] = None) -> Dict[str, Any]:
-        clean = (name or "").strip()
-        if not clean:
-            raise HTTPException(status_code=400, detail="Label name is required.")
-        with self.write_lock():
-            doc = self._read_json(self.labels_path)
-            labels = doc.get("labels", [])
-            ts = now_iso()
-            for lb in labels:
-                if lb["name"].lower() == clean.lower():
-                    if color is not None:
-                        lb["color"] = color
-                    if description is not None:
-                        lb["description"] = description
-                    lb["updated_at"] = ts
-                    self._atomic_write_json(self.labels_path, {"labels": labels})
-                    return lb
-            entry = {
-                "name": clean,
-                "color": color or "#3b82f6",
-                "description": description or "",
-                "created_at": ts,
-            }
-            labels.append(entry)
-            self._atomic_write_json(self.labels_path, {"labels": labels})
-            return entry
+            total = len(issues)
+            done_count = by_state.get("done", 0)
+            active_count = sum(1 for i in issues if i.get("state") not in TERMINAL_STATES)
+            sprints = self._read_json(self.sprints_path, {"sprints": []}).get("sprints", [])
+            milestones = self._read_json(self.milestones_path, {"milestones": []}).get("milestones", [])
 
-    def delete_label(self, name: str) -> Dict[str, Any]:
-        clean = name.strip()
-        with self.write_lock():
-            doc = self._read_json(self.labels_path)
-            labels = doc.get("labels", [])
-            new_labels = [lb for lb in labels if lb["name"].lower() != clean.lower()]
-            if len(new_labels) == len(labels):
-                raise HTTPException(status_code=404, detail=f"Label '{clean}' not found.")
-            self._atomic_write_json(self.labels_path, {"labels": new_labels})
-            rows = self._db.execute(
-                "SELECT issue_key FROM issue_labels WHERE LOWER(label) = LOWER(?)", (clean,)
-            ).fetchall()
-            ts = now_iso()
-            for r in rows:
-                iss = self._get_raw_issue_or_404(r["issue_key"])
-                iss["labels"] = [l for l in iss.get("labels", []) if l.lower() != clean.lower()]
-                iss["updated_at"] = ts
-                self._save_issue(iss)
-            return {"deleted": True, "name": clean}
+            sprint_velocity: List[Dict[str, Any]] = []
+            for sp in sprints:
+                sid = sp["id"]
+                sp_issues = [i for i in issues if i.get("sprint") == sid]
+                sp_done = [i for i in sp_issues if i.get("state") == "done"]
+                sprint_velocity.append({
+                    "id": sid,
+                    "name": sp.get("name", sid),
+                    "state": sp.get("state", "planned"),
+                    "total_issues": len(sp_issues),
+                    "done_issues": len(sp_done),
+                    "total_points": round(sum(float(i.get("story_points") or 0.0) for i in sp_issues), 2),
+                    "completed_points": round(sum(float(i.get("story_points") or 0.0) for i in sp_done), 2),
+                })
 
-    def list_components(self) -> List[Dict[str, Any]]:
-        with self.read_lock():
-            return self._read_json(self.components_path).get("components", [])
-
-    def add_component(self, name: str, lead: Optional[str] = None, description: Optional[str] = None) -> Dict[str, Any]:
-        clean = (name or "").strip()
-        if not clean:
-            raise HTTPException(status_code=400, detail="Component name is required.")
-        with self.write_lock():
-            doc = self._read_json(self.components_path)
-            comps = doc.get("components", [])
-            ts = now_iso()
-            for cp in comps:
-                if cp["name"].lower() == clean.lower():
-                    if lead is not None:
-                        cp["lead"] = lead
-                    if description is not None:
-                        cp["description"] = description
-                    cp["updated_at"] = ts
-                    self._atomic_write_json(self.components_path, {"components": comps})
-                    return cp
-            entry = {
-                "name": clean,
-                "lead": lead or None,
-                "description": description or "",
-                "created_at": ts,
-            }
-            comps.append(entry)
-            self._atomic_write_json(self.components_path, {"components": comps})
-            return entry
-
-    def delete_component(self, name: str) -> Dict[str, Any]:
-        clean = name.strip()
-        with self.write_lock():
-            doc = self._read_json(self.components_path)
-            comps = doc.get("components", [])
-            new_comps = [cp for cp in comps if cp["name"].lower() != clean.lower()]
-            if len(new_comps) == len(comps):
-                raise HTTPException(status_code=404, detail=f"Component '{clean}' not found.")
-            self._atomic_write_json(self.components_path, {"components": new_comps})
-            rows = self._db.execute(
-                "SELECT issue_key FROM issue_components WHERE LOWER(component) = LOWER(?)", (clean,)
-            ).fetchall()
-            ts = now_iso()
-            for r in rows:
-                iss = self._get_raw_issue_or_404(r["issue_key"])
-                iss["components"] = [c for c in iss.get("components", []) if c.lower() != clean.lower()]
-                iss["updated_at"] = ts
-                self._save_issue(iss)
-            return {"deleted": True, "name": clean}
-
-    # Users / Agents
-    def list_users(self) -> List[Dict[str, Any]]:
-        with self.read_lock():
-            return self._read_json(self.users_path).get("users", [])
-
-    def upsert_user(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        uname = (data.get("username") or "").strip()
-        if not uname:
-            raise HTTPException(status_code=400, detail="username is required.")
-        with self.write_lock():
-            doc = self._read_json(self.users_path)
-            users = doc.get("users", [])
-            ts = now_iso()
-            for u in users:
-                if u["username"].lower() == uname.lower():
-                    for k in ("display_name", "email", "role", "is_agent", "avatar_color"):
-                        if k in data and data[k] is not None:
-                            u[k] = data[k]
-                    u["updated_at"] = ts
-                    self._atomic_write_json(self.users_path, {"users": users})
-                    return u
-            entry = {
-                "username": uname,
-                "display_name": data.get("display_name") or uname,
-                "email": data.get("email") or "",
-                "role": data.get("role") or ("agent" if data.get("is_agent") else "developer"),
-                "is_agent": bool(data.get("is_agent", False)),
-                "avatar_color": data.get("avatar_color") or "#2563eb",
-                "created_at": ts,
-                "updated_at": ts,
-            }
-            users.append(entry)
-            self._atomic_write_json(self.users_path, {"users": users})
-            return entry
-
-    def get_user_detail(self, username: str) -> Dict[str, Any]:
-        uname = username.strip()
-        with self.read_lock():
-            users = self._read_json(self.users_path).get("users", [])
-            found = next((u for u in users if u["username"].lower() == uname.lower()), None)
-            if not found:
-                raise HTTPException(status_code=404, detail=f"User '{uname}' not found.")
-            assigned = self._db.execute(
-                "SELECT COUNT(*) AS c FROM issues WHERE LOWER(assignee) = LOWER(?)", (uname,)
-            ).fetchone()["c"]
-            in_prog = self._db.execute(
-                "SELECT COUNT(*) AS c FROM issues WHERE LOWER(assignee) = LOWER(?) AND status = 'in_progress'",
-                (uname,),
-            ).fetchone()["c"]
             return {
-                "user": found,
-                "assigned_issues": int(assigned),
-                "in_progress_issues": int(in_prog),
+                "total_issues": total,
+                "active_issues": active_count,
+                "done_issues": done_count,
+                "blocked_issues": blocked_count,
+                "overdue_issues": overdue_count,
+                "archived_issues": archived_count,
+                "completion_rate_pct": round(done_count / total * 100.0, 1) if total else 0.0,
+                "total_points": round(total_points, 2),
+                "completed_points": round(completed_points, 2),
+                "total_estimate_minutes": total_estimate_minutes,
+                "total_logged_minutes": total_logged_minutes,
+                "by_state": by_state,
+                "by_category": by_category,
+                "by_priority": by_priority,
+                "by_severity": by_severity,
+                "by_assignee": by_assignee,
+                "by_tag": by_tag,
+                "sprint_velocity": sprint_velocity,
+                "milestone_count": len(milestones),
             }
 
-    def update_user(self, username: str, patch: Dict[str, Any]) -> Dict[str, Any]:
-        uname = username.strip()
-        with self.write_lock():
-            doc = self._read_json(self.users_path)
-            users = doc.get("users", [])
-            found = next((u for u in users if u["username"].lower() == uname.lower()), None)
-            if not found:
-                raise HTTPException(status_code=404, detail=f"User '{uname}' not found.")
-            for k in ("display_name", "email", "role", "is_agent", "avatar_color"):
-                if k in patch and patch[k] is not None:
-                    found[k] = patch[k]
-            found["updated_at"] = now_iso()
-            self._atomic_write_json(self.users_path, {"users": users})
-            return found
-
-    def delete_user(self, username: str) -> Dict[str, Any]:
-        uname = username.strip()
-        with self.write_lock():
-            doc = self._read_json(self.users_path)
-            users = doc.get("users", [])
-            new_users = [u for u in users if u["username"].lower() != uname.lower()]
-            if len(new_users) == len(users):
-                raise HTTPException(status_code=404, detail=f"User '{uname}' not found.")
-            self._atomic_write_json(self.users_path, {"users": new_users})
-            return {"deleted": True, "username": uname}
-
-    # Saved Views
-    def list_views(self) -> List[Dict[str, Any]]:
+    def get_tree(self, root_ref: Optional[str] = None) -> Dict[str, Any]:
         with self.read_lock():
-            views = self._list_dir_json(self.views_dir)
-            views.sort(key=lambda v: int(v.get("seq", 0)))
-            return views
+            assert self._db is not None
+            folders = [r["folder"] for r in self._db.execute("SELECT folder FROM issues ORDER BY seq ASC").fetchall()]
+            raw_pairs = [(self._read_json(self.issues_dir / f / "issue.json"), self.issues_dir / f) for f in folders if (self.issues_dir / f / "issue.json").exists()]
+            issues = self._enrich_issues_unlocked(raw_pairs)
+            by_key = {i["key"]: i for i in issues}
+            children_map: Dict[Optional[str], List[Dict[str, Any]]] = {}
+            for i in issues:
+                p = i.get("parent")
+                if p and p not in by_key:
+                    p = None
+                children_map.setdefault(p, []).append(i)
 
-    def create_view(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        name = (data.get("name") or "").strip()
-        if not name:
-            raise HTTPException(status_code=400, detail="View name is required.")
-        iql_str = data.get("iql") or ""
-        try:
-            ast = parse_iql(iql_str)
-            compiler = self._make_compiler()
-            compiler.compile_where(ast["where"])
-            compiler.compile_order_by(ast["order_by"])
-        except IQLError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid iQL: {e.message}")
-        layout = (data.get("layout") or "list").strip().lower()
-        if layout not in ("board", "list"):
-            raise HTTPException(status_code=400, detail="layout must be 'board' or 'list'.")
-        with self.write_lock():
-            cfg = self._read_json(self.config_path)
-            seq = int(cfg.get("next_view_seq", 1))
-            cfg["next_view_seq"] = seq + 1
-            cfg["updated_at"] = now_iso()
-            vid = f"VIEW-{seq}"
-            ts = now_iso()
-            view = {
-                "id": vid,
-                "seq": seq,
-                "name": name,
-                "iql": iql_str,
-                "layout": layout,
-                "description": data.get("description") or "",
-                "icon": data.get("icon") or "filter",
-                "created_at": ts,
-                "updated_at": ts,
-            }
-            self._atomic_write_json(self.config_path, cfg)
-            self._atomic_write_json(self.views_dir / f"{vid}.json", view)
-            return view
+            def build_node(iss: Dict[str, Any], visited: Set[str]) -> Dict[str, Any]:
+                k = iss["key"]
+                visited.add(k)
+                kids = [
+                    build_node(ch, set(visited))
+                    for ch in children_map.get(k, [])
+                    if ch["key"] not in visited
+                ]
+                return {
+                    "key": k,
+                    "name": iss["name"],
+                    "category": iss["category"],
+                    "state": iss["state"],
+                    "priority": iss["priority"],
+                    "assignee": iss.get("assignee"),
+                    "is_blocked": iss["is_blocked"],
+                    "unresolved_blockers": iss["unresolved_blockers"],
+                    "links": iss.get("links", []),
+                    "children": kids,
+                }
 
-    def update_view(self, view_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
-        vid = view_id.strip().upper()
-        with self.write_lock():
-            p = self.views_dir / f"{vid}.json"
-            if not p.exists():
-                raise HTTPException(status_code=404, detail=f"View '{vid}' not found.")
-            view = self._read_json(p)
-            if "iql" in patch and patch["iql"] is not None:
-                try:
-                    ast = parse_iql(patch["iql"])
-                    compiler = self._make_compiler()
-                    compiler.compile_where(ast["where"])
-                    compiler.compile_order_by(ast["order_by"])
-                except IQLError as e:
-                    raise HTTPException(status_code=400, detail=f"Invalid iQL: {e.message}")
-                view["iql"] = patch["iql"]
-            if "layout" in patch and patch["layout"] is not None:
-                ly = str(patch["layout"]).strip().lower()
-                if ly not in ("board", "list"):
-                    raise HTTPException(status_code=400, detail="layout must be 'board' or 'list'.")
-                view["layout"] = ly
-            for k in ("name", "description", "icon"):
-                if k in patch and patch[k] is not None:
-                    view[k] = patch[k]
-            view["updated_at"] = now_iso()
-            self._atomic_write_json(p, view)
-            return view
+            if root_ref and str(root_ref).strip():
+                root_iss_raw, _ = self._resolve_issue_unlocked(root_ref)
+                root_iss = by_key[root_iss_raw["key"]]
+                return {"root": root_iss["key"], "trees": [build_node(root_iss, set())]}
 
-    def delete_view(self, view_id: str) -> Dict[str, Any]:
-        vid = view_id.strip().upper()
-        with self.write_lock():
-            p = self.views_dir / f"{vid}.json"
-            if not p.exists():
-                raise HTTPException(status_code=404, detail=f"View '{vid}' not found.")
-            p.unlink(missing_ok=True)
-            return {"deleted": True, "id": vid}
+            roots = children_map.get(None, [])
+            return {"root": None, "trees": [build_node(r, set()) for r in roots]}
+
 
     # ------------------------------------------------------------------------
-    # Issues CRUD, Lifecycle, Subtasks, Bulk & Agent Coordination
+    # Internal Reference & AC Helpers
     # ------------------------------------------------------------------------
 
-    def _clean_nullable_id(self, val: Optional[str]) -> Optional[str]:
-        if val is None:
-            return None
-        s = str(val).strip()
-        if not s or s.lower() in ("none", "null", "unassigned", "backlog"):
-            return None
-        return s.upper()
-
-    def _clean_assignee(self, val: Optional[str]) -> Optional[str]:
-        if val is None:
-            return None
-        s = str(val).strip()
-        if not s or s.lower() in ("none", "null", "unassigned"):
-            return None
-        return s
-
-    def _dedupe_strs(self, items: Optional[List[str]]) -> List[str]:
+    def _dedupe_strs(self, items: Optional[List[Any]]) -> List[str]:
         if not items:
             return []
         seen: Set[str] = set()
         out: List[str] = []
-        for x in items:
-            s = str(x).strip()
+        for raw in items:
+            s = str(raw).strip()
             if s and s.lower() not in seen:
                 seen.add(s.lower())
                 out.append(s)
         return out
 
-    def create_issue(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        title = (data.get("title") or "").strip()
-        if not title:
-            raise HTTPException(status_code=400, detail="Issue title cannot be empty.")
-        with self.write_lock():
-            cfg = self._read_json(self.config_path)
-            itype = (data.get("type") or cfg.get("default_type", "task")).strip().lower()
-            if itype not in cfg["issue_types"]:
+    def _ensure_tags_registered_unlocked(self, tag_names: List[str]) -> None:
+        if not tag_names:
+            return
+        doc = self._read_json(self.tags_path, {"tags": []})
+        tags = list(doc.get("tags", []))
+        existing = {t["name"].lower() for t in tags if isinstance(t, dict) and "name" in t}
+        palette = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#06b6d4", "#84cc16"]
+        added = False
+        ts = now_iso()
+        for tname in tag_names:
+            if tname.lower() not in existing:
+                color = palette[len(tags) % len(palette)]
+                tags.append({"name": tname, "color": color, "description": "", "created_at": ts, "updated_at": ts})
+                existing.add(tname.lower())
+                added = True
+        if added:
+            self._atomic_write_json(self.tags_path, {"tags": tags})
+
+    def _find_sprint_unlocked(self, sprint_ref: str) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any]]:
+        ref = urllib.parse.unquote(str(sprint_ref)).strip()
+        sprints = list(self._read_json(self.sprints_path, {"sprints": []}).get("sprints", []))
+        for idx, sp in enumerate(sprints):
+            if str(sp.get("id", "")).upper() == ref.upper() or str(sp.get("name", "")).lower() == ref.lower():
+                return sprints, idx, sp
+        raise HTTPException(status_code=404, detail=f"Sprint '{ref}' not found.")
+
+    def _find_milestone_unlocked(self, milestone_ref: str) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any]]:
+        ref = urllib.parse.unquote(str(milestone_ref)).strip()
+        milestones = list(self._read_json(self.milestones_path, {"milestones": []}).get("milestones", []))
+        for idx, ms in enumerate(milestones):
+            if str(ms.get("id", "")).upper() == ref.upper() or str(ms.get("name", "")).lower() == ref.lower():
+                return milestones, idx, ms
+        raise HTTPException(status_code=404, detail=f"Milestone '{ref}' not found.")
+
+    def _find_view_unlocked(self, view_ref: str) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any]]:
+        ref = urllib.parse.unquote(str(view_ref)).strip()
+        views = list(self._read_json(self.views_path, {"views": []}).get("views", []))
+        for idx, vw in enumerate(views):
+            if str(vw.get("id", "")).upper() == ref.upper() or str(vw.get("name", "")).lower() == ref.lower():
+                return views, idx, vw
+        raise HTTPException(status_code=404, detail=f"Saved view '{ref}' not found.")
+
+    def _check_other_issue_name_collision_unlocked(self, candidate_name: str, exclude_key: Optional[str] = None) -> Optional[str]:
+        cand_low = candidate_name.lower()
+        if self.issues_dir.exists():
+            for ent in os.scandir(self.issues_dir):
+                if not ent.is_dir(follow_symlinks=False) or ent.name.startswith("."):
+                    continue
+                if ent.name.lower() == cand_low:
+                    ij = Path(ent.path) / "issue.json"
+                    if ij.exists():
+                        iss = self._read_json(ij)
+                        if exclude_key and iss.get("key") == exclude_key:
+                            continue
+                        return iss.get("key", ent.name)
+                    return ent.name
+        return None
+
+    def _check_parent_cycle_unlocked(self, child_key: str, candidate_parent_key: str) -> None:
+        if child_key == candidate_parent_key:
+            raise HTTPException(status_code=409, detail=f"Issue '{child_key}' cannot be its own parent.")
+        assert self._db is not None
+        rows = self._db.execute("SELECT key, parent FROM issues").fetchall()
+        parent_of = {r["key"]: r["parent"] for r in rows}
+        curr: Optional[str] = candidate_parent_key
+        visited: Set[str] = set()
+        while curr:
+            if curr == child_key:
                 raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid issue type '{itype}'. Allowed: {', '.join(cfg['issue_types'])}.",
+                    status_code=409,
+                    detail=f"Setting parent of '{child_key}' to '{candidate_parent_key}' creates a hierarchy cycle.",
                 )
-            status = (data.get("status") or "todo").strip().lower()
-            if status not in cfg["statuses"]:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid status '{status}'. Allowed: {', '.join(cfg['statuses'])}.",
-                )
+            if curr in visited:
+                break
+            visited.add(curr)
+            curr = parent_of.get(curr)
+
+    def _parse_ac_input_list(self, raw_ac: Any) -> List[Dict[str, Any]]:
+        if raw_ac is None:
+            return []
+        if not isinstance(raw_ac, list):
+            raise ValueError("acceptance_criteria must be a list.")
+        out: List[Dict[str, Any]] = []
+        seq = 1
+        for item in raw_ac:
+            if isinstance(item, dict):
+                txt = str(item.get("text", "")).strip()
+                if not txt:
+                    continue
+                checked = bool(item.get("checked", False))
+                acid = str(item.get("id") or f"AC-{seq}").strip()
+                m = re.search(r"-(\d+)$", acid)
+                if m:
+                    seq = max(seq, int(m.group(1)))
+                out.append({"id": acid, "text": txt, "checked": checked})
+                seq += 1
+            else:
+                s = str(item).strip()
+                if not s:
+                    continue
+                checked = False
+                m_chk = re.match(r"^(?:-\s*)?\[([xX ])\]\s*(.+)$", s)
+                if m_chk:
+                    checked = m_chk.group(1).lower() == "x"
+                    s = m_chk.group(2).strip()
+                out.append({"id": f"AC-{seq}", "text": s, "checked": checked})
+                seq += 1
+        return out
+
+    def _find_ac_index(self, ac_list: List[Dict[str, Any]], ref: Any) -> int:
+        s = str(ref).strip()
+        for i, item in enumerate(ac_list):
+            if str(item.get("id", "")).upper() == s.upper():
+                return i
+        if re.fullmatch(r"\d+", s):
+            idx_1 = int(s)
+            if 1 <= idx_1 <= len(ac_list):
+                return idx_1 - 1
+        raise HTTPException(status_code=400, detail=f"Acceptance criterion '{ref}' not found.")
+
+    # ------------------------------------------------------------------------
+    # Issues Querying, Search, Pagination & Kanban Board
+    # ------------------------------------------------------------------------
+
+    def _make_compiler_unlocked(self) -> IQLCompiler:
+        sprints = self._read_json(self.sprints_path, {"sprints": []}).get("sprints", [])
+        milestones = self._read_json(self.milestones_path, {"milestones": []}).get("milestones", [])
+        sprint_map: Dict[str, str] = {}
+        active_sprints: List[str] = []
+        for sp in sprints:
+            sid = sp["id"]
+            sprint_map[sid.lower()] = sid
+            sprint_map[str(sp.get("name", "")).lower()] = sid
+            if sp.get("state") == "active":
+                active_sprints.append(sid)
+        milestone_map: Dict[str, str] = {}
+        for ms in milestones:
+            mid = ms["id"]
+            milestone_map[mid.lower()] = mid
+            milestone_map[str(ms.get("name", "")).lower()] = mid
+        return IQLCompiler(
+            current_user=self.default_user,
+            sprint_map=sprint_map,
+            milestone_map=milestone_map,
+            active_sprint_ids=active_sprints,
+        )
+
+    def _tab_sql_clause(self, tab: str) -> str:
+        if tab == "active":
+            return "(issues.state IN ('triage','backlog','todo','ready','in-progress','in-review','in-qa','on-hold','blocked') AND issues.archived = 0)"
+        if tab == "open":
+            return "(issues.state IN ('triage','backlog','todo','ready') AND issues.archived = 0)"
+        if tab == "in-progress":
+            return "(issues.state IN ('in-progress','in-review','in-qa') AND issues.archived = 0)"
+        if tab == "blocked":
+            return f"({IQLCompiler.BLOCKED_SQL} AND issues.state NOT IN ('done','cancelled','archived'))"
+        if tab == "completed":
+            return "(issues.state = 'done')"
+        if tab == "cancelled":
+            return "(issues.state = 'cancelled')"
+        if tab == "archived":
+            return "(issues.state = 'archived' OR issues.archived = 1)"
+        return "1 = 1"
+
+    def query_issues(
+        self,
+        tab: Optional[str] = None,
+        q: Optional[str] = None,
+        iql: Optional[str] = None,
+        category: Optional[str] = None,
+        state: Optional[str] = None,
+        priority: Optional[str] = None,
+        severity: Optional[str] = None,
+        resolution: Optional[str] = None,
+        assignee: Optional[str] = None,
+        reporter: Optional[str] = None,
+        tag: Optional[str] = None,
+        component: Optional[str] = None,
+        parent: Optional[str] = None,
+        sprint: Optional[str] = None,
+        milestone: Optional[str] = None,
+        overdue: Optional[bool] = None,
+        sort: Optional[str] = None,
+        order: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> Dict[str, Any]:
+        if page < 1:
+            raise HTTPException(status_code=400, detail="page must be >= 1.")
+        if page_size < 1 or page_size > 1000:
+            raise HTTPException(status_code=400, detail="page_size must be between 1 and 1000.")
+
+        try:
+            eff_tab = normalize_tab(tab) if tab else "all"
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        with self.read_lock():
+            assert self._db is not None
+            compiler = self._make_compiler_unlocked()
+            where_clauses: List[str] = [self._tab_sql_clause(eff_tab)]
+            sql_params: List[Any] = []
+            order_items: List[Dict[str, str]] = []
+
+            if iql and iql.strip():
+                try:
+                    ast = parse_iql(iql)
+                    w_sql, w_params = compiler.compile_where(ast["where"])
+                    where_clauses.append(f"({w_sql})")
+                    sql_params.extend(w_params)
+                    order_items = ast["order_by"]
+                except IQLError as e:
+                    raise HTTPException(status_code=400, detail=f"Invalid iQL: {e.message}")
+
+            if q and q.strip():
+                try:
+                    # Auto-detect if q looks like valid structured iQL with operators
+                    q_str = q.strip()
+                    used_as_iql = False
+                    if not iql and re.search(r"(\b(?:AND|OR|NOT|IN|IS|ORDER\s+BY)\b|[=!<>~])", q_str):
+                        try:
+                            q_ast = parse_iql(q_str)
+                            qw_sql, qw_params = compiler.compile_where(q_ast["where"])
+                            where_clauses.append(f"({qw_sql})")
+                            sql_params.extend(qw_params)
+                            if q_ast["order_by"] and not order_items:
+                                order_items = q_ast["order_by"]
+                            used_as_iql = True
+                        except IQLError:
+                            used_as_iql = False
+                    if not used_as_iql:
+                        ft_sql, ft_params = compiler._compile_cmp("text", "~", q_str)
+                        where_clauses.append(f"({ft_sql})")
+                        sql_params.extend(ft_params)
+                except IQLError as e:
+                    raise HTTPException(status_code=400, detail=str(e))
+
+            filter_pairs: List[Tuple[str, Optional[str]]] = [
+                ("category", category),
+                ("state", state),
+                ("priority", priority),
+                ("severity", severity),
+                ("resolution", resolution),
+                ("assignee", assignee),
+                ("reporter", reporter),
+                ("tags", tag),
+                ("components", component),
+                ("sprint", sprint),
+                ("milestone", milestone),
+            ]
+            for f_name, f_val in filter_pairs:
+                if f_val is not None and str(f_val).strip() != "":
+                    raw_s = str(f_val).strip()
+                    try:
+                        if "," in raw_s and f_name in ("category", "state", "priority", "severity", "tags", "components"):
+                            vals = [x.strip() for x in raw_s.split(",") if x.strip()]
+                            c_sql, c_params = compiler._compile_in(f_name, False, vals)
+                        else:
+                            c_sql, c_params = compiler._compile_cmp(f_name, "=", raw_s)
+                    except (ValueError, IQLError) as e:
+                        raise HTTPException(status_code=400, detail=str(e))
+                    where_clauses.append(f"({c_sql})")
+                    sql_params.extend(c_params)
+
+            if parent is not None and str(parent).strip() != "":
+                p_str = str(parent).strip()
+                if p_str.lower() in ("none", "null"):
+                    where_clauses.append("(issues.parent IS NULL OR issues.parent = '')")
+                else:
+                    try:
+                        p_iss, _ = self._resolve_issue_unlocked(p_str)
+                        p_key = p_iss["key"]
+                    except HTTPException:
+                        p_key = p_str.upper()
+                    where_clauses.append("UPPER(issues.parent) = UPPER(?)")
+                    sql_params.append(p_key)
+
+            if overdue is not None:
+                ov_sql, ov_params = compiler._compile_cmp("is_overdue", "=", "true" if overdue else "false")
+                where_clauses.append(f"({ov_sql})")
+                sql_params.extend(ov_params)
+
             try:
+                order_sql = compiler.compile_order_by(order_items, sort_field=sort, sort_order=order)
+            except IQLError as e:
+                raise HTTPException(status_code=400, detail=e.message)
+
+            full_where = " AND ".join(where_clauses)
+            total = int(
+                self._db.execute(f"SELECT COUNT(*) FROM issues WHERE {full_where}", sql_params).fetchone()[0]
+            )
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            offset = (page - 1) * page_size
+
+            rows = self._db.execute(
+                f"SELECT folder FROM issues WHERE {full_where} ORDER BY {order_sql} LIMIT ? OFFSET ?",
+                [*sql_params, page_size, offset],
+            ).fetchall()
+
+            pairs: List[Tuple[Dict[str, Any], Path]] = []
+            for r in rows:
+                idir = self.issues_dir / r["folder"]
+                if (idir / "issue.json").exists():
+                    pairs.append((self._read_json(idir / "issue.json"), idir))
+            issues = self._enrich_issues_unlocked(pairs)
+
+            return {
+                "issues": issues,
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": total_pages,
+                "has_prev": page > 1,
+                "has_next": page < total_pages,
+                "tab": eff_tab,
+            }
+
+    def get_board(
+        self,
+        swimlane: Optional[str] = "none",
+        category: Optional[str] = None,
+        priority: Optional[str] = None,
+        assignee: Optional[str] = None,
+        sprint: Optional[str] = None,
+        tag: Optional[str] = None,
+        q: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        try:
+            sw = normalize_swimlane(swimlane)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        res = self.query_issues(
+            tab="all",
+            q=q,
+            category=category,
+            priority=priority,
+            assignee=assignee,
+            sprint=sprint,
+            tag=tag,
+            sort="priority",
+            order="desc",
+            page=1,
+            page_size=1000,
+        )
+        # Exclude archived from board unless explicitly searched
+        issues = [i for i in res["issues"] if not i.get("archived") and i.get("state") != "archived"]
+        cfg = self.get_config()
+        wip_limits = cfg.get("wip_limits") or {}
+        board_states = [s for s in STATES if s != "archived"]
+
+        def build_columns(subset: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            cols: List[Dict[str, Any]] = []
+            for st in board_states:
+                col_items = [i for i in subset if i.get("state") == st]
+                lim = wip_limits.get(st)
+                pts = round(sum(float(i.get("story_points") or 0.0) for i in col_items), 2)
+                cols.append({
+                    "state": st,
+                    "count": len(col_items),
+                    "points": pts,
+                    "wip_limit": lim,
+                    "wip_exceeded": bool(lim is not None and len(col_items) > int(lim)),
+                    "issues": col_items,
+                })
+            return cols
+
+        columns = build_columns(issues)
+        lanes: List[Dict[str, Any]] = []
+        if sw == "none":
+            lanes.append({"key": "all", "label": "All Issues", "count": len(issues), "columns": columns})
+        elif sw == "category":
+            present = [c for c in CATEGORIES if any(i.get("category") == c for i in issues)] or ["task"]
+            for c in present:
+                sub = [i for i in issues if i.get("category") == c]
+                lanes.append({"key": c, "label": c, "count": len(sub), "columns": build_columns(sub)})
+        elif sw == "priority":
+            for p in PRIORITIES:
+                sub = [i for i in issues if i.get("priority") == p]
+                if sub or not issues:
+                    lanes.append({"key": p, "label": p, "count": len(sub), "columns": build_columns(sub)})
+        elif sw == "assignee":
+            assignees = sorted({i.get("assignee") or "unassigned" for i in issues}) or ["unassigned"]
+            for a in assignees:
+                sub = [i for i in issues if (i.get("assignee") or "unassigned") == a]
+                lanes.append({"key": a, "label": a, "count": len(sub), "columns": build_columns(sub)})
+        elif sw == "sprint":
+            sprints_list = self._read_json(self.sprints_path, {"sprints": []}).get("sprints", [])
+            sp_names = {s["id"]: f"{s['id']} — {s.get('name', '')}" for s in sprints_list}
+            sp_keys = sorted({i.get("sprint") or "backlog" for i in issues}) or ["backlog"]
+            for sk in sp_keys:
+                sub = [i for i in issues if (i.get("sprint") or "backlog") == sk]
+                lanes.append({
+                    "key": sk,
+                    "label": "Backlog (No Sprint)" if sk == "backlog" else sp_names.get(sk, sk),
+                    "count": len(sub),
+                    "columns": build_columns(sub),
+                })
+
+        return {
+            "swimlane": sw,
+            "states": board_states,
+            "wip_limits": wip_limits,
+            "total_issues": len(issues),
+            "columns": columns,
+            "lanes": lanes,
+        }
+
+    # ------------------------------------------------------------------------
+    # Issue Create, Edit/Clear, Rename, Clone, Archive, Delete, Context & History
+    # ------------------------------------------------------------------------
+
+    def create_issue(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            name = validate_issue_name(data.get("name") if "name" in data else data.get("title"))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        with self.write_lock():
+            if self._check_other_issue_name_collision_unlocked(name) is not None:
+                raise HTTPException(status_code=400, detail=f"An issue named '{name}' already exists.")
+
+            cfg = self._read_json(self.config_path)
+            try:
+                category = normalize_category(data.get("category"), cfg.get("default_category", "task"))
+                state = normalize_state(data.get("state"), cfg.get("default_state", "backlog"))
                 priority, p_rank = normalize_priority(data.get("priority"), cfg.get("default_priority", "medium"))
+                severity, s_rank = normalize_severity(data.get("severity"), cfg.get("default_severity", "sev3"))
+                resolution = normalize_resolution(data.get("resolution"))
+                story_points = validate_story_points(data.get("story_points"))
+                estimate_minutes = validate_estimate_minutes(data.get("estimate_minutes"))
+                due_date = validate_calendar_date(data.get("due_date"), "due_date")
+                ac_list = self._parse_ac_input_list(data.get("acceptance_criteria"))
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
 
-            parent_id = self._clean_nullable_id(data.get("parent_id"))
-            if parent_id:
-                self._get_raw_issue_or_404(parent_id)
-            epic_id = self._clean_nullable_id(data.get("epic_id"))
-            if epic_id:
-                self._get_raw_issue_or_404(epic_id)
-            sprint_id = self._clean_nullable_id(data.get("sprint_id"))
-            if sprint_id:
-                self._get_sprint_or_404(sprint_id)
-            milestone_id = self._clean_nullable_id(data.get("milestone_id"))
-            if milestone_id and not (self.milestones_dir / f"{milestone_id}.json").exists():
-                raise HTTPException(status_code=404, detail=f"Milestone '{milestone_id}' not found.")
+            parent_key: Optional[str] = None
+            if data.get("parent") and str(data["parent"]).strip().lower() not in ("", "none", "null"):
+                p_iss, _ = self._resolve_issue_unlocked(str(data["parent"]))
+                parent_key = p_iss["key"]
 
-            seq = int(cfg.get("next_seq", 1))
-            key = f"{cfg['project_key']}-{seq}"
-            cfg["next_seq"] = seq + 1
+            sprint_id: Optional[str] = None
+            if data.get("sprint") and str(data["sprint"]).strip().lower() not in ("", "none", "null", "backlog"):
+                _, _, sp_obj = self._find_sprint_unlocked(str(data["sprint"]))
+                sprint_id = sp_obj["id"]
+
+            milestone_id: Optional[str] = None
+            if data.get("milestone") and str(data["milestone"]).strip().lower() not in ("", "none", "null"):
+                _, _, ms_obj = self._find_milestone_unlocked(str(data["milestone"]))
+                milestone_id = ms_obj["id"]
+
+            raw_cf = data.get("custom_fields")
+            custom_fields: Dict[str, Any] = {}
+            if raw_cf is not None:
+                if not isinstance(raw_cf, dict):
+                    raise HTTPException(status_code=400, detail="custom_fields must be an object.")
+                for ck, cv in raw_cf.items():
+                    ks = str(ck).strip()
+                    if ks and cv is not None:
+                        custom_fields[ks] = cv
+
+            tags = self._dedupe_strs(data.get("tags"))
+            components = self._dedupe_strs(data.get("components"))
+            self._ensure_tags_registered_unlocked(tags)
+
+            actor = str(data.get("actor") or data.get("reporter") or self.default_user).strip() or self.default_user
+            assignee_raw = data.get("assignee") if "assignee" in data else cfg.get("default_assignee")
+            assignee = None if (assignee_raw is None or str(assignee_raw).strip().lower() in ("", "none", "null", "unassigned")) else str(assignee_raw).strip()
+            reporter_raw = data.get("reporter") if "reporter" in data else actor
+            reporter = None if (reporter_raw is None or str(reporter_raw).strip().lower() in ("", "none", "null")) else str(reporter_raw).strip()
+
+            seq = self._next_seq(cfg, "next_issue_seq")
+            prefix = cfg.get("project_prefix", "ITR")
+            key = f"{prefix}-{seq}"
             ts = now_iso()
-            cfg["updated_at"] = ts
 
-            actor = (data.get("actor") or data.get("reporter") or self.default_user).strip()
-            reporter = (data.get("reporter") or actor).strip()
-            points = data.get("story_points")
-            if points is not None and points != "":
-                points = float(points)
+            issue_dir = self.issues_dir / name
+            (issue_dir / "attachments").mkdir(parents=True, exist_ok=True)
+            (issue_dir / "comments").mkdir(parents=True, exist_ok=True)
+
+            archived = state == "archived" or bool(data.get("archived", False))
+            if archived and state != "archived":
+                prev_st = state
+                state = "archived"
             else:
-                points = None
-
-            started_at = ts if status == "in_progress" else None
-            resolved_at = ts if status in ("done", "canceled") else None
-            closed_at = ts if status in ("done", "canceled") else None
+                prev_st = None
 
             issue: Dict[str, Any] = {
                 "key": key,
                 "seq": seq,
-                "title": title,
-                "description": data.get("description") or "",
-                "type": itype,
-                "status": status,
+                "name": name,
+                "folder": name,
+                "category": category,
+                "state": state,
+                "previous_state": prev_st,
+                "archived": archived,
                 "priority": priority,
                 "priority_rank": p_rank,
-                "resolution": data.get("resolution") or ("done" if status == "done" else None),
-                "assignee": self._clean_assignee(data.get("assignee")),
+                "severity": severity,
+                "severity_rank": s_rank,
+                "resolution": resolution,
+                "description": str(data.get("description") or ""),
+                "description_embeds": [],
+                "acceptance_criteria": ac_list,
+                "assignee": assignee,
                 "reporter": reporter,
-                "labels": self._dedupe_strs(data.get("labels")),
-                "components": self._dedupe_strs(data.get("components")),
-                "epic_id": epic_id,
-                "parent_id": parent_id,
-                "sprint_id": sprint_id,
-                "milestone_id": milestone_id,
-                "story_points": points,
-                "due_date": data.get("due_date") or None,
-                "environment": data.get("environment") or None,
-                "custom_fields": dict(data.get("custom_fields") or {}),
-                "watchers": [],
-                "claimed_by": None,
-                "claimed_at": None,
-                "comments": [],
+                "tags": tags,
+                "components": components,
+                "parent": parent_key,
+                "sprint": sprint_id,
+                "milestone": milestone_id,
+                "story_points": story_points,
+                "estimate_minutes": estimate_minutes,
+                "logged_minutes": 0,
+                "due_date": due_date,
+                "custom_fields": custom_fields,
                 "attachments": [],
+                "deleted_attachments": {},
                 "links": [],
                 "worklogs": [],
-                "history": [
-                    {
-                        "id": f"EVT-{short_id()}",
-                        "actor": actor,
-                        "action": "created",
-                        "changes": {},
-                        "timestamp": ts,
-                    }
-                ],
+                "cloned_from": data.get("cloned_from"),
                 "created_at": ts,
                 "updated_at": ts,
-                "started_at": started_at,
-                "resolved_at": resolved_at,
-                "closed_at": closed_at,
             }
+
+            self._append_history(
+                issue_dir,
+                cfg,
+                actor=actor,
+                action="created",
+                diffs=[
+                    {"field": "name", "old": None, "new": name},
+                    {"field": "category", "old": None, "new": category},
+                    {"field": "state", "old": None, "new": state},
+                    {"field": "priority", "old": None, "new": priority},
+                    {"field": "severity", "old": None, "new": severity},
+                ],
+                timestamp=ts,
+            )
             self._atomic_write_json(self.config_path, cfg)
-            self._save_issue(issue)
-            return self._enrich_issues([issue])[0]
+            self._save_issue_unlocked(issue, issue_dir)
+            return self._enrich_issues_unlocked([(issue, issue_dir)])[0]
 
-    def update_issue(self, key: str, patch: Dict[str, Any]) -> Dict[str, Any]:
-        with self.write_lock():
-            cfg = self._read_json(self.config_path)
-            iss = self._get_raw_issue_or_404(key)
-            actor = (patch.get("actor") or self.default_user).strip()
+    def _rename_issue_unlocked(self, iss: Dict[str, Any], old_dir: Path, raw_new_name: Any, actor: str) -> Tuple[Dict[str, Any], Path]:
+        try:
+            new_name = validate_issue_name(raw_new_name)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        old_name = iss["name"]
+        if new_name == old_name and old_dir.name == new_name:
+            return iss, old_dir
+
+        collider = self._check_other_issue_name_collision_unlocked(new_name, exclude_key=iss["key"])
+        if collider is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot rename '{old_name}' to '{new_name}': issue '{collider}' already uses that name.",
+            )
+
+        target_dir = self.issues_dir / new_name
+        case_only = old_name.lower() == new_name.lower()
+        if not case_only and target_dir.exists():
+            raise HTTPException(status_code=409, detail=f"Target folder '{new_name}' already exists.")
+
+        tmp_dir: Optional[Path] = None
+        moved = False
+        try:
+            if case_only:
+                tmp_dir = self.issues_dir / f".rename_tmp_{uuid.uuid4().hex}"
+                os.replace(old_dir, tmp_dir)
+                os.replace(tmp_dir, target_dir)
+            else:
+                os.replace(old_dir, target_dir)
+            moved = True
+
             ts = now_iso()
-            changes: Dict[str, Any] = {}
+            iss["name"] = new_name
+            iss["folder"] = new_name
+            iss["updated_at"] = ts
 
-            def set_field(fname: str, new_val: Any) -> None:
-                old_val = iss.get(fname)
+            cfg = self._read_json(self.config_path)
+            self._append_history(
+                target_dir,
+                cfg,
+                actor=actor,
+                action="renamed",
+                diffs=[{"field": "name", "old": old_name, "new": new_name}],
+                timestamp=ts,
+            )
+            self._atomic_write_json(self.config_path, cfg)
+
+            # Update cached target_name in peer linked issues
+            for ent in os.scandir(self.issues_dir):
+                if not ent.is_dir(follow_symlinks=False) or ent.name.startswith(".") or ent.name == new_name:
+                    continue
+                p_json = Path(ent.path) / "issue.json"
+                if p_json.exists():
+                    peer = self._read_json(p_json)
+                    changed_peer = False
+                    for lnk in peer.get("links", []):
+                        if lnk.get("target_key") == iss["key"] and lnk.get("target_name") != new_name:
+                            lnk["target_name"] = new_name
+                            changed_peer = True
+                    if changed_peer:
+                        self._atomic_write_json(p_json, peer)
+
+            self._save_issue_unlocked(iss, target_dir)
+            return iss, target_dir
+        except Exception:
+            if moved and target_dir.exists() and not old_dir.exists():
+                with contextlib.suppress(Exception):
+                    os.replace(target_dir, old_dir)
+            elif tmp_dir is not None and tmp_dir.exists() and not old_dir.exists():
+                with contextlib.suppress(Exception):
+                    os.replace(tmp_dir, old_dir)
+            raise
+
+    def rename_issue(self, issue_ref: str, new_name: Any, actor: Optional[str] = None) -> Dict[str, Any]:
+        with self.write_lock():
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            eff_actor = str(actor or self.default_user).strip() or self.default_user
+            iss, new_dir = self._rename_issue_unlocked(iss, idir, new_name, eff_actor)
+            return self._enrich_issues_unlocked([(iss, new_dir)])[0]
+
+    def update_issue(self, issue_ref: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+        with self.write_lock():
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            actor = str(patch.get("actor") or self.default_user).strip() or self.default_user
+
+            if "name" in patch and patch["name"] is not None:
+                iss, idir = self._rename_issue_unlocked(iss, idir, patch["name"], actor)
+
+            diffs: List[Dict[str, Any]] = []
+
+            def record(field: str, new_val: Any) -> None:
+                old_val = iss.get(field)
                 if old_val != new_val:
-                    changes[fname] = {"from": old_val, "to": new_val}
-                    iss[fname] = new_val
+                    diffs.append({"field": field, "old": old_val, "new": new_val})
+                    iss[field] = new_val
 
-            if "title" in patch and patch["title"] is not None:
-                t = str(patch["title"]).strip()
-                if not t:
-                    raise HTTPException(status_code=400, detail="Issue title cannot be empty.")
-                set_field("title", t)
+            try:
+                if "category" in patch and patch["category"] is not None:
+                    record("category", normalize_category(str(patch["category"])))
 
-            if "description" in patch and patch["description"] is not None:
-                set_field("description", str(patch["description"]))
+                if "state" in patch and patch["state"] is not None:
+                    new_st = normalize_state(str(patch["state"]))
+                    cur_st = iss.get("state")
+                    if new_st == "archived" and cur_st != "archived":
+                        iss["previous_state"] = cur_st
+                        record("archived", True)
+                    elif new_st != "archived" and iss.get("archived"):
+                        record("archived", False)
+                    record("state", new_st)
 
-            if "type" in patch and patch["type"] is not None:
-                tp = str(patch["type"]).strip().lower()
-                if tp not in cfg["issue_types"]:
-                    raise HTTPException(status_code=400, detail=f"Invalid issue type '{tp}'.")
-                set_field("type", tp)
-
-            if "status" in patch and patch["status"] is not None:
-                st = str(patch["status"]).strip().lower()
-                if st not in cfg["statuses"]:
-                    raise HTTPException(status_code=400, detail=f"Invalid status '{st}'.")
-                set_field("status", st)
-                self._apply_status_timestamps(iss, st, ts)
-
-            if "priority" in patch and patch["priority"] is not None:
-                try:
+                if "priority" in patch and patch["priority"] is not None:
                     pr, prank = normalize_priority(str(patch["priority"]))
-                except ValueError as e:
-                    raise HTTPException(status_code=400, detail=str(e))
-                set_field("priority", pr)
-                iss["priority_rank"] = prank
+                    record("priority", pr)
+                    iss["priority_rank"] = prank
 
-            if "resolution" in patch:
-                res = patch["resolution"]
-                if isinstance(res, str) and res.strip().lower() in ("none", "null", ""):
-                    res = None
-                set_field("resolution", res)
+                if "severity" in patch and patch["severity"] is not None:
+                    sv, srank = normalize_severity(str(patch["severity"]))
+                    record("severity", sv)
+                    iss["severity_rank"] = srank
 
-            if "assignee" in patch:
-                set_field("assignee", self._clean_assignee(patch["assignee"]))
+                if patch.get("clear_resolution"):
+                    record("resolution", None)
+                elif "resolution" in patch:
+                    record("resolution", normalize_resolution(patch["resolution"]))
 
-            if "reporter" in patch and patch["reporter"] is not None:
-                set_field("reporter", str(patch["reporter"]).strip())
+                if patch.get("clear_desc") or patch.get("clear_description"):
+                    record("description", "")
+                elif "description" in patch and patch["description"] is not None:
+                    record("description", str(patch["description"]))
 
-            if "labels" in patch and patch["labels"] is not None:
-                set_field("labels", self._dedupe_strs(patch["labels"]))
+                if patch.get("clear_assignee"):
+                    record("assignee", None)
+                elif "assignee" in patch:
+                    av = patch["assignee"]
+                    record("assignee", None if (av is None or str(av).strip().lower() in ("", "none", "null", "unassigned")) else str(av).strip())
 
-            if "add_labels" in patch and patch["add_labels"]:
-                merged = self._dedupe_strs(list(iss.get("labels", [])) + list(patch["add_labels"]))
-                set_field("labels", merged)
+                if patch.get("clear_reporter"):
+                    record("reporter", None)
+                elif "reporter" in patch:
+                    rv = patch["reporter"]
+                    record("reporter", None if (rv is None or str(rv).strip().lower() in ("", "none", "null")) else str(rv).strip())
 
-            if "remove_labels" in patch and patch["remove_labels"]:
-                rem_set = {str(x).strip().lower() for x in patch["remove_labels"]}
-                filtered = [l for l in iss.get("labels", []) if l.lower() not in rem_set]
-                set_field("labels", filtered)
+                # Tags
+                cur_tags = list(iss.get("tags", []))
+                if patch.get("clear_tags"):
+                    cur_tags = []
+                elif "tags" in patch and patch["tags"] is not None:
+                    cur_tags = self._dedupe_strs(patch["tags"])
+                if patch.get("add_tags"):
+                    cur_tags = self._dedupe_strs(cur_tags + list(patch["add_tags"]))
+                if patch.get("remove_tags"):
+                    rem_t = {str(x).strip().lower() for x in patch["remove_tags"]}
+                    cur_tags = [t for t in cur_tags if t.lower() not in rem_t]
+                if cur_tags != iss.get("tags", []):
+                    self._ensure_tags_registered_unlocked(cur_tags)
+                    record("tags", cur_tags)
 
-            if "components" in patch and patch["components"] is not None:
-                set_field("components", self._dedupe_strs(patch["components"]))
+                # Components
+                cur_comps = list(iss.get("components", []))
+                if patch.get("clear_components"):
+                    cur_comps = []
+                elif "components" in patch and patch["components"] is not None:
+                    cur_comps = self._dedupe_strs(patch["components"])
+                if patch.get("add_components"):
+                    cur_comps = self._dedupe_strs(cur_comps + list(patch["add_components"]))
+                if patch.get("remove_components"):
+                    rem_c = {str(x).strip().lower() for x in patch["remove_components"]}
+                    cur_comps = [c for c in cur_comps if c.lower() not in rem_c]
+                if cur_comps != iss.get("components", []):
+                    record("components", cur_comps)
 
-            if "epic_id" in patch:
-                eid = self._clean_nullable_id(patch["epic_id"])
-                if eid:
-                    if eid == iss["key"]:
-                        raise HTTPException(status_code=400, detail="Issue cannot be its own epic.")
-                    self._get_raw_issue_or_404(eid)
-                set_field("epic_id", eid)
+                # Parent
+                if patch.get("clear_parent"):
+                    record("parent", None)
+                elif "parent" in patch:
+                    pv = patch["parent"]
+                    if pv is None or str(pv).strip().lower() in ("", "none", "null"):
+                        record("parent", None)
+                    else:
+                        p_iss, _ = self._resolve_issue_unlocked(str(pv))
+                        self._check_parent_cycle_unlocked(iss["key"], p_iss["key"])
+                        record("parent", p_iss["key"])
 
-            if "parent_id" in patch:
-                pid = self._clean_nullable_id(patch["parent_id"])
-                if pid:
-                    if pid == iss["key"]:
-                        raise HTTPException(status_code=400, detail="Issue cannot be its own parent.")
-                    self._get_raw_issue_or_404(pid)
-                set_field("parent_id", pid)
+                # Sprint
+                if patch.get("clear_sprint"):
+                    record("sprint", None)
+                elif "sprint" in patch:
+                    sv_raw = patch["sprint"]
+                    if sv_raw is None or str(sv_raw).strip().lower() in ("", "none", "null", "backlog"):
+                        record("sprint", None)
+                    else:
+                        _, _, sp_obj = self._find_sprint_unlocked(str(sv_raw))
+                        record("sprint", sp_obj["id"])
 
-            if "sprint_id" in patch:
-                sid = self._clean_nullable_id(patch["sprint_id"])
-                if sid:
-                    self._get_sprint_or_404(sid)
-                set_field("sprint_id", sid)
+                # Milestone
+                if patch.get("clear_milestone"):
+                    record("milestone", None)
+                elif "milestone" in patch:
+                    mv_raw = patch["milestone"]
+                    if mv_raw is None or str(mv_raw).strip().lower() in ("", "none", "null"):
+                        record("milestone", None)
+                    else:
+                        _, _, ms_obj = self._find_milestone_unlocked(str(mv_raw))
+                        record("milestone", ms_obj["id"])
 
-            if "milestone_id" in patch:
-                mid = self._clean_nullable_id(patch["milestone_id"])
-                if mid and not (self.milestones_dir / f"{mid}.json").exists():
-                    raise HTTPException(status_code=404, detail=f"Milestone '{mid}' not found.")
-                set_field("milestone_id", mid)
+                # Points, Estimate, Due Date
+                if patch.get("clear_points"):
+                    record("story_points", None)
+                elif "story_points" in patch:
+                    record("story_points", validate_story_points(patch["story_points"]))
 
-            if "story_points" in patch:
-                sp = patch["story_points"]
-                sp_val = float(sp) if (sp is not None and sp != "") else None
-                set_field("story_points", sp_val)
+                if patch.get("clear_estimate"):
+                    record("estimate_minutes", None)
+                elif "estimate_minutes" in patch:
+                    record("estimate_minutes", validate_estimate_minutes(patch["estimate_minutes"]))
 
-            if "due_date" in patch:
-                dd = patch["due_date"]
-                dd_val = str(dd).strip() if (dd is not None and str(dd).strip().lower() not in ("", "none", "null")) else None
-                set_field("due_date", dd_val)
+                if patch.get("clear_due"):
+                    record("due_date", None)
+                elif "due_date" in patch:
+                    record("due_date", validate_calendar_date(patch["due_date"], "due_date"))
 
-            if "environment" in patch:
-                set_field("environment", patch["environment"] or None)
+                # Acceptance Criteria mutations
+                cur_ac = [dict(a) for a in (iss.get("acceptance_criteria") or [])]
+                ac_modified = False
+                if patch.get("clear_ac"):
+                    cur_ac = []
+                    ac_modified = True
+                elif "acceptance_criteria" in patch and patch["acceptance_criteria"] is not None:
+                    cur_ac = self._parse_ac_input_list(patch["acceptance_criteria"])
+                    ac_modified = True
 
-            if "custom_fields" in patch and patch["custom_fields"] is not None:
-                merged_cf = dict(iss.get("custom_fields") or {})
-                merged_cf.update(patch["custom_fields"])
-                set_field("custom_fields", merged_cf)
+                if patch.get("add_ac"):
+                    max_ac_id = max(
+                        (int(re.search(r"-(\d+)$", str(a.get("id", "0"))).group(1)) for a in cur_ac if re.search(r"-(\d+)$", str(a.get("id", "")))),
+                        default=len(cur_ac),
+                    )
+                    for raw_txt in patch["add_ac"]:
+                        s = str(raw_txt).strip()
+                        if not s:
+                            continue
+                        chk = False
+                        m_chk = re.match(r"^(?:-\s*)?\[([xX ])\]\s*(.+)$", s)
+                        if m_chk:
+                            chk = m_chk.group(1).lower() == "x"
+                            s = m_chk.group(2).strip()
+                        max_ac_id += 1
+                        cur_ac.append({"id": f"AC-{max_ac_id}", "text": s, "checked": chk})
+                        ac_modified = True
 
-            if changes:
+                if patch.get("edit_ac"):
+                    edits = patch["edit_ac"]
+                    if isinstance(edits, dict):
+                        edits = [{"target": k, "text": v} for k, v in edits.items()]
+                    for ed in edits:
+                        idx = self._find_ac_index(cur_ac, ed["target"])
+                        ntxt = str(ed.get("text", "")).strip()
+                        if not ntxt:
+                            raise ValueError("Acceptance criterion text cannot be empty.")
+                        cur_ac[idx]["text"] = ntxt
+                        ac_modified = True
+
+                if patch.get("check_ac"):
+                    for ref in patch["check_ac"]:
+                        idx = self._find_ac_index(cur_ac, ref)
+                        cur_ac[idx]["checked"] = True
+                        ac_modified = True
+
+                if patch.get("uncheck_ac"):
+                    for ref in patch["uncheck_ac"]:
+                        idx = self._find_ac_index(cur_ac, ref)
+                        cur_ac[idx]["checked"] = False
+                        ac_modified = True
+
+                if patch.get("remove_ac"):
+                    # Resolve indices first then remove descending so 1-based positions stay stable
+                    rem_indices = sorted({self._find_ac_index(cur_ac, ref) for ref in patch["remove_ac"]}, reverse=True)
+                    for ridx in rem_indices:
+                        cur_ac.pop(ridx)
+                    ac_modified = True
+
+                if ac_modified:
+                    record("acceptance_criteria", cur_ac)
+
+                # Custom Fields mutations
+                cur_cf = dict(iss.get("custom_fields") or {})
+                cf_modified = False
+                if patch.get("clear_fields"):
+                    cur_cf = {}
+                    cf_modified = True
+                elif patch.get("replace_custom_fields") and isinstance(patch.get("custom_fields"), dict):
+                    cur_cf = {str(k).strip(): v for k, v in patch["custom_fields"].items() if str(k).strip() and v is not None}
+                    cf_modified = True
+                elif "custom_fields" in patch and patch["custom_fields"] is not None:
+                    if not isinstance(patch["custom_fields"], dict):
+                        raise ValueError("custom_fields must be an object.")
+                    if len(patch["custom_fields"]) == 0:
+                        if cur_cf:
+                            cur_cf = {}
+                            cf_modified = True
+                    else:
+                        for ck, cv in patch["custom_fields"].items():
+                            ks = str(ck).strip()
+                            if not ks:
+                                continue
+                            if cv is None:
+                                cur_cf.pop(ks, None)
+                            else:
+                                cur_cf[ks] = cv
+                            cf_modified = True
+
+                if patch.get("set_fields") and isinstance(patch["set_fields"], dict):
+                    for ck, cv in patch["set_fields"].items():
+                        ks = str(ck).strip()
+                        if ks:
+                            cur_cf[ks] = cv
+                            cf_modified = True
+
+                if patch.get("unset_fields"):
+                    for ck in patch["unset_fields"]:
+                        cur_cf.pop(str(ck).strip(), None)
+                        cf_modified = True
+
+                if cf_modified:
+                    record("custom_fields", cur_cf)
+
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+
+            if diffs:
+                ts = now_iso()
                 iss["updated_at"] = ts
-                iss.setdefault("history", []).append(
-                    {
-                        "id": f"EVT-{short_id()}",
-                        "actor": actor,
-                        "action": "updated",
-                        "changes": changes,
-                        "timestamp": ts,
-                    }
-                )
-                self._save_issue(iss)
+                cfg = self._read_json(self.config_path)
+                self._append_history(idir, cfg, actor=actor, action="updated", diffs=diffs, timestamp=ts)
+                self._atomic_write_json(self.config_path, cfg)
+                self._save_issue_unlocked(iss, idir)
 
-            return self._enrich_issues([iss])[0]
+            return self._enrich_issues_unlocked([(iss, idir)])[0]
 
-    def _apply_status_timestamps(self, iss: Dict[str, Any], new_status: str, ts: str) -> None:
-        if new_status == "in_progress" and not iss.get("started_at"):
-            iss["started_at"] = ts
-        if new_status in ("done", "canceled"):
-            iss["resolved_at"] = iss.get("resolved_at") or ts
-            iss["closed_at"] = ts
-            if not iss.get("resolution"):
-                iss["resolution"] = "done" if new_status == "done" else "canceled"
-            # Clear active agent claim when done/canceled
-            iss["claimed_by"] = None
-            iss["claimed_at"] = None
-        else:
-            iss["resolved_at"] = None
-            iss["closed_at"] = None
-            if iss.get("resolution") in ("done", "canceled"):
-                iss["resolution"] = None
-
-    def transition_issue(
-        self,
-        key: str,
-        target_status: str,
-        resolution: Optional[str] = None,
-        comment: Optional[str] = None,
-        force: bool = False,
-        actor: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    def clone_issue(self, issue_ref: str, new_name: Optional[str] = None, actor: Optional[str] = None) -> Dict[str, Any]:
         with self.write_lock():
+            orig, _ = self._resolve_issue_unlocked(issue_ref)
+            eff_actor = str(actor or self.default_user).strip() or self.default_user
+            if new_name and str(new_name).strip():
+                target_name = str(new_name).strip()
+            else:
+                base = f"Copy of {orig['name']}"[:170]
+                target_name = base
+                n = 2
+                while self._check_other_issue_name_collision_unlocked(target_name) is not None:
+                    target_name = f"Copy {n} of {orig['name']}"[:175]
+                    n += 1
+
             cfg = self._read_json(self.config_path)
-            iss = self._get_raw_issue_or_404(key)
-            target = (target_status or "").strip().lower()
-            if target not in cfg["statuses"]:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unknown status '{target}'. Allowed statuses: {', '.join(cfg['statuses'])}.",
-                )
-            cur_status = iss["status"]
-            if cur_status != target and not force:
-                allowed = cfg.get("transitions", {}).get(cur_status, [])
-                if target not in allowed:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Invalid workflow transition from '{cur_status}' to '{target}'. Allowed transitions: {allowed}. Pass force=true to override.",
-                    )
-            ts = now_iso()
-            eff_actor = (actor or self.default_user).strip()
-            changes: Dict[str, Any] = {}
-            if cur_status != target:
-                changes["status"] = {"from": cur_status, "to": target}
-                iss["status"] = target
-                self._apply_status_timestamps(iss, target, ts)
-            if resolution is not None:
-                changes["resolution"] = {"from": iss.get("resolution"), "to": resolution}
-                iss["resolution"] = resolution
-            if comment and comment.strip():
-                iss.setdefault("comments", []).append(
-                    {
-                        "id": f"CMT-{short_id()}",
-                        "author": eff_actor,
-                        "body": comment.strip(),
-                        "created_at": ts,
-                        "updated_at": ts,
-                    }
-                )
-            iss["updated_at"] = ts
-            iss.setdefault("history", []).append(
-                {
-                    "id": f"EVT-{short_id()}",
-                    "actor": eff_actor,
-                    "action": "transitioned",
-                    "changes": changes or {"status": {"from": cur_status, "to": target}},
-                    "timestamp": ts,
-                }
-            )
-            self._save_issue(iss)
-            return self._enrich_issues([iss])[0]
-
-    def assign_issue(self, key: str, assignee: Optional[str], actor: Optional[str] = None) -> Dict[str, Any]:
-        with self.write_lock():
-            iss = self._get_raw_issue_or_404(key)
-            clean_a = self._clean_assignee(assignee)
-            old_a = iss.get("assignee")
-            ts = now_iso()
-            iss["assignee"] = clean_a
-            iss["updated_at"] = ts
-            iss.setdefault("history", []).append(
-                {
-                    "id": f"EVT-{short_id()}",
-                    "actor": (actor or self.default_user).strip(),
-                    "action": "assigned",
-                    "changes": {"assignee": {"from": old_a, "to": clean_a}},
-                    "timestamp": ts,
-                }
-            )
-            self._save_issue(iss)
-            return self._enrich_issues([iss])[0]
-
-    def claim_issue(self, key: str, agent: str, note: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
-        clean_agent = (agent or "").strip()
-        if not clean_agent:
-            raise HTTPException(status_code=400, detail="agent identifier is required.")
-        with self.write_lock():
-            iss = self._get_raw_issue_or_404(key)
-            cur_claim = iss.get("claimed_by")
-            cur_status = iss.get("status")
-            if not force:
-                if cur_claim and cur_claim != clean_agent:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"Issue {iss['key']} is already claimed by '{cur_claim}'. Pass force=true to override.",
-                    )
-                if cur_status == "in_progress" and cur_claim != clean_agent:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"Issue {iss['key']} is already in_progress (assignee={iss.get('assignee')!r}, claimed_by={cur_claim!r}). Pass force=true to override.",
-                    )
-            ts = now_iso()
-            old_status = cur_status
-            old_assignee = iss.get("assignee")
-            iss["claimed_by"] = clean_agent
-            iss["claimed_at"] = ts
-            iss["assignee"] = clean_agent
-            iss["status"] = "in_progress"
-            iss["started_at"] = iss.get("started_at") or ts
-            iss["resolved_at"] = None
-            iss["closed_at"] = None
-            if note and note.strip():
-                iss.setdefault("comments", []).append(
-                    {
-                        "id": f"CMT-{short_id()}",
-                        "author": clean_agent,
-                        "body": note.strip(),
-                        "created_at": ts,
-                        "updated_at": ts,
-                    }
-                )
-            iss["updated_at"] = ts
-            iss.setdefault("history", []).append(
-                {
-                    "id": f"EVT-{short_id()}",
-                    "actor": clean_agent,
-                    "action": "claimed",
-                    "changes": {
-                        "claimed_by": {"from": cur_claim, "to": clean_agent},
-                        "status": {"from": old_status, "to": "in_progress"},
-                        "assignee": {"from": old_assignee, "to": clean_agent},
-                    },
-                    "timestamp": ts,
-                }
-            )
-            self._save_issue(iss)
-            return self._enrich_issues([iss])[0]
-
-    def release_issue(
-        self,
-        key: str,
-        agent: Optional[str] = None,
-        status: Optional[str] = None,
-        note: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        with self.write_lock():
-            cfg = self._read_json(self.config_path)
-            iss = self._get_raw_issue_or_404(key)
-            cur_claim = iss.get("claimed_by")
-            if agent and cur_claim and cur_claim != agent.strip():
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Issue {iss['key']} is claimed by '{cur_claim}', not '{agent}'.",
-                )
-            target_status = (status or "todo").strip().lower()
-            if target_status not in cfg["statuses"]:
-                raise HTTPException(status_code=400, detail=f"Invalid status '{target_status}'.")
-            ts = now_iso()
-            actor = (agent or cur_claim or self.default_user).strip()
-            old_status = iss["status"]
-            iss["claimed_by"] = None
-            iss["claimed_at"] = None
-            iss["status"] = target_status
-            self._apply_status_timestamps(iss, target_status, ts)
-            if note and note.strip():
-                iss.setdefault("comments", []).append(
-                    {
-                        "id": f"CMT-{short_id()}",
-                        "author": actor,
-                        "body": note.strip(),
-                        "created_at": ts,
-                        "updated_at": ts,
-                    }
-                )
-            iss["updated_at"] = ts
-            iss.setdefault("history", []).append(
-                {
-                    "id": f"EVT-{short_id()}",
-                    "actor": actor,
-                    "action": "released",
-                    "changes": {
-                        "claimed_by": {"from": cur_claim, "to": None},
-                        "status": {"from": old_status, "to": target_status},
-                    },
-                    "timestamp": ts,
-                }
-            )
-            self._save_issue(iss)
-            return self._enrich_issues([iss])[0]
-
-    def clone_issue(
-        self,
-        key: str,
-        title_prefix: str = "[Clone] ",
-        include_subtasks: bool = False,
-        actor: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        with self.write_lock():
-            orig = self._get_raw_issue_or_404(key)
-            eff_actor = (actor or self.default_user).strip()
-            cloned = self.create_issue(
-                {
-                    "title": f"{title_prefix}{orig['title']}",
-                    "description": orig.get("description", ""),
-                    "type": orig.get("type", "task"),
-                    "status": "todo",
-                    "priority": orig.get("priority", "medium"),
-                    "assignee": orig.get("assignee"),
-                    "reporter": eff_actor,
-                    "labels": list(orig.get("labels", [])),
-                    "components": list(orig.get("components", [])),
-                    "epic_id": orig.get("epic_id"),
-                    "parent_id": orig.get("parent_id"),
-                    "sprint_id": orig.get("sprint_id"),
-                    "milestone_id": orig.get("milestone_id"),
-                    "story_points": orig.get("story_points"),
-                    "due_date": orig.get("due_date"),
-                    "environment": orig.get("environment"),
-                    "custom_fields": dict(orig.get("custom_fields") or {}),
-                    "actor": eff_actor,
-                }
-            )
-            self.add_link(cloned["key"], orig["key"], "clones", actor=eff_actor)
-            if include_subtasks:
-                sub_rows = self._db.execute(
-                    "SELECT key FROM issues WHERE parent_id = ? ORDER BY seq ASC", (orig["key"],)
-                ).fetchall()
-                for sr in sub_rows:
-                    sub = self._get_raw_issue_or_404(sr["key"])
-                    self.create_issue(
-                        {
-                            "title": sub["title"],
-                            "description": sub.get("description", ""),
-                            "type": "subtask",
-                            "status": "todo",
-                            "priority": sub.get("priority", "medium"),
-                            "assignee": sub.get("assignee"),
-                            "reporter": eff_actor,
-                            "labels": list(sub.get("labels", [])),
-                            "components": list(sub.get("components", [])),
-                            "epic_id": cloned.get("epic_id"),
-                            "parent_id": cloned["key"],
-                            "sprint_id": cloned.get("sprint_id"),
-                            "story_points": sub.get("story_points"),
-                            "actor": eff_actor,
-                        }
-                    )
+            cloned = self.create_issue({
+                "name": target_name,
+                "category": orig.get("category"),
+                "state": cfg.get("default_state", "backlog"),
+                "priority": orig.get("priority"),
+                "severity": orig.get("severity"),
+                "description": orig.get("description", ""),
+                "acceptance_criteria": [{"text": a.get("text", ""), "checked": False} for a in (orig.get("acceptance_criteria") or [])],
+                "assignee": orig.get("assignee"),
+                "reporter": eff_actor,
+                "tags": list(orig.get("tags", [])),
+                "components": list(orig.get("components", [])),
+                "parent": orig.get("parent"),
+                "sprint": orig.get("sprint"),
+                "milestone": orig.get("milestone"),
+                "story_points": orig.get("story_points"),
+                "estimate_minutes": orig.get("estimate_minutes"),
+                "due_date": orig.get("due_date"),
+                "custom_fields": dict(orig.get("custom_fields") or {}),
+                "cloned_from": orig["key"],
+                "actor": eff_actor,
+            })
+            self.add_link(cloned["key"], "clones", orig["key"], actor=eff_actor)
             return self.get_issue(cloned["key"])
 
-    def delete_issue(self, key: str) -> Dict[str, Any]:
+    def archive_issue(self, issue_ref: str, actor: Optional[str] = None) -> Dict[str, Any]:
         with self.write_lock():
-            iss = self._get_raw_issue_or_404(key)
-            real_key = iss["key"]
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            eff_actor = str(actor or self.default_user).strip() or self.default_user
+            old_state = iss.get("state", "backlog")
+            if not iss.get("archived") or old_state != "archived":
+                if old_state != "archived":
+                    iss["previous_state"] = old_state
+                iss["state"] = "archived"
+                iss["archived"] = True
+                ts = now_iso()
+                iss["updated_at"] = ts
+                cfg = self._read_json(self.config_path)
+                self._append_history(
+                    idir,
+                    cfg,
+                    actor=eff_actor,
+                    action="archived",
+                    diffs=[{"field": "state", "old": old_state, "new": "archived"}, {"field": "archived", "old": False, "new": True}],
+                    timestamp=ts,
+                )
+                self._atomic_write_json(self.config_path, cfg)
+                self._save_issue_unlocked(iss, idir)
+            return self._enrich_issues_unlocked([(iss, idir)])[0]
+
+    def unarchive_issue(self, issue_ref: str, actor: Optional[str] = None) -> Dict[str, Any]:
+        with self.write_lock():
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            eff_actor = str(actor or self.default_user).strip() or self.default_user
+            cfg = self._read_json(self.config_path)
+            restore_state = iss.get("previous_state") or cfg.get("default_state", "backlog")
+            if restore_state == "archived":
+                restore_state = cfg.get("default_state", "backlog")
+            old_state = iss.get("state", "archived")
+            iss["state"] = restore_state
+            iss["archived"] = False
             ts = now_iso()
-
-            # Clean inbound links on peer issues
-            peer_rows = self._db.execute(
-                "SELECT DISTINCT source_key FROM issue_links WHERE target_key = ? AND source_key != ?",
-                (real_key, real_key),
-            ).fetchall()
-            for pr in peer_rows:
-                peer = self._get_raw_issue_or_404(pr["source_key"])
-                peer["links"] = [l for l in peer.get("links", []) if l["target_key"] != real_key]
-                peer["updated_at"] = ts
-                self._save_issue(peer)
-
-            # Clear parent_id / epic_id references
-            ref_rows = self._db.execute(
-                "SELECT key FROM issues WHERE parent_id = ? OR epic_id = ?",
-                (real_key, real_key),
-            ).fetchall()
-            for rr in ref_rows:
-                if rr["key"] == real_key:
-                    continue
-                child = self._get_raw_issue_or_404(rr["key"])
-                if child.get("parent_id") == real_key:
-                    child["parent_id"] = None
-                if child.get("epic_id") == real_key:
-                    child["epic_id"] = None
-                child["updated_at"] = ts
-                self._save_issue(child)
-
-            # Remove attachments folder & JSON file & index rows
-            att_dir = self.attachments_dir / real_key
-            if att_dir.exists():
-                shutil.rmtree(att_dir, ignore_errors=True)
-            (self.issues_dir / f"{real_key}.json").unlink(missing_ok=True)
-            self._remove_issue_from_index(real_key)
-            return {"deleted": True, "key": real_key}
-
-    def list_subtasks(self, parent_key: str) -> Dict[str, Any]:
-        with self.read_lock():
-            parent = self._get_raw_issue_or_404(parent_key)
-            pk = parent["key"]
-            rows = self._db.execute(
-                "SELECT raw_json FROM issues WHERE parent_id = ? ORDER BY seq ASC", (pk,)
-            ).fetchall()
-            subs = self._enrich_issues([json.loads(r["raw_json"]) for r in rows])
-            done_cnt = sum(1 for s in subs if s["status"] == "done")
-            return {
-                "parent_key": pk,
-                "subtasks": subs,
-                "completed_count": done_cnt,
-                "total_count": len(subs),
-            }
-
-    def create_subtask(self, parent_key: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        with self.write_lock():
-            parent = self._get_raw_issue_or_404(parent_key)
-            pk = parent["key"]
-            payload = {
-                "title": data.get("title"),
-                "description": data.get("description") or "",
-                "type": "subtask",
-                "status": data.get("status") or "todo",
-                "priority": data.get("priority") or parent.get("priority", "medium"),
-                "assignee": data.get("assignee"),
-                "story_points": data.get("story_points"),
-                "parent_id": pk,
-                "epic_id": parent["key"] if parent.get("type") == "epic" else parent.get("epic_id"),
-                "sprint_id": parent.get("sprint_id"),
-                "milestone_id": parent.get("milestone_id"),
-                "actor": data.get("actor"),
-            }
-            return self.create_issue(payload)
-
-    def bulk_action(
-        self,
-        keys: List[str],
-        action: str,
-        fields: Dict[str, Any],
-        actor: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        act = (action or "").strip().lower()
-        if act not in ("update", "transition", "delete", "label_add", "label_remove", "sprint"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported bulk action '{action}'. Expected update, transition, delete, label_add, label_remove, or sprint.",
+            iss["updated_at"] = ts
+            self._append_history(
+                idir,
+                cfg,
+                actor=eff_actor,
+                action="unarchived",
+                diffs=[{"field": "state", "old": old_state, "new": restore_state}, {"field": "archived", "old": True, "new": False}],
+                timestamp=ts,
             )
-        updated: List[str] = []
-        deleted: List[str] = []
-        errors: List[Dict[str, Any]] = []
+            self._atomic_write_json(self.config_path, cfg)
+            self._save_issue_unlocked(iss, idir)
+            return self._enrich_issues_unlocked([(iss, idir)])[0]
+
+    def delete_issue(self, issue_ref: str, actor: Optional[str] = None) -> Dict[str, Any]:
         with self.write_lock():
-            for raw_k in keys:
-                k = raw_k.strip().upper()
-                if not k:
-                    continue
-                try:
-                    if act == "delete":
-                        res = self.delete_issue(k)
-                        deleted.append(res["key"])
-                    elif act == "transition":
-                        st = fields.get("status")
-                        if not st:
-                            raise HTTPException(status_code=400, detail="fields.status required for bulk transition.")
-                        iss = self.transition_issue(
-                            k,
-                            target_status=st,
-                            resolution=fields.get("resolution"),
-                            force=bool(fields.get("force", True)),
-                            actor=actor,
-                        )
-                        updated.append(iss["key"])
-                    elif act == "label_add":
-                        lb = fields.get("label") or fields.get("labels")
-                        lbs = lb if isinstance(lb, list) else ([lb] if lb else [])
-                        iss = self.update_issue(k, {"add_labels": lbs, "actor": actor})
-                        updated.append(iss["key"])
-                    elif act == "label_remove":
-                        lb = fields.get("label") or fields.get("labels")
-                        lbs = lb if isinstance(lb, list) else ([lb] if lb else [])
-                        iss = self.update_issue(k, {"remove_labels": lbs, "actor": actor})
-                        updated.append(iss["key"])
-                    elif act == "sprint":
-                        sid = fields.get("sprint_id") if "sprint_id" in fields else fields.get("sprint")
-                        iss = self.update_issue(k, {"sprint_id": sid, "actor": actor})
-                        updated.append(iss["key"])
-                    elif act == "update":
-                        patch = dict(fields)
-                        if actor:
-                            patch["actor"] = actor
-                        iss = self.update_issue(k, patch)
-                        updated.append(iss["key"])
-                except HTTPException as he:
-                    errors.append({"key": k, "status_code": he.status_code, "error": he.detail})
-                except Exception as exc:
-                    errors.append({"key": k, "status_code": 400, "error": str(exc)})
-        return {"updated": updated, "deleted": deleted, "errors": errors}
-
-    # ------------------------------------------------------------------------
-    # Watchers, Comments, Attachments, Links (DAG Cycle Check), Worklogs
-    # ------------------------------------------------------------------------
-
-    def add_watcher(self, key: str, username: str) -> Dict[str, Any]:
-        uname = (username or "").strip()
-        if not uname:
-            raise HTTPException(status_code=400, detail="username is required.")
-        with self.write_lock():
-            iss = self._get_raw_issue_or_404(key)
-            watchers = list(iss.get("watchers", []))
-            if uname not in watchers:
-                watchers.append(uname)
-                iss["watchers"] = watchers
-                iss["updated_at"] = now_iso()
-                self._save_issue(iss)
-            return {"key": iss["key"], "watchers": watchers}
-
-    def remove_watcher(self, key: str, username: str) -> Dict[str, Any]:
-        uname = username.strip()
-        with self.write_lock():
-            iss = self._get_raw_issue_or_404(key)
-            watchers = [w for w in iss.get("watchers", []) if w != uname]
-            iss["watchers"] = watchers
-            iss["updated_at"] = now_iso()
-            self._save_issue(iss)
-            return {"key": iss["key"], "watchers": watchers}
-
-    def list_comments(self, key: str) -> Dict[str, Any]:
-        with self.read_lock():
-            iss = self._get_raw_issue_or_404(key)
-            return {"key": iss["key"], "comments": iss.get("comments", [])}
-
-    def add_comment(self, key: str, body: str, author: Optional[str] = None) -> Dict[str, Any]:
-        text = (body or "").strip()
-        if not text:
-            raise HTTPException(status_code=400, detail="Comment body cannot be empty.")
-        with self.write_lock():
-            iss = self._get_raw_issue_or_404(key)
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            del_key = iss["key"]
+            del_name = iss["name"]
             ts = now_iso()
-            eff_author = (author or self.default_user).strip()
-            cmt = {
-                "id": f"CMT-{short_id()}",
+
+            # Scrub cross-links & child parent references across all other issues
+            for ent in os.scandir(self.issues_dir):
+                if not ent.is_dir(follow_symlinks=False) or ent.name.startswith(".") or Path(ent.path) == idir:
+                    continue
+                p_dir = Path(ent.path)
+                p_json = p_dir / "issue.json"
+                if not p_json.exists():
+                    continue
+                peer = self._read_json(p_json)
+                changed = False
+                orig_links = peer.get("links", [])
+                new_links = [l for l in orig_links if l.get("target_key") != del_key]
+                if len(new_links) != len(orig_links):
+                    peer["links"] = new_links
+                    changed = True
+                if peer.get("parent") == del_key:
+                    peer["parent"] = None
+                    changed = True
+                if changed:
+                    peer["updated_at"] = ts
+                    self._atomic_write_json(p_json, peer)
+
+            # Delete entire folder (issue.json, history.jsonl, attachments/, comments/)
+            shutil.rmtree(idir, ignore_errors=True)
+
+            assert self._db is not None
+            cur = self._db.cursor()
+            cur.execute("DELETE FROM issues WHERE key = ?", (del_key,))
+            cur.execute("DELETE FROM issue_tags WHERE issue_key = ?", (del_key,))
+            cur.execute("DELETE FROM issue_components WHERE issue_key = ?", (del_key,))
+            cur.execute("DELETE FROM issue_links WHERE blocker_key = ? OR blocked_key = ?", (del_key, del_key))
+            cur.execute("DELETE FROM issues_fts WHERE key = ?", (del_key,))
+            self._db.commit()
+
+            # Re-index any modified peers cleanly
+            self._rebuild_index_unlocked()
+            return {"deleted": True, "key": del_key, "name": del_name}
+
+    def get_issue_history(self, issue_ref: str) -> Dict[str, Any]:
+        with self.read_lock():
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            h_path = idir / "history.jsonl"
+            entries: List[Dict[str, Any]] = []
+            if h_path.exists():
+                with open(h_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        s = line.strip()
+                        if s:
+                            with contextlib.suppress(Exception):
+                                entries.append(json.loads(s))
+            return {"key": iss["key"], "name": iss["name"], "history": entries}
+
+    def get_issue_context(self, issue_ref: str) -> Dict[str, Any]:
+        iss = self.get_issue(issue_ref)
+        hist = self.get_issue_history(iss["key"])["history"]
+        lines: List[str] = [
+            f"# Agent Context Pack: [{iss['key']}] {iss['name']}",
+            "",
+            "## Metadata",
+            f"- **Key:** `{iss['key']}`",
+            f"- **Name (Folder):** `itrack-issues/issues/{iss['folder']}/`",
+            f"- **Category:** `{iss['category']}` | **State:** `{iss['state']}` | **Priority:** `{iss['priority']}` | **Severity:** `{iss['severity']}`",
+            f"- **Resolution:** `{iss.get('resolution') or 'none'}`",
+            f"- **Assignee:** `{iss.get('assignee') or 'unassigned'}` | **Reporter:** `{iss.get('reporter') or 'none'}`",
+            f"- **Parent:** `{iss.get('parent') or 'none'}` | **Sprint:** `{iss.get('sprint') or 'none'}` | **Milestone:** `{iss.get('milestone') or 'none'}`",
+            f"- **Story Points:** `{iss.get('story_points')}` | **Estimate:** `{iss.get('estimate_minutes')}m` | **Logged:** `{iss.get('logged_minutes')}m` | **Due:** `{iss.get('due_date') or 'none'}`",
+            f"- **Tags:** {', '.join(iss.get('tags', [])) or 'none'}",
+            f"- **Components:** {', '.join(iss.get('components', [])) or 'none'}",
+            f"- **Blocked:** `{iss['is_blocked']}` (Blockers: {', '.join(iss['unresolved_blockers']) or 'none'})",
+        ]
+        if iss.get("custom_fields"):
+            lines.append(f"- **Custom Fields:** `{json.dumps(iss['custom_fields'], sort_keys=True)}`")
+
+        lines.extend(["", "## Description", iss.get("description") or "_No description._"])
+
+        if iss.get("acceptance_criteria"):
+            lines.extend(["", "## Acceptance Criteria"])
+            for ac in iss["acceptance_criteria"]:
+                mark = "x" if ac.get("checked") else " "
+                lines.append(f"- [{mark}] ({ac['id']}) {ac['text']}")
+
+        if iss.get("subtasks"):
+            lines.extend(["", "## Subtasks"])
+            for sub in iss["subtasks"]:
+                mark = "x" if sub["completed"] else " "
+                lines.append(f"- [{mark}] `{sub['key']}` {sub['name']} (`{sub['state']}`)")
+
+        if iss.get("links"):
+            lines.extend(["", "## Linked Issues"])
+            for lnk in iss["links"]:
+                lines.append(f"- `{lnk['type']}` -> `{lnk['target_key']}` ({lnk.get('target_name', '')})")
+
+        if iss.get("attachments") or iss.get("description_embeds"):
+            lines.extend(["", "## Issue Attachments & Embeds"])
+            for a in list(iss.get("attachments", [])) + list(iss.get("description_embeds", [])):
+                lines.append(f"- `{a['id']}` `{a['filename']}` ({a['mime_type']}, {a['size_bytes']} bytes)")
+
+        if iss.get("comments"):
+            lines.extend(["", "## Discussion Comments"])
+            for c in iss["comments"]:
+                lines.append(f"### {c['id']} by {c['author']} ({c['created_at']})")
+                lines.append(c.get("body") or "")
+                if c.get("linked_attachments"):
+                    for la in c["linked_attachments"]:
+                        status_note = " [DELETED]" if la.get("deleted") else ""
+                        lines.append(f"- Linked attachment: `{la['id']}` `{la.get('filename', '')}`{status_note}")
+
+        md = "\n".join(lines) + "\n"
+        return {
+            "key": iss["key"],
+            "name": iss["name"],
+            "markdown": md,
+            "context": {
+                "issue": iss,
+                "recent_history": hist[-20:],
+            },
+        }
+
+
+    # ------------------------------------------------------------------------
+    # Embeds, Attachments & Rich Comments Matrix
+    # ------------------------------------------------------------------------
+
+    def _store_file_bytes_unlocked(
+        self,
+        dest_dir: Path,
+        cfg: Dict[str, Any],
+        raw_filename: Optional[str],
+        content_type: Optional[str],
+        data: bytes,
+        scope: str,
+        uploaded_by: str,
+        comment_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        display_name, safe_suffix = sanitize_filename(raw_filename)
+        att_seq = self._next_seq(cfg, "next_att_seq")
+        att_id = f"ATT-{att_seq}"
+        stored_name = f"{att_id}_{safe_suffix}"
+        target_path = (dest_dir / stored_name).resolve()
+        if not target_path.is_relative_to(dest_dir.resolve()):
+            raise HTTPException(status_code=400, detail="Invalid attachment filename.")
+        _atomic_write_bytes(target_path, data)
+
+        guessed_mime = mimetypes.guess_type(display_name)[0]
+        mime = (
+            content_type
+            if (content_type and content_type != "application/octet-stream")
+            else (guessed_mime or content_type or "application/octet-stream")
+        )
+        meta: Dict[str, Any] = {
+            "id": att_id,
+            "filename": display_name,
+            "stored_name": stored_name,
+            "mime_type": mime,
+            "size_bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "scope": scope,
+            "is_image": is_image_file(display_name, mime),
+            "uploaded_by": uploaded_by or self.default_user,
+            "created_at": now_iso(),
+        }
+        if comment_id:
+            meta["comment_id"] = comment_id
+        return meta
+
+    @staticmethod
+    def _apply_embed_to_markdown(body: str, filename: str, att_id: str) -> str:
+        text = body or ""
+        esc_fn = re.escape(filename)
+        md_pat = re.compile(rf"!\[([^\]]*)\]\(embed:{esc_fn}\)")
+        if md_pat.search(text):
+            return md_pat.sub(lambda m: f"![{m.group(1) or filename}](attachment://{att_id})", text, count=1)
+        bare_pat = re.compile(rf"(?<!!\[)(?<!\()embed:{esc_fn}")
+        if bare_pat.search(text):
+            return bare_pat.sub(f"![{filename}](attachment://{att_id})", text, count=1)
+        if f"attachment://{att_id}" in text:
+            return text
+        tag = f"![{filename}](attachment://{att_id})"
+        return tag if not text.strip() else f"{text.rstrip()}\n\n{tag}"
+
+    @staticmethod
+    def _strip_embed_from_markdown(body: str, att_id: str) -> str:
+        text = body or ""
+        esc_id = re.escape(att_id)
+        cleaned = re.sub(rf"!\[[^\]]*\]\(attachment://{esc_id}\)", "", text, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return cleaned
+
+    def add_description_embeds(
+        self,
+        issue_ref: str,
+        files_payload: List[Tuple[str, Optional[str], bytes]],
+        uploaded_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not files_payload:
+            raise HTTPException(status_code=400, detail="At least one embed file is required.")
+        with self.write_lock():
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            cfg = self._read_json(self.config_path)
+            actor = str(uploaded_by or self.default_user).strip() or self.default_user
+            att_dir = idir / "attachments"
+            desc = iss.get("description") or ""
+            added: List[Dict[str, Any]] = []
+            for fname, ctype, raw_bytes in files_payload:
+                meta = self._store_file_bytes_unlocked(att_dir, cfg, fname, ctype, raw_bytes, "description_embed", actor)
+                desc = self._apply_embed_to_markdown(desc, meta["filename"], meta["id"])
+                iss.setdefault("description_embeds", []).append(meta)
+                added.append(meta)
+
+            ts = now_iso()
+            old_desc = iss.get("description") or ""
+            iss["description"] = desc
+            iss["updated_at"] = ts
+            self._append_history(
+                idir,
+                cfg,
+                actor=actor,
+                action="description_embed_added",
+                diffs=[
+                    {"field": "description_embeds", "old": None, "new": [m["id"] for m in added]},
+                    {"field": "description", "old": old_desc, "new": desc},
+                ],
+                timestamp=ts,
+            )
+            self._atomic_write_json(self.config_path, cfg)
+            self._save_issue_unlocked(iss, idir)
+            return {"key": iss["key"], "embeds": added, "issue": self._enrich_issues_unlocked([(iss, idir)])[0]}
+
+    def delete_description_embed(self, issue_ref: str, att_id: str, actor: Optional[str] = None) -> Dict[str, Any]:
+        with self.write_lock():
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            up_id = att_id.strip().upper()
+            embeds = list(iss.get("description_embeds") or [])
+            found = next((e for e in embeds if e["id"].upper() == up_id), None)
+            if not found:
+                raise HTTPException(status_code=404, detail=f"Description embed '{att_id}' not found on {iss['key']}.")
+
+            fpath = idir / "attachments" / found["stored_name"]
+            fpath.unlink(missing_ok=True)
+            iss["description_embeds"] = [e for e in embeds if e["id"].upper() != up_id]
+            old_desc = iss.get("description") or ""
+            iss["description"] = self._strip_embed_from_markdown(old_desc, found["id"])
+            ts = now_iso()
+            iss["updated_at"] = ts
+            cfg = self._read_json(self.config_path)
+            self._append_history(
+                idir,
+                cfg,
+                actor=str(actor or self.default_user).strip() or self.default_user,
+                action="description_embed_deleted",
+                diffs=[{"field": "description_embeds", "old": found["id"], "new": None}],
+                timestamp=ts,
+            )
+            self._atomic_write_json(self.config_path, cfg)
+            self._save_issue_unlocked(iss, idir)
+            return {"deleted": True, "id": found["id"], "issue": self._enrich_issues_unlocked([(iss, idir)])[0]}
+
+    def add_issue_attachments(
+        self,
+        issue_ref: str,
+        files_payload: List[Tuple[str, Optional[str], bytes]],
+        uploaded_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not files_payload:
+            raise HTTPException(status_code=400, detail="At least one attachment file is required.")
+        with self.write_lock():
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            cfg = self._read_json(self.config_path)
+            actor = str(uploaded_by or self.default_user).strip() or self.default_user
+            att_dir = idir / "attachments"
+            added: List[Dict[str, Any]] = []
+            for fname, ctype, raw_bytes in files_payload:
+                meta = self._store_file_bytes_unlocked(att_dir, cfg, fname, ctype, raw_bytes, "issue", actor)
+                iss.setdefault("attachments", []).append(meta)
+                added.append(meta)
+
+            ts = now_iso()
+            iss["updated_at"] = ts
+            self._append_history(
+                idir,
+                cfg,
+                actor=actor,
+                action="attachment_added",
+                diffs=[{"field": "attachments", "old": None, "new": [m["id"] for m in added]}],
+                timestamp=ts,
+            )
+            self._atomic_write_json(self.config_path, cfg)
+            self._save_issue_unlocked(iss, idir)
+            return {"key": iss["key"], "attachments": added}
+
+    def list_attachments(self, issue_ref: str, scope: str = "all") -> Dict[str, Any]:
+        sc = (scope or "all").strip().lower()
+        if sc not in ("issue", "comments", "all"):
+            raise HTTPException(status_code=400, detail="Invalid scope. Expected 'issue', 'comments', or 'all'.")
+        with self.read_lock():
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            out: List[Dict[str, Any]] = []
+            if sc in ("issue", "all"):
+                out.extend(list(iss.get("attachments") or []))
+                out.extend(list(iss.get("description_embeds") or []))
+            if sc in ("comments", "all"):
+                for c in self._load_raw_comments_from_dir(idir):
+                    out.extend(list(c.get("embeds") or []))
+                    out.extend(list(c.get("attachments") or []))
+            return {"key": iss["key"], "scope": sc, "attachments": out}
+
+    def _locate_attachment_unlocked(
+        self, iss: Dict[str, Any], idir: Path, att_id: str
+    ) -> Tuple[Dict[str, Any], Path, str, Optional[Dict[str, Any]]]:
+        up = att_id.strip().upper()
+        for a in iss.get("attachments") or []:
+            if a["id"].upper() == up:
+                return a, idir / "attachments" / a["stored_name"], "issue", None
+        for e in iss.get("description_embeds") or []:
+            if e["id"].upper() == up:
+                return e, idir / "attachments" / e["stored_name"], "description_embed", None
+        for c in self._load_raw_comments_from_dir(idir):
+            cid = c["id"]
+            for e in c.get("embeds") or []:
+                if e["id"].upper() == up:
+                    return e, idir / "comments" / cid / "files" / e["stored_name"], "comment_embed", c
+            for ca in c.get("attachments") or []:
+                if ca["id"].upper() == up:
+                    return ca, idir / "comments" / cid / "files" / ca["stored_name"], "comment", c
+        raise HTTPException(status_code=404, detail=f"Attachment '{att_id}' not found on issue '{iss['key']}'.")
+
+    def get_attachment_info(self, issue_ref: str, att_id: str) -> Dict[str, Any]:
+        with self.read_lock():
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            meta, fpath, _, _ = self._locate_attachment_unlocked(iss, idir, att_id)
+            info = dict(meta)
+            info["issue_key"] = iss["key"]
+            info["exists_on_disk"] = fpath.exists()
+            preview_text: Optional[str] = None
+            if fpath.exists() and is_text_previewable(meta["filename"], meta.get("mime_type", "")):
+                with contextlib.suppress(Exception):
+                    with open(fpath, "rb") as f:
+                        raw = f.read(65536)
+                    preview_text = raw.decode("utf-8", errors="replace")
+            info["preview_text"] = preview_text
+            return info
+
+    def get_attachment_download(self, issue_ref: str, att_id: str) -> Tuple[Path, Dict[str, Any]]:
+        with self.read_lock():
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            meta, fpath, _, _ = self._locate_attachment_unlocked(iss, idir, att_id)
+            if not fpath.exists():
+                raise HTTPException(status_code=404, detail=f"Attachment file '{att_id}' missing on disk.")
+            return fpath, meta
+
+    def delete_attachment(self, issue_ref: str, att_id: str, actor: Optional[str] = None) -> Dict[str, Any]:
+        with self.write_lock():
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            meta, fpath, kind, cmt = self._locate_attachment_unlocked(iss, idir, att_id)
+            real_id = meta["id"]
+            fpath.unlink(missing_ok=True)
+            ts = now_iso()
+            eff_actor = str(actor or self.default_user).strip() or self.default_user
+
+            if kind == "issue":
+                iss["attachments"] = [a for a in (iss.get("attachments") or []) if a["id"] != real_id]
+                iss.setdefault("deleted_attachments", {})[real_id] = {
+                    "id": real_id,
+                    "filename": meta["filename"],
+                    "deleted_at": ts,
+                }
+            elif kind == "description_embed":
+                iss["description_embeds"] = [e for e in (iss.get("description_embeds") or []) if e["id"] != real_id]
+                iss["description"] = self._strip_embed_from_markdown(iss.get("description") or "", real_id)
+            elif cmt is not None:
+                c_path = idir / "comments" / cmt["id"] / "comment.json"
+                if kind == "comment_embed":
+                    cmt["embeds"] = [e for e in (cmt.get("embeds") or []) if e["id"] != real_id]
+                    cmt["body"] = self._strip_embed_from_markdown(cmt.get("body") or "", real_id)
+                else:
+                    cmt["attachments"] = [a for a in (cmt.get("attachments") or []) if a["id"] != real_id]
+                cmt["updated_at"] = ts
+                self._atomic_write_json(c_path, cmt)
+
+            iss["updated_at"] = ts
+            cfg = self._read_json(self.config_path)
+            self._append_history(
+                idir,
+                cfg,
+                actor=eff_actor,
+                action="attachment_deleted",
+                diffs=[{"field": "attachments", "old": real_id, "new": None}],
+                timestamp=ts,
+            )
+            self._atomic_write_json(self.config_path, cfg)
+            self._save_issue_unlocked(iss, idir)
+            return {"deleted": True, "id": real_id, "filename": meta["filename"], "scope": kind}
+
+    # --- Rich Comments ---
+
+    def list_comments(self, issue_ref: str) -> Dict[str, Any]:
+        with self.read_lock():
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            raw_cmts = self._load_raw_comments_from_dir(idir)
+            return {"key": iss["key"], "comments": [self._enrich_comment(c, iss) for c in raw_cmts]}
+
+    def get_comment(self, issue_ref: str, comment_id: str) -> Dict[str, Any]:
+        with self.read_lock():
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            cid = comment_id.strip().upper()
+            c_path = idir / "comments" / cid / "comment.json"
+            if not c_path.exists():
+                raise HTTPException(status_code=404, detail=f"Comment '{comment_id}' not found on {iss['key']}.")
+            return self._enrich_comment(self._read_json(c_path), iss)
+
+    def _validate_linkable_issue_attachments_unlocked(self, iss: Dict[str, Any], ids: List[str]) -> List[str]:
+        existing = {a["id"].upper(): a["id"] for a in (iss.get("attachments") or [])}
+        resolved: List[str] = []
+        for raw_id in ids:
+            up = str(raw_id).strip().upper()
+            if not up:
+                continue
+            if up not in existing:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Issue attachment '{raw_id}' does not exist on issue '{iss['key']}'.",
+                )
+            canon = existing[up]
+            if canon not in resolved:
+                resolved.append(canon)
+        return resolved
+
+    def add_comment(
+        self,
+        issue_ref: str,
+        body: str = "",
+        author: Optional[str] = None,
+        embeds_payload: Optional[List[Tuple[str, Optional[str], bytes]]] = None,
+        attachments_payload: Optional[List[Tuple[str, Optional[str], bytes]]] = None,
+        linked_attachment_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        embeds_payload = embeds_payload or []
+        attachments_payload = attachments_payload or []
+        linked_attachment_ids = linked_attachment_ids or []
+        if not (body and body.strip()) and not embeds_payload and not attachments_payload and not linked_attachment_ids:
+            raise HTTPException(status_code=400, detail="Comment must contain body text, embeds, or attachments.")
+
+        with self.write_lock():
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            linked_clean = self._validate_linkable_issue_attachments_unlocked(iss, linked_attachment_ids)
+
+            cfg = self._read_json(self.config_path)
+            c_seq = self._next_seq(cfg, "next_comment_seq")
+            cid = f"CMT-{c_seq}"
+            eff_author = str(author or self.default_user).strip() or self.default_user
+            c_dir = idir / "comments" / cid
+            c_files_dir = c_dir / "files"
+            c_dir.mkdir(parents=True, exist_ok=True)
+
+            text = body or ""
+            embeds_meta: List[Dict[str, Any]] = []
+            for fname, ctype, raw_bytes in embeds_payload:
+                meta = self._store_file_bytes_unlocked(
+                    c_files_dir, cfg, fname, ctype, raw_bytes, "comment_embed", eff_author, comment_id=cid
+                )
+                text = self._apply_embed_to_markdown(text, meta["filename"], meta["id"])
+                embeds_meta.append(meta)
+
+            atts_meta: List[Dict[str, Any]] = []
+            for fname, ctype, raw_bytes in attachments_payload:
+                meta = self._store_file_bytes_unlocked(
+                    c_files_dir, cfg, fname, ctype, raw_bytes, "comment", eff_author, comment_id=cid
+                )
+                atts_meta.append(meta)
+
+            ts = now_iso()
+            cmt: Dict[str, Any] = {
+                "id": cid,
+                "seq": c_seq,
+                "issue_key": iss["key"],
                 "author": eff_author,
                 "body": text,
+                "embeds": embeds_meta,
+                "attachments": atts_meta,
+                "linked_attachment_ids": linked_clean,
+                "edit_history": [],
                 "created_at": ts,
                 "updated_at": ts,
             }
-            iss.setdefault("comments", []).append(cmt)
+            self._atomic_write_json(c_dir / "comment.json", cmt)
+
             iss["updated_at"] = ts
-            iss.setdefault("history", []).append(
-                {
-                    "id": f"EVT-{short_id()}",
-                    "actor": eff_author,
-                    "action": "comment_added",
-                    "changes": {"comment_id": cmt["id"]},
-                    "timestamp": ts,
-                }
-            )
-            self._save_issue(iss)
-            return cmt
-
-    def edit_comment(self, key: str, comment_id: str, body: str, actor: Optional[str] = None) -> Dict[str, Any]:
-        text = (body or "").strip()
-        if not text:
-            raise HTTPException(status_code=400, detail="Comment body cannot be empty.")
-        with self.write_lock():
-            iss = self._get_raw_issue_or_404(key)
-            cmt = next((c for c in iss.get("comments", []) if c["id"] == comment_id), None)
-            if not cmt:
-                raise HTTPException(status_code=404, detail=f"Comment '{comment_id}' not found on {iss['key']}.")
-            ts = now_iso()
-            cmt["body"] = text
-            cmt["updated_at"] = ts
-            iss["updated_at"] = ts
-            self._save_issue(iss)
-            return cmt
-
-    def delete_comment(self, key: str, comment_id: str) -> Dict[str, Any]:
-        with self.write_lock():
-            iss = self._get_raw_issue_or_404(key)
-            comments = iss.get("comments", [])
-            new_comments = [c for c in comments if c["id"] != comment_id]
-            if len(new_comments) == len(comments):
-                raise HTTPException(status_code=404, detail=f"Comment '{comment_id}' not found on {iss['key']}.")
-            iss["comments"] = new_comments
-            iss["updated_at"] = now_iso()
-            self._save_issue(iss)
-            return {"deleted": True, "id": comment_id}
-
-    # Multipart Attachments
-    def list_attachments(self, key: str) -> Dict[str, Any]:
-        with self.read_lock():
-            iss = self._get_raw_issue_or_404(key)
-            return {"key": iss["key"], "attachments": iss.get("attachments", [])}
-
-    def save_attachment(
-        self,
-        key: str,
-        filename: Optional[str],
-        content_type: Optional[str],
-        stream: Any,
-        uploaded_by: str = "system",
-        description: str = "",
-    ) -> Dict[str, Any]:
-        safe_name = sanitize_filename(filename)
-        with self.write_lock():
-            iss = self._get_raw_issue_or_404(key)
-            real_key = iss["key"]
-            cfg = self._read_json(self.config_path)
-            att_seq = int(cfg.get("next_attachment_seq", 1))
-            cfg["next_attachment_seq"] = att_seq + 1
-            att_id = f"ATT-{att_seq}"
-            stored_name = f"{att_id}_{safe_name}"
-
-            issue_att_dir = (self.attachments_dir / real_key).resolve()
-            if not issue_att_dir.is_relative_to(self.attachments_dir.resolve()):
-                raise HTTPException(status_code=400, detail="Invalid attachment storage path.")
-            issue_att_dir.mkdir(parents=True, exist_ok=True)
-            target_path = (issue_att_dir / stored_name).resolve()
-            if not target_path.is_relative_to(issue_att_dir):
-                raise HTTPException(status_code=400, detail="Invalid attachment filename.")
-
-            tmp_path = issue_att_dir / f".{stored_name}.{short_id()}.tmp"
-            hasher = hashlib.sha256()
-            size_bytes = 0
-            with open(tmp_path, "wb") as out_f:
-                while True:
-                    chunk = stream.read(65536)
-                    if not chunk:
-                        break
-                    hasher.update(chunk)
-                    size_bytes += len(chunk)
-                    out_f.write(chunk)
-                out_f.flush()
-            os.replace(tmp_path, target_path)
-
-            guessed_mime = mimetypes.guess_type(safe_name)[0]
-            mime = content_type if (content_type and content_type != "application/octet-stream") else (guessed_mime or content_type or "application/octet-stream")
-            ts = now_iso()
-            actor = (uploaded_by or self.default_user).strip()
-            att_meta = {
-                "id": att_id,
-                "filename": safe_name,
-                "stored_name": stored_name,
-                "mime_type": mime,
-                "size_bytes": size_bytes,
-                "sha256": hasher.hexdigest(),
-                "description": description or "",
-                "uploaded_by": actor,
-                "created_at": ts,
-            }
-            iss.setdefault("attachments", []).append(att_meta)
-            iss["updated_at"] = ts
-            cfg["updated_at"] = ts
-            iss.setdefault("history", []).append(
-                {
-                    "id": f"EVT-{short_id()}",
-                    "actor": actor,
-                    "action": "attachment_added",
-                    "changes": {"attachment_id": att_id, "filename": safe_name},
-                    "timestamp": ts,
-                }
+            self._append_history(
+                idir,
+                cfg,
+                actor=eff_author,
+                action="comment_added",
+                diffs=[{"field": "comments", "old": None, "new": cid}],
+                timestamp=ts,
             )
             self._atomic_write_json(self.config_path, cfg)
-            self._save_issue(iss)
-            return att_meta
+            self._save_issue_unlocked(iss, idir)
+            return self._enrich_comment(cmt, iss)
 
-    def get_attachment_download_info(self, key: str, attachment_id: str) -> Tuple[Path, Dict[str, Any]]:
-        with self.read_lock():
-            iss = self._get_raw_issue_or_404(key)
-            real_key = iss["key"]
-            att_norm = attachment_id.strip().upper()
-            att = next(
-                (a for a in iss.get("attachments", []) if a["id"].upper() == att_norm),
-                None,
-            )
-            if not att:
-                raise HTTPException(status_code=404, detail=f"Attachment '{attachment_id}' not found on {real_key}.")
-            fpath = (self.attachments_dir / real_key / att["stored_name"]).resolve()
-            if not fpath.is_relative_to(self.attachments_dir.resolve()) or not fpath.exists():
-                raise HTTPException(status_code=404, detail=f"Attachment file missing on disk for '{attachment_id}'.")
-            return fpath, att
-
-    def delete_attachment(self, key: str, attachment_id: str) -> Dict[str, Any]:
+    def update_comment(
+        self,
+        issue_ref: str,
+        comment_id: str,
+        body: Optional[str] = None,
+        actor: Optional[str] = None,
+        add_embeds: Optional[List[Tuple[str, Optional[str], bytes]]] = None,
+        remove_embeds: Optional[List[str]] = None,
+        add_attachments: Optional[List[Tuple[str, Optional[str], bytes]]] = None,
+        remove_attachments: Optional[List[str]] = None,
+        link_attachments: Optional[List[str]] = None,
+        unlink_attachments: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         with self.write_lock():
-            iss = self._get_raw_issue_or_404(key)
-            real_key = iss["key"]
-            att_norm = attachment_id.strip().upper()
-            att = next((a for a in iss.get("attachments", []) if a["id"].upper() == att_norm), None)
-            if not att:
-                raise HTTPException(status_code=404, detail=f"Attachment '{attachment_id}' not found on {real_key}.")
-            fpath = (self.attachments_dir / real_key / att["stored_name"]).resolve()
-            if fpath.is_relative_to(self.attachments_dir.resolve()):
-                fpath.unlink(missing_ok=True)
-            iss["attachments"] = [a for a in iss.get("attachments", []) if a["id"].upper() != att_norm]
-            iss["updated_at"] = now_iso()
-            self._save_issue(iss)
-            return {"deleted": True, "id": att["id"]}
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            cid = comment_id.strip().upper()
+            c_dir = idir / "comments" / cid
+            c_path = c_dir / "comment.json"
+            if not c_path.exists():
+                raise HTTPException(status_code=404, detail=f"Comment '{comment_id}' not found on {iss['key']}.")
 
-    # Links & DAG Cycle Detection
-    def list_links(self, key: str) -> Dict[str, Any]:
-        iss = self.get_issue(key)
-        return {"key": iss["key"], "links": iss["all_links"]}
+            cmt = self._read_json(c_path)
+            cfg = self._read_json(self.config_path)
+            eff_actor = str(actor or self.default_user).strip() or self.default_user
+            ts = now_iso()
 
-    def _find_blocking_path(self, start: str, goal: str) -> Optional[List[str]]:
-        """BFS over current blocking graph (blocker -> blocked) to detect cycles."""
+            old_body = cmt.get("body") or ""
+            cur_body = body if body is not None else old_body
+
+            # 1. Remove specified embeds
+            for rem_id in (remove_embeds or []):
+                up = str(rem_id).strip().upper()
+                emb = next((e for e in (cmt.get("embeds") or []) if e["id"].upper() == up), None)
+                if not emb:
+                    raise HTTPException(status_code=404, detail=f"Embed '{rem_id}' not found on comment '{cid}'.")
+                (c_dir / "files" / emb["stored_name"]).unlink(missing_ok=True)
+                cmt["embeds"] = [e for e in (cmt.get("embeds") or []) if e["id"].upper() != up]
+                cur_body = self._strip_embed_from_markdown(cur_body, emb["id"])
+
+            # 2. Remove specified comment attachments
+            for rem_att_id in (remove_attachments or []):
+                up = str(rem_att_id).strip().upper()
+                ca = next((a for a in (cmt.get("attachments") or []) if a["id"].upper() == up), None)
+                if not ca:
+                    raise HTTPException(status_code=404, detail=f"Attachment '{rem_att_id}' not found on comment '{cid}'.")
+                (c_dir / "files" / ca["stored_name"]).unlink(missing_ok=True)
+                cmt["attachments"] = [a for a in (cmt.get("attachments") or []) if a["id"].upper() != up]
+
+            # 3. Add new embeds
+            c_files_dir = c_dir / "files"
+            for fname, ctype, raw_bytes in (add_embeds or []):
+                meta = self._store_file_bytes_unlocked(
+                    c_files_dir, cfg, fname, ctype, raw_bytes, "comment_embed", eff_actor, comment_id=cid
+                )
+                cur_body = self._apply_embed_to_markdown(cur_body, meta["filename"], meta["id"])
+                cmt.setdefault("embeds", []).append(meta)
+
+            # 4. Add new comment attachments
+            for fname, ctype, raw_bytes in (add_attachments or []):
+                meta = self._store_file_bytes_unlocked(
+                    c_files_dir, cfg, fname, ctype, raw_bytes, "comment", eff_actor, comment_id=cid
+                )
+                cmt.setdefault("attachments", []).append(meta)
+
+            # 5. Link / Unlink issue attachments
+            linked_ids = list(cmt.get("linked_attachment_ids") or [])
+            if link_attachments:
+                validated_new = self._validate_linkable_issue_attachments_unlocked(iss, link_attachments)
+                for vid in validated_new:
+                    if vid not in linked_ids:
+                        linked_ids.append(vid)
+            if unlink_attachments:
+                un_set = {str(x).strip().upper() for x in unlink_attachments if str(x).strip()}
+                linked_ids = [lid for lid in linked_ids if lid.upper() not in un_set]
+            cmt["linked_attachment_ids"] = linked_ids
+
+            if cur_body != old_body:
+                cmt.setdefault("edit_history", []).append({
+                    "edited_at": ts,
+                    "actor": eff_actor,
+                    "previous_body": old_body,
+                })
+            cmt["body"] = cur_body
+            cmt["updated_at"] = ts
+            self._atomic_write_json(c_path, cmt)
+
+            iss["updated_at"] = ts
+            self._append_history(
+                idir,
+                cfg,
+                actor=eff_actor,
+                action="comment_updated",
+                diffs=[{"field": "comment", "old": cid, "new": cid}],
+                timestamp=ts,
+            )
+            self._atomic_write_json(self.config_path, cfg)
+            self._save_issue_unlocked(iss, idir)
+            return self._enrich_comment(cmt, iss)
+
+    def delete_comment(self, issue_ref: str, comment_id: str, actor: Optional[str] = None) -> Dict[str, Any]:
+        with self.write_lock():
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            cid = comment_id.strip().upper()
+            c_dir = idir / "comments" / cid
+            if not (c_dir / "comment.json").exists():
+                raise HTTPException(status_code=404, detail=f"Comment '{comment_id}' not found on {iss['key']}.")
+
+            shutil.rmtree(c_dir, ignore_errors=True)
+            ts = now_iso()
+            iss["updated_at"] = ts
+            cfg = self._read_json(self.config_path)
+            self._append_history(
+                idir,
+                cfg,
+                actor=str(actor or self.default_user).strip() or self.default_user,
+                action="comment_deleted",
+                diffs=[{"field": "comments", "old": cid, "new": None}],
+                timestamp=ts,
+            )
+            self._atomic_write_json(self.config_path, cfg)
+            self._save_issue_unlocked(iss, idir)
+            return {"deleted": True, "id": cid, "issue_key": iss["key"]}
+
+    # ------------------------------------------------------------------------
+    # Bidirectional Links, Worklogs & Bulk Operations
+    # ------------------------------------------------------------------------
+
+    def list_links(self, issue_ref: str) -> Dict[str, Any]:
+        with self.read_lock():
+            iss, _ = self._resolve_issue_unlocked(issue_ref)
+            return {"key": iss["key"], "links": list(iss.get("links") or [])}
+
+    def _has_blocking_path_unlocked(self, start_key: str, goal_key: str) -> bool:
+        assert self._db is not None
+        rows = self._db.execute("SELECT blocker_key, blocked_key FROM issue_links").fetchall()
         adj: Dict[str, Set[str]] = {}
-        rows = self._db.execute("SELECT source_key, target_key, link_type FROM issue_links").fetchall()
         for r in rows:
-            lt = r["link_type"]
-            if lt == "blocks":
-                adj.setdefault(r["source_key"], set()).add(r["target_key"])
-            elif lt == "blocked_by":
-                adj.setdefault(r["target_key"], set()).add(r["source_key"])
-
-        q: deque[List[str]] = deque([[start]])
-        visited: Set[str] = {start}
+            adj.setdefault(r["blocker_key"], set()).add(r["blocked_key"])
+        q: deque[str] = deque([start_key])
+        seen: Set[str] = {start_key}
         while q:
-            path = q.popleft()
-            curr = path[-1]
-            if curr == goal:
-                return path
-            for nxt in adj.get(curr, ()):
-                if nxt not in visited:
-                    visited.add(nxt)
-                    q.append(path + [nxt])
-        return None
+            cur = q.popleft()
+            if cur == goal_key:
+                return True
+            for nxt in adj.get(cur, ()):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    q.append(nxt)
+        return False
 
-    def add_link(self, source_key: str, target_key: str, link_type: str, actor: Optional[str] = None) -> Dict[str, Any]:
+    def add_link(self, issue_ref: str, link_type: str, target_ref: str, actor: Optional[str] = None) -> Dict[str, Any]:
         try:
             norm_type = normalize_link_type(link_type)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
         with self.write_lock():
-            src_iss = self._get_raw_issue_or_404(source_key)
-            tgt_iss = self._get_raw_issue_or_404(target_key)
-            s_key = src_iss["key"]
-            t_key = tgt_iss["key"]
-            if s_key == t_key:
-                raise HTTPException(status_code=400, detail="Cannot link an issue to itself.")
+            src, src_dir = self._resolve_issue_unlocked(issue_ref)
+            tgt, tgt_dir = self._resolve_issue_unlocked(target_ref)
+            src_key = src["key"]
+            tgt_key = tgt["key"]
 
-            # Duplicate check (direct or inverse)
-            inv_type = INVERSE_LINK_TYPES[norm_type]
-            dup = self._db.execute(
-                """
-                SELECT id FROM issue_links
-                WHERE (source_key = ? AND target_key = ? AND link_type = ?)
-                   OR (source_key = ? AND target_key = ? AND link_type = ?)
-                """,
-                (s_key, t_key, norm_type, t_key, s_key, inv_type),
-            ).fetchone()
-            if dup:
-                raise HTTPException(status_code=409, detail=f"Link '{s_key} {norm_type} {t_key}' already exists.")
+            if src_key == tgt_key:
+                raise HTTPException(status_code=409, detail=f"Cannot link issue '{src_key}' to itself.")
 
-            # DAG Cycle check for blocks / blocked_by
-            if norm_type in ("blocks", "blocked_by"):
-                blocker = s_key if norm_type == "blocks" else t_key
-                blocked = t_key if norm_type == "blocks" else s_key
-                existing_path = self._find_blocking_path(blocked, blocker)
-                if existing_path is not None:
-                    cycle_str = " -> ".join(existing_path + [blocked])
+            # Duplicate link check
+            for ex in src.get("links") or []:
+                if ex.get("target_key") == tgt_key and ex.get("type") == norm_type:
                     raise HTTPException(
                         status_code=409,
-                        detail=f"Dependency cycle detected: adding '{blocker} blocks {blocked}' creates cycle ({cycle_str}).",
+                        detail=f"Link '{src_key} {norm_type} {tgt_key}' already exists ({ex['id']}).",
                     )
 
+            # Cycle check for blocks / blocked-by
+            if norm_type in ("blocks", "blocked-by"):
+                blocker = src_key if norm_type == "blocks" else tgt_key
+                blocked = tgt_key if norm_type == "blocks" else src_key
+                if self._has_blocking_path_unlocked(blocked, blocker):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Adding '{src_key} {norm_type} {tgt_key}' creates a circular blocking dependency.",
+                    )
+
+            # Cycle check & parent sync for parent-of
+            if norm_type == "parent-of":
+                self._check_parent_cycle_unlocked(tgt_key, src_key)
+
+            cfg = self._read_json(self.config_path)
+            l_seq = self._next_seq(cfg, "next_link_seq")
+            lid = f"LNK-{l_seq}"
             ts = now_iso()
-            eff_actor = (actor or self.default_user).strip()
-            lnk = {
-                "id": f"LNK-{short_id()}",
-                "source_key": s_key,
-                "target_key": t_key,
-                "link_type": norm_type,
-                "created_by": eff_actor,
+            eff_actor = str(actor or self.default_user).strip() or self.default_user
+            inv_type = INVERSE_LINK_TYPES[norm_type]
+
+            src_entry = {
+                "id": lid,
+                "type": norm_type,
+                "direction": "outbound",
+                "target_key": tgt_key,
+                "target_name": tgt["name"],
                 "created_at": ts,
             }
-            src_iss.setdefault("links", []).append(lnk)
-            src_iss["updated_at"] = ts
-            src_iss.setdefault("history", []).append(
-                {
-                    "id": f"EVT-{short_id()}",
-                    "actor": eff_actor,
-                    "action": "link_added",
-                    "changes": {"link": f"{s_key} {norm_type} {t_key}"},
-                    "timestamp": ts,
-                }
+            tgt_entry = {
+                "id": lid,
+                "type": inv_type,
+                "direction": "inbound",
+                "target_key": src_key,
+                "target_name": src["name"],
+                "created_at": ts,
+            }
+
+            src.setdefault("links", []).append(src_entry)
+            tgt.setdefault("links", []).append(tgt_entry)
+            if norm_type == "parent-of":
+                tgt["parent"] = src_key
+
+            src["updated_at"] = ts
+            tgt["updated_at"] = ts
+            self._append_history(
+                src_dir, cfg, actor=eff_actor, action="link_added",
+                diffs=[{"field": "links", "old": None, "new": f"{norm_type} {tgt_key}"}], timestamp=ts,
             )
-            self._save_issue(src_iss)
-            return lnk
+            self._append_history(
+                tgt_dir, cfg, actor=eff_actor, action="link_added",
+                diffs=[{"field": "links", "old": None, "new": f"{inv_type} {src_key}"}], timestamp=ts,
+            )
+            self._atomic_write_json(self.config_path, cfg)
+            self._atomic_write_json(tgt_dir / "issue.json", tgt)
+            self._save_issue_unlocked(src, src_dir)
+            self._save_issue_unlocked(tgt, tgt_dir)
+            return src_entry
 
-    def delete_link(self, key: str, link_id: str) -> Dict[str, Any]:
+    def remove_link(self, issue_ref: str, link_id: str, actor: Optional[str] = None) -> Dict[str, Any]:
         with self.write_lock():
-            iss = self._get_raw_issue_or_404(key)
-            real_key = iss["key"]
-            row = self._db.execute(
-                "SELECT id, source_key, target_key FROM issue_links WHERE id = ?", (link_id,)
-            ).fetchone()
-            if not row or (row["source_key"] != real_key and row["target_key"] != real_key):
-                raise HTTPException(status_code=404, detail=f"Link '{link_id}' not found on {real_key}.")
-            owner_iss = self._get_raw_issue_or_404(row["source_key"])
-            owner_iss["links"] = [l for l in owner_iss.get("links", []) if l["id"] != link_id]
-            owner_iss["updated_at"] = now_iso()
-            self._save_issue(owner_iss)
-            return {"deleted": True, "id": link_id}
+            src, src_dir = self._resolve_issue_unlocked(issue_ref)
+            lid = link_id.strip().upper()
+            found = next((l for l in (src.get("links") or []) if l["id"].upper() == lid), None)
+            if not found:
+                raise HTTPException(status_code=404, detail=f"Link '{link_id}' not found on {src['key']}.")
 
-    # Worklogs
-    def list_worklogs(self, key: str) -> Dict[str, Any]:
-        with self.read_lock():
-            iss = self._get_raw_issue_or_404(key)
-            wls = iss.get("worklogs", [])
-            total = sum(int(w.get("minutes", 0)) for w in wls)
-            return {"key": iss["key"], "worklogs": wls, "total_minutes": total}
+            real_lid = found["id"]
+            tgt_key = found["target_key"]
+            ts = now_iso()
+            eff_actor = str(actor or self.default_user).strip() or self.default_user
+
+            src["links"] = [l for l in (src.get("links") or []) if l["id"] != real_lid]
+            if found.get("type") == "child-of" and src.get("parent") == tgt_key:
+                src["parent"] = None
+            src["updated_at"] = ts
+
+            cfg = self._read_json(self.config_path)
+            self._append_history(
+                src_dir, cfg, actor=eff_actor, action="link_removed",
+                diffs=[{"field": "links", "old": real_lid, "new": None}], timestamp=ts,
+            )
+
+            with contextlib.suppress(HTTPException):
+                tgt, tgt_dir = self._resolve_issue_unlocked(tgt_key)
+                tgt["links"] = [l for l in (tgt.get("links") or []) if l["id"] != real_lid]
+                if found.get("type") == "parent-of" and tgt.get("parent") == src["key"]:
+                    tgt["parent"] = None
+                tgt["updated_at"] = ts
+                self._append_history(
+                    tgt_dir, cfg, actor=eff_actor, action="link_removed",
+                    diffs=[{"field": "links", "old": real_lid, "new": None}], timestamp=ts,
+                )
+                self._save_issue_unlocked(tgt, tgt_dir)
+
+            self._atomic_write_json(self.config_path, cfg)
+            self._save_issue_unlocked(src, src_dir)
+            return {"deleted": True, "id": real_lid}
+
+    # --- Worklogs ---
+
+    def list_worklogs(self, issue_ref: str) -> Dict[str, Any]:
+        iss = self.get_issue(issue_ref)
+        return {
+            "key": iss["key"],
+            "worklogs": iss.get("worklogs") or [],
+            "time_progress": iss["time_progress"],
+        }
 
     def add_worklog(
         self,
-        key: str,
-        minutes: Optional[int] = None,
-        duration: Optional[str] = None,
+        issue_ref: str,
+        minutes: Optional[Any] = None,
+        duration: Optional[Any] = None,
         author: Optional[str] = None,
         note: Optional[str] = None,
-        started_at: Optional[str] = None,
     ) -> Dict[str, Any]:
         try:
             mins = parse_duration_minutes(minutes, duration)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+
         with self.write_lock():
-            iss = self._get_raw_issue_or_404(key)
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            cfg = self._read_json(self.config_path)
+            w_seq = self._next_seq(cfg, "next_worklog_seq")
+            wid = f"WL-{w_seq}"
+            eff_author = str(author or self.default_user).strip() or self.default_user
             ts = now_iso()
-            eff_author = (author or self.default_user).strip()
-            wl = {
-                "id": f"WL-{short_id()}",
+            entry = {
+                "id": wid,
                 "author": eff_author,
                 "minutes": mins,
-                "note": (note or "").strip(),
-                "started_at": started_at or ts,
+                "note": str(note or "").strip(),
                 "created_at": ts,
             }
-            iss.setdefault("worklogs", []).append(wl)
+            iss.setdefault("worklogs", []).append(entry)
+            old_logged = int(iss.get("logged_minutes") or 0)
+            iss["logged_minutes"] = sum(int(w.get("minutes", 0)) for w in iss["worklogs"])
             iss["updated_at"] = ts
-            self._save_issue(iss)
-            return wl
-
-    def delete_worklog(self, key: str, worklog_id: str) -> Dict[str, Any]:
-        with self.write_lock():
-            iss = self._get_raw_issue_or_404(key)
-            wls = iss.get("worklogs", [])
-            new_wls = [w for w in wls if w["id"] != worklog_id]
-            if len(new_wls) == len(wls):
-                raise HTTPException(status_code=404, detail=f"Worklog '{worklog_id}' not found on {iss['key']}.")
-            iss["worklogs"] = new_wls
-            iss["updated_at"] = now_iso()
-            self._save_issue(iss)
-            return {"deleted": True, "id": worklog_id}
-
-    # ------------------------------------------------------------------------
-    # iQL Execution, Search, Ready Queue, Board, Epics, Graph, Stats, Export/Import
-    # ------------------------------------------------------------------------
-
-    def _make_compiler(self, current_user: Optional[str] = None) -> IQLCompiler:
-        sprints = self.list_sprints()
-        active_ids = [s["id"] for s in sprints if s.get("state") == "active"]
-        name_map = {s["name"]: s["id"] for s in sprints if s.get("name")}
-        return IQLCompiler(
-            current_user=(current_user or self.default_user),
-            active_sprint_ids=active_ids,
-            sprint_name_to_id=name_map,
-        )
-
-    def execute_iql(
-        self,
-        iql: Optional[str] = None,
-        extra_filters: Optional[List[Dict[str, Any]]] = None,
-        sort: Optional[str] = None,
-        limit: int = 200,
-        offset: int = 0,
-        current_user: Optional[str] = None,
-    ) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any]]:
-        with self.read_lock():
-            try:
-                ast = parse_iql(iql or "")
-            except IQLError as e:
-                raise HTTPException(status_code=400, detail=f"iQL error: {e.message}")
-
-            where_node = ast["where"]
-            if extra_filters:
-                combined = ([where_node] if where_node else []) + extra_filters
-                where_node = combined[0] if len(combined) == 1 else {"type": "and", "children": combined}
-
-            compiler = self._make_compiler(current_user=current_user)
-            try:
-                where_sql, params = compiler.compile_where(where_node)
-                order_sql = compiler.compile_order_by(ast["order_by"], default_sort=sort)
-            except IQLError as e:
-                raise HTTPException(status_code=400, detail=f"iQL compilation error: {e.message}")
-
-            eff_limit = ast["limit"] if ast["limit"] is not None else max(0, int(limit))
-            eff_offset = ast["offset"] if ast["offset"] is not None else max(0, int(offset))
-
-            try:
-                total_row = self._db.execute(
-                    f"SELECT COUNT(*) AS c FROM issues WHERE {where_sql}", params
-                ).fetchone()
-                total = int(total_row["c"]) if total_row else 0
-
-                rows = self._db.execute(
-                    f"SELECT raw_json FROM issues WHERE {where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?",
-                    [*params, eff_limit, eff_offset],
-                ).fetchall()
-            except sqlite3.OperationalError as exc:
-                raise HTTPException(status_code=400, detail=f"iQL query execution error: {exc}")
-            issues = self._enrich_issues([json.loads(r["raw_json"]) for r in rows])
-            return issues, total, ast
-
-    def get_ready_issues(
-        self,
-        assignee: Optional[str] = None,
-        sprint_id: Optional[str] = None,
-        limit: int = 50,
-    ) -> Dict[str, Any]:
-        filters: List[Dict[str, Any]] = [
-            {"type": "in", "field": "status", "raw_field": "status", "negated": False, "values": ["backlog", "todo"]},
-            {"type": "cmp", "field": "is_blocked", "raw_field": "blocked", "op": "=", "value": "false"},
-            {"type": "empty", "field": "claimed_by", "raw_field": "claimed_by", "negated": False},
-        ]
-        if assignee:
-            filters.append({"type": "cmp", "field": "assignee", "raw_field": "assignee", "op": "=", "value": assignee})
-        if sprint_id:
-            filters.append({"type": "cmp", "field": "sprint_id", "raw_field": "sprint_id", "op": "=", "value": sprint_id})
-        issues, total, _ = self.execute_iql(
-            iql="ORDER BY priority DESC, seq ASC",
-            extra_filters=filters,
-            limit=limit,
-            offset=0,
-        )
-        return {"issues": issues, "total": total}
-
-    def search_issues(
-        self,
-        q: Optional[str] = None,
-        iql: Optional[str] = None,
-        limit: int = 50,
-        offset: int = 0,
-    ) -> Dict[str, Any]:
-        with self.read_lock():
-            snippets: Dict[str, str] = {}
-            extra: List[Dict[str, Any]] = []
-            if q and q.strip():
-                extra.append({"type": "cmp", "field": "text", "raw_field": "text", "op": "~", "value": q.strip()})
-
-            if iql and iql.strip():
-                issues, total, _ = self.execute_iql(
-                    iql=iql,
-                    extra_filters=extra or None,
-                    limit=limit,
-                    offset=offset,
-                )
-            elif q and q.strip():
-                fts_q = build_fts_match_expr(q.strip())
-                if fts_q:
-                    fts_rows = self._db.execute(
-                        "SELECT key, snippet(issues_fts, -1, '<mark>', '</mark>', '...', 16) AS snip "
-                        "FROM issues_fts WHERE issues_fts MATCH ? ORDER BY bm25(issues_fts)",
-                        (fts_q,),
-                    ).fetchall()
-                    for fr in fts_rows:
-                        snippets[fr["key"]] = fr["snip"]
-                issues, total, _ = self.execute_iql(
-                    iql="",
-                    extra_filters=extra,
-                    sort="-priority,seq",
-                    limit=limit,
-                    offset=offset,
-                )
-            else:
-                issues, total, _ = self.execute_iql(iql="", limit=limit, offset=offset)
-
-            # Populate snippets for matched issues even when matched via iQL or substring
-            needle = (q or "").strip().lower()
-            for iss in issues:
-                k = iss["key"]
-                if k not in snippets:
-                    body = iss.get("description") or iss.get("title") or ""
-                    if needle and needle in body.lower():
-                        idx = body.lower().find(needle)
-                        start = max(0, idx - 36)
-                        end = min(len(body), idx + len(needle) + 64)
-                        snippets[k] = ("..." if start > 0 else "") + body[start:end] + ("..." if end < len(body) else "")
-                    else:
-                        snippets[k] = (iss.get("description") or iss.get("title") or "")[:120]
-
-            return {
-                "issues": issues,
-                "snippets": snippets,
-                "total": total,
-                "query": iql if (iql and iql.strip()) else (q or ""),
-            }
-
-    def get_board(
-        self,
-        sprint_id: Optional[str] = None,
-        epic_id: Optional[str] = None,
-        assignee: Optional[str] = None,
-        iql: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        with self.read_lock():
-            cfg = self._read_json(self.config_path)
-            extra: List[Dict[str, Any]] = []
-            if sprint_id:
-                extra.append({"type": "cmp", "field": "sprint_id", "raw_field": "sprint_id", "op": "=", "value": sprint_id})
-            if epic_id:
-                extra.append({"type": "cmp", "field": "epic_id", "raw_field": "epic_id", "op": "=", "value": epic_id})
-            if assignee:
-                extra.append({"type": "cmp", "field": "assignee", "raw_field": "assignee", "op": "=", "value": assignee})
-
-            issues, _, _ = self.execute_iql(
-                iql=iql or "",
-                extra_filters=extra or None,
-                sort="-priority,seq",
-                limit=2000,
-                offset=0,
+            self._append_history(
+                idir, cfg, actor=eff_author, action="worklog_added",
+                diffs=[{"field": "logged_minutes", "old": old_logged, "new": iss["logged_minutes"]}],
+                timestamp=ts,
             )
-            statuses = list(cfg.get("statuses", DEFAULT_STATUSES))
-            for iss in issues:
-                if iss["status"] not in statuses:
-                    statuses.append(iss["status"])
-
-            wip_limits = cfg.get("wip_limits") or {}
-            by_status: Dict[str, List[Dict[str, Any]]] = {st: [] for st in statuses}
-            for iss in issues:
-                by_status[iss["status"]].append(iss)
-
-            columns: List[Dict[str, Any]] = []
-            for st in statuses:
-                col_issues = by_status[st]
-                pts = round(sum(float(i.get("story_points") or 0.0) for i in col_issues), 2)
-                columns.append(
-                    {
-                        "status": st,
-                        "issues": col_issues,
-                        "count": len(col_issues),
-                        "points": pts,
-                        "wip_limit": wip_limits.get(st),
-                    }
-                )
-            return {"columns": columns, "total_issues": len(issues)}
-
-    def get_epics(self) -> Dict[str, Any]:
-        with self.read_lock():
-            epic_rows = self._db.execute(
-                "SELECT raw_json FROM issues WHERE type = 'epic' ORDER BY priority_rank DESC, seq ASC"
-            ).fetchall()
-            epics = self._enrich_issues([json.loads(r["raw_json"]) for r in epic_rows])
-            out: List[Dict[str, Any]] = []
-            for ep in epics:
-                ekey = ep["key"]
-                child_rows = self._db.execute(
-                    "SELECT key, status, story_points FROM issues WHERE (epic_id = ? OR parent_id = ?) AND key != ? ORDER BY seq ASC",
-                    (ekey, ekey, ekey),
-                ).fetchall()
-                child_count = len(child_rows)
-                done_count = sum(1 for r in child_rows if r["status"] == "done")
-                total_pts = round(sum(float(r["story_points"] or 0.0) for r in child_rows), 2)
-                done_pts = round(
-                    sum(float(r["story_points"] or 0.0) for r in child_rows if r["status"] == "done"), 2
-                )
-                if child_count > 0:
-                    pct = round(done_count / child_count * 100.0, 1)
-                else:
-                    pct = 100.0 if ep["status"] == "done" else 0.0
-                out.append(
-                    {
-                        "issue": ep,
-                        "child_count": child_count,
-                        "done_count": done_count,
-                        "total_points": total_pts,
-                        "done_points": done_pts,
-                        "progress_pct": pct,
-                        "children": [r["key"] for r in child_rows],
-                    }
-                )
-            return {"epics": out}
-
-    def get_dependency_graph(self) -> Dict[str, Any]:
-        with self.read_lock():
-            rows = self._db.execute("SELECT raw_json FROM issues ORDER BY seq ASC").fetchall()
-            issues = self._enrich_issues([json.loads(r["raw_json"]) for r in rows])
-            nodes = [
-                {
-                    "key": i["key"],
-                    "title": i["title"],
-                    "status": i["status"],
-                    "priority": i["priority"],
-                    "assignee": i.get("assignee"),
-                    "is_blocked": i["is_blocked"],
-                }
-                for i in issues
-            ]
-            link_rows = self._db.execute(
-                "SELECT id, source_key, target_key, link_type FROM issue_links"
-            ).fetchall()
-            edges: List[Dict[str, Any]] = []
-            seen_edges: Set[Tuple[str, str, str]] = set()
-            for lr in link_rows:
-                lt = lr["link_type"]
-                src = lr["source_key"]
-                tgt = lr["target_key"]
-                if lt == "blocked_by":
-                    src, tgt, lt = tgt, src, "blocks"
-                elif lt == "duplicated_by":
-                    src, tgt, lt = tgt, src, "duplicates"
-                elif lt == "cloned_from":
-                    src, tgt, lt = tgt, src, "clones"
-                sig = (src, tgt, lt)
-                if sig not in seen_edges:
-                    seen_edges.add(sig)
-                    edges.append({"id": lr["id"], "source": src, "target": tgt, "type": lt})
-
-            blocked_keys = [
-                i["key"] for i in issues if i["is_blocked"] and i["status"] not in ("done", "canceled")
-            ]
-            ready_keys = [
-                i["key"]
-                for i in issues
-                if i["status"] in ("backlog", "todo") and not i["is_blocked"] and not i.get("claimed_by")
-            ]
-            return {
-                "nodes": nodes,
-                "edges": edges,
-                "blocked_keys": blocked_keys,
-                "ready_keys": ready_keys,
-            }
-
-    def get_stats(self) -> Dict[str, Any]:
-        with self.read_lock():
-            rows = self._db.execute("SELECT raw_json FROM issues ORDER BY seq ASC").fetchall()
-            issues = self._enrich_issues([json.loads(r["raw_json"]) for r in rows])
-            total_issues = len(issues)
-            open_count = sum(1 for i in issues if i["status"] not in ("done", "canceled"))
-            done_count = sum(1 for i in issues if i["status"] == "done")
-            blocked_count = sum(
-                1 for i in issues if i["is_blocked"] and i["status"] not in ("done", "canceled")
-            )
-            ready_count = sum(
-                1
-                for i in issues
-                if i["status"] in ("backlog", "todo") and not i["is_blocked"] and not i.get("claimed_by")
-            )
-            total_points = round(sum(float(i.get("story_points") or 0.0) for i in issues), 2)
-            completed_points = round(
-                sum(float(i.get("story_points") or 0.0) for i in issues if i["status"] == "done"), 2
-            )
-
-            by_status: Dict[str, int] = {}
-            by_priority: Dict[str, int] = {}
-            by_type: Dict[str, int] = {}
-            by_assignee: Dict[str, int] = {}
-            recent_events: List[Dict[str, Any]] = []
-
-            for i in issues:
-                by_status[i["status"]] = by_status.get(i["status"], 0) + 1
-                by_priority[i["priority"]] = by_priority.get(i["priority"], 0) + 1
-                by_type[i["type"]] = by_type.get(i["type"], 0) + 1
-                assignee_key = i.get("assignee") or "unassigned"
-                by_assignee[assignee_key] = by_assignee.get(assignee_key, 0) + 1
-                for ev in i.get("history", []):
-                    recent_events.append(
-                        {
-                            "issue_key": i["key"],
-                            "issue_title": i["title"],
-                            "id": ev.get("id"),
-                            "actor": ev.get("actor"),
-                            "action": ev.get("action"),
-                            "changes": ev.get("changes", {}),
-                            "timestamp": ev.get("timestamp", ""),
-                        }
-                    )
-
-            recent_events.sort(key=lambda e: e["timestamp"], reverse=True)
-            active_sprints = self.list_sprints(state="active")
-            return {
-                "total_issues": total_issues,
-                "open_count": open_count,
-                "done_count": done_count,
-                "blocked_count": blocked_count,
-                "ready_count": ready_count,
-                "total_points": total_points,
-                "completed_points": completed_points,
-                "by_status": by_status,
-                "by_priority": by_priority,
-                "by_type": by_type,
-                "by_assignee": by_assignee,
-                "active_sprints": active_sprints,
-                "recent_activity": recent_events[:25],
-            }
-
-    def export_bundle(self) -> Dict[str, Any]:
-        with self.read_lock():
-            return {
-                "version": VERSION,
-                "exported_at": now_iso(),
-                "config": self._read_json(self.config_path),
-                "labels": self.list_labels(),
-                "components": self.list_components(),
-                "users": self.list_users(),
-                "issues": self._list_dir_json(self.issues_dir),
-                "sprints": self._list_dir_json(self.sprints_dir),
-                "milestones": self._list_dir_json(self.milestones_dir),
-                "views": self._list_dir_json(self.views_dir),
-            }
-
-    def import_bundle(self, bundle: Dict[str, Any], mode: str = "merge") -> Dict[str, Any]:
-        if mode not in ("merge", "replace"):
-            raise HTTPException(status_code=400, detail="Import mode must be 'merge' or 'replace'.")
-        if not isinstance(bundle, dict):
-            raise HTTPException(status_code=400, detail="Invalid bundle object.")
-        with self.write_lock():
-            if mode == "replace":
-                for d in (self.issues_dir, self.sprints_dir, self.milestones_dir, self.views_dir):
-                    for p in d.glob("*.json"):
-                        p.unlink(missing_ok=True)
-                if "config" in bundle and isinstance(bundle["config"], dict):
-                    self._atomic_write_json(self.config_path, bundle["config"])
-                if "labels" in bundle and isinstance(bundle["labels"], list):
-                    self._atomic_write_json(self.labels_path, {"labels": bundle["labels"]})
-                if "components" in bundle and isinstance(bundle["components"], list):
-                    self._atomic_write_json(self.components_path, {"components": bundle["components"]})
-                if "users" in bundle and isinstance(bundle["users"], list):
-                    self._atomic_write_json(self.users_path, {"users": bundle["users"]})
-            else:
-                for lb in bundle.get("labels", []):
-                    if isinstance(lb, dict) and lb.get("name"):
-                        self.add_label(lb["name"], lb.get("color"), lb.get("description"))
-                for cp in bundle.get("components", []):
-                    if isinstance(cp, dict) and cp.get("name"):
-                        self.add_component(cp["name"], cp.get("lead"), cp.get("description"))
-                for u in bundle.get("users", []):
-                    if isinstance(u, dict) and u.get("username"):
-                        self.upsert_user(u)
-
-            n_sprints = 0
-            max_spr_seq = 0
-            for sp in bundle.get("sprints", []):
-                if isinstance(sp, dict) and sp.get("id"):
-                    sid = sp["id"].upper()
-                    sp["id"] = sid
-                    m = re.search(r"-(\d+)$", sid)
-                    seq = int(sp.get("seq") or (int(m.group(1)) if m else (n_sprints + 1)))
-                    sp["seq"] = seq
-                    max_spr_seq = max(max_spr_seq, seq)
-                    self._atomic_write_json(self.sprints_dir / f"{sid}.json", sp)
-                    n_sprints += 1
-
-            n_milestones = 0
-            max_mil_seq = 0
-            for ms in bundle.get("milestones", []):
-                if isinstance(ms, dict) and ms.get("id"):
-                    mid = ms["id"].upper()
-                    ms["id"] = mid
-                    m = re.search(r"-(\d+)$", mid)
-                    seq = int(ms.get("seq") or (int(m.group(1)) if m else (n_milestones + 1)))
-                    ms["seq"] = seq
-                    max_mil_seq = max(max_mil_seq, seq)
-                    self._atomic_write_json(self.milestones_dir / f"{mid}.json", ms)
-                    n_milestones += 1
-
-            max_view_seq = 0
-            for vw in bundle.get("views", []):
-                if isinstance(vw, dict) and vw.get("id"):
-                    vid = vw["id"].upper()
-                    vw["id"] = vid
-                    m = re.search(r"-(\d+)$", vid)
-                    seq = int(vw.get("seq") or (int(m.group(1)) if m else 1))
-                    vw["seq"] = seq
-                    max_view_seq = max(max_view_seq, seq)
-                    self._atomic_write_json(self.views_dir / f"{vid}.json", vw)
-
-            n_issues = 0
-            for iss in bundle.get("issues", []):
-                if isinstance(iss, dict) and iss.get("key"):
-                    ikey = iss["key"].upper()
-                    iss["key"] = ikey
-                    self._atomic_write_json(self.issues_dir / f"{ikey}.json", iss)
-                    n_issues += 1
-
-            cfg = self._read_json(self.config_path)
-            if max_spr_seq >= cfg.get("next_sprint_seq", 1):
-                cfg["next_sprint_seq"] = max_spr_seq + 1
-            if max_mil_seq >= cfg.get("next_milestone_seq", 1):
-                cfg["next_milestone_seq"] = max_mil_seq + 1
-            if max_view_seq >= cfg.get("next_view_seq", 1):
-                cfg["next_view_seq"] = max_view_seq + 1
-            cfg["updated_at"] = now_iso()
             self._atomic_write_json(self.config_path, cfg)
+            self._save_issue_unlocked(iss, idir)
+            enriched = self._enrich_issues_unlocked([(iss, idir)])[0]
+            return {"worklog": entry, "time_progress": enriched["time_progress"]}
 
-            self.reindex()
+    def delete_worklog(self, issue_ref: str, worklog_id: str, actor: Optional[str] = None) -> Dict[str, Any]:
+        with self.write_lock():
+            iss, idir = self._resolve_issue_unlocked(issue_ref)
+            wid = worklog_id.strip().upper()
+            wls = list(iss.get("worklogs") or [])
+            found = next((w for w in wls if w["id"].upper() == wid), None)
+            if not found:
+                raise HTTPException(status_code=404, detail=f"Worklog '{worklog_id}' not found on {iss['key']}.")
+
+            iss["worklogs"] = [w for w in wls if w["id"] != found["id"]]
+            old_logged = int(iss.get("logged_minutes") or 0)
+            iss["logged_minutes"] = sum(int(w.get("minutes", 0)) for w in iss["worklogs"])
+            ts = now_iso()
+            iss["updated_at"] = ts
+            cfg = self._read_json(self.config_path)
+            self._append_history(
+                idir, cfg, actor=str(actor or self.default_user).strip() or self.default_user,
+                action="worklog_deleted",
+                diffs=[{"field": "logged_minutes", "old": old_logged, "new": iss["logged_minutes"]}],
+                timestamp=ts,
+            )
+            self._atomic_write_json(self.config_path, cfg)
+            self._save_issue_unlocked(iss, idir)
+            return {"deleted": True, "id": found["id"], "logged_minutes": iss["logged_minutes"]}
+
+    # --- Bulk Update & Bulk Delete ---
+
+    def _resolve_bulk_targets(self, issues: Optional[List[str]], query: Optional[str]) -> List[str]:
+        if issues:
+            keys: List[str] = []
+            with self.read_lock():
+                for ref in issues:
+                    s = str(ref).strip()
+                    if not s:
+                        continue
+                    iss, _ = self._resolve_issue_unlocked(s)
+                    if iss["key"] not in keys:
+                        keys.append(iss["key"])
+            if not keys:
+                raise HTTPException(status_code=400, detail="No target issues specified.")
+            return keys
+        if query and str(query).strip():
+            res = self.query_issues(iql=str(query).strip(), page=1, page_size=1000)
+            return [i["key"] for i in res["issues"]]
+        raise HTTPException(status_code=400, detail="Provide either 'issues' list or 'query' iQL expression.")
+
+    def bulk_update(
+        self,
+        issues: Optional[List[str]] = None,
+        query: Optional[str] = None,
+        updates: Optional[Dict[str, Any]] = None,
+        actor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not updates or not isinstance(updates, dict):
+            raise HTTPException(status_code=400, detail="'updates' dictionary is required for bulk update.")
+        target_keys = self._resolve_bulk_targets(issues, query)
+        updated_keys: List[str] = []
+        with self.write_lock():
+            for k in target_keys:
+                if updates.get("archive") or updates.get("archived") is True:
+                    self.archive_issue(k, actor=actor)
+                elif updates.get("unarchive") or updates.get("archived") is False:
+                    self.unarchive_issue(k, actor=actor)
+                patch = {pk: pv for pk, pv in updates.items() if pk not in ("archive", "unarchive", "archived")}
+                if patch:
+                    patch["actor"] = actor
+                    self.update_issue(k, patch)
+                updated_keys.append(k)
+        return {"updated_count": len(updated_keys), "updated_keys": updated_keys}
+
+    def bulk_delete(
+        self,
+        issues: Optional[List[str]] = None,
+        query: Optional[str] = None,
+        actor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        target_keys = self._resolve_bulk_targets(issues, query)
+        deleted_keys: List[str] = []
+        with self.write_lock():
+            for k in target_keys:
+                self.delete_issue(k, actor=actor)
+                deleted_keys.append(k)
+        return {"deleted_count": len(deleted_keys), "deleted_keys": deleted_keys}
+
+    # ------------------------------------------------------------------------
+    # Tags, Sprints, Milestones & Saved Views
+    # ------------------------------------------------------------------------
+
+    def list_tags(self) -> List[Dict[str, Any]]:
+        with self.read_lock():
+            assert self._db is not None
+            tags = list(self._read_json(self.tags_path, {"tags": []}).get("tags", []))
+            counts = {
+                r["tag_low"]: int(r["c"])
+                for r in self._db.execute("SELECT LOWER(tag) AS tag_low, COUNT(*) AS c FROM issue_tags GROUP BY LOWER(tag)").fetchall()
+            }
+            out: List[Dict[str, Any]] = []
+            for t in tags:
+                item = dict(t)
+                item["issue_count"] = counts.get(t["name"].lower(), 0)
+                out.append(item)
+            return out
+
+    def create_tag(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        name = str(data.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Tag name is required.")
+        color = str(data.get("color") or "#3b82f6").strip()
+        if not re.fullmatch(r"#[0-9A-Fa-f]{3,8}", color):
+            raise HTTPException(status_code=400, detail=f"Invalid hex color '{color}'.")
+        with self.write_lock():
+            doc = self._read_json(self.tags_path, {"tags": []})
+            tags = list(doc.get("tags", []))
+            if any(t["name"].lower() == name.lower() for t in tags):
+                raise HTTPException(status_code=409, detail=f"Tag '{name}' already exists.")
+            ts = now_iso()
+            entry = {
+                "name": name,
+                "color": color,
+                "description": str(data.get("description") or "").strip(),
+                "created_at": ts,
+                "updated_at": ts,
+            }
+            tags.append(entry)
+            self._atomic_write_json(self.tags_path, {"tags": tags})
+            self._update_disk_sig_in_db()
+            return entry
+
+    def update_tag(self, tag_name: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+        clean = urllib.parse.unquote(tag_name).strip()
+        with self.write_lock():
+            doc = self._read_json(self.tags_path, {"tags": []})
+            tags = list(doc.get("tags", []))
+            found = next((t for t in tags if t["name"].lower() == clean.lower()), None)
+            if not found:
+                raise HTTPException(status_code=404, detail=f"Tag '{clean}' not found.")
+
+            old_name = found["name"]
+            new_name = str(patch["new_name"]).strip() if ("new_name" in patch and patch["new_name"] is not None) else old_name
+            if not new_name:
+                raise HTTPException(status_code=400, detail="Tag new_name cannot be empty.")
+            if new_name.lower() != old_name.lower() and any(t["name"].lower() == new_name.lower() for t in tags):
+                raise HTTPException(status_code=409, detail=f"Tag '{new_name}' already exists.")
+            if "color" in patch and patch["color"] is not None:
+                c = str(patch["color"]).strip()
+                if not re.fullmatch(r"#[0-9A-Fa-f]{3,8}", c):
+                    raise HTTPException(status_code=400, detail=f"Invalid hex color '{c}'.")
+                found["color"] = c
+            if "description" in patch and patch["description"] is not None:
+                found["description"] = str(patch["description"]).strip()
+
+            ts = now_iso()
+            found["name"] = new_name
+            found["updated_at"] = ts
+            self._atomic_write_json(self.tags_path, {"tags": tags})
+
+            if new_name != old_name:
+                for ent in os.scandir(self.issues_dir):
+                    if not ent.is_dir(follow_symlinks=False) or ent.name.startswith("."):
+                        continue
+                    ij = Path(ent.path) / "issue.json"
+                    if ij.exists():
+                        iss = self._read_json(ij)
+                        itags = iss.get("tags") or []
+                        if any(t.lower() == old_name.lower() for t in itags):
+                            iss["tags"] = self._dedupe_strs([new_name if t.lower() == old_name.lower() else t for t in itags])
+                            iss["updated_at"] = ts
+                            self._atomic_write_json(ij, iss)
+                self._rebuild_index_unlocked()
+            else:
+                self._update_disk_sig_in_db()
+            return found
+
+    def delete_tag(self, tag_name: str) -> Dict[str, Any]:
+        clean = urllib.parse.unquote(tag_name).strip()
+        with self.write_lock():
+            doc = self._read_json(self.tags_path, {"tags": []})
+            tags = list(doc.get("tags", []))
+            new_tags = [t for t in tags if t["name"].lower() != clean.lower()]
+            if len(new_tags) == len(tags):
+                raise HTTPException(status_code=404, detail=f"Tag '{clean}' not found.")
+            self._atomic_write_json(self.tags_path, {"tags": new_tags})
+
+            ts = now_iso()
+            for ent in os.scandir(self.issues_dir):
+                if not ent.is_dir(follow_symlinks=False) or ent.name.startswith("."):
+                    continue
+                ij = Path(ent.path) / "issue.json"
+                if ij.exists():
+                    iss = self._read_json(ij)
+                    itags = iss.get("tags") or []
+                    filtered = [t for t in itags if t.lower() != clean.lower()]
+                    if len(filtered) != len(itags):
+                        iss["tags"] = filtered
+                        iss["updated_at"] = ts
+                        self._atomic_write_json(ij, iss)
+            self._rebuild_index_unlocked()
+            return {"deleted": True, "name": clean}
+
+    # --- Sprints ---
+
+    def _enrich_sprint_unlocked(self, sp: Dict[str, Any]) -> Dict[str, Any]:
+        assert self._db is not None
+        out = dict(sp)
+        sid = sp["id"]
+        rows = self._db.execute(
+            "SELECT state, story_points FROM issues WHERE sprint = ?", (sid,)
+        ).fetchall()
+        total = len(rows)
+        done = sum(1 for r in rows if r["state"] == "done")
+        pts_tot = round(sum(float(r["story_points"] or 0.0) for r in rows), 2)
+        pts_done = round(sum(float(r["story_points"] or 0.0) for r in rows if r["state"] == "done"), 2)
+        out["total_issues"] = total
+        out["done_issues"] = done
+        out["incomplete_issues"] = sum(1 for r in rows if r["state"] not in TERMINAL_STATES)
+        out["total_points"] = pts_tot
+        out["completed_points"] = pts_done
+        out["progress_pct"] = round(done / total * 100.0, 1) if total else 0.0
+        return out
+
+    def list_sprints(self, state: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self.read_lock():
+            sprints = list(self._read_json(self.sprints_path, {"sprints": []}).get("sprints", []))
+            if state and state.strip().lower() != "all":
+                st = state.strip().lower()
+                if st not in ("planned", "active", "completed"):
+                    raise HTTPException(status_code=400, detail="Invalid sprint state filter.")
+                sprints = [s for s in sprints if s.get("state") == st]
+            return [self._enrich_sprint_unlocked(s) for s in sprints]
+
+    def create_sprint(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        name = str(data.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Sprint name is required.")
+        try:
+            start_d = validate_calendar_date(data.get("start_date"), "start_date")
+            end_d = validate_calendar_date(data.get("end_date"), "end_date")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if start_d and end_d and end_d < start_d:
+            raise HTTPException(status_code=400, detail="Sprint end_date cannot be earlier than start_date.")
+
+        with self.write_lock():
+            sprints = list(self._read_json(self.sprints_path, {"sprints": []}).get("sprints", []))
+            if any(s["name"].lower() == name.lower() for s in sprints):
+                raise HTTPException(status_code=409, detail=f"Sprint '{name}' already exists.")
+            cfg = self._read_json(self.config_path)
+            seq = self._next_seq(cfg, "next_sprint_seq")
+            sid = f"SPR-{seq}"
+            ts = now_iso()
+            sp = {
+                "id": sid,
+                "seq": seq,
+                "name": name,
+                "goal": str(data.get("goal") or "").strip(),
+                "state": "planned",
+                "start_date": start_d,
+                "end_date": end_d,
+                "started_at": None,
+                "completed_at": None,
+                "created_at": ts,
+                "updated_at": ts,
+            }
+            sprints.append(sp)
+            self._atomic_write_json(self.config_path, cfg)
+            self._atomic_write_json(self.sprints_path, {"sprints": sprints})
+            self._update_disk_sig_in_db()
+            return self._enrich_sprint_unlocked(sp)
+
+    def get_sprint(self, sprint_ref: str) -> Dict[str, Any]:
+        with self.read_lock():
+            assert self._db is not None
+            _, _, sp = self._find_sprint_unlocked(sprint_ref)
+            enriched_sp = self._enrich_sprint_unlocked(sp)
+            folders = [
+                r["folder"]
+                for r in self._db.execute("SELECT folder FROM issues WHERE sprint = ? ORDER BY priority_rank DESC, seq ASC", (sp["id"],)).fetchall()
+            ]
+            pairs = [(self._read_json(self.issues_dir / f / "issue.json"), self.issues_dir / f) for f in folders if (self.issues_dir / f / "issue.json").exists()]
+            enriched_sp["issues"] = self._enrich_issues_unlocked(pairs)
+            return enriched_sp
+
+    def update_sprint(self, sprint_ref: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+        with self.write_lock():
+            sprints, idx, sp = self._find_sprint_unlocked(sprint_ref)
+            if "name" in patch and patch["name"] is not None:
+                nn = str(patch["name"]).strip()
+                if not nn:
+                    raise HTTPException(status_code=400, detail="Sprint name cannot be empty.")
+                sp["name"] = nn
+            if "goal" in patch and patch["goal"] is not None:
+                sp["goal"] = str(patch["goal"]).strip()
+            try:
+                if "start_date" in patch:
+                    sp["start_date"] = validate_calendar_date(patch["start_date"], "start_date")
+                if "end_date" in patch:
+                    sp["end_date"] = validate_calendar_date(patch["end_date"], "end_date")
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            if sp.get("start_date") and sp.get("end_date") and sp["end_date"] < sp["start_date"]:
+                raise HTTPException(status_code=400, detail="Sprint end_date cannot precede start_date.")
+            sp["updated_at"] = now_iso()
+            sprints[idx] = sp
+            self._atomic_write_json(self.sprints_path, {"sprints": sprints})
+            self._update_disk_sig_in_db()
+            return self._enrich_sprint_unlocked(sp)
+
+    def start_sprint(self, sprint_ref: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> Dict[str, Any]:
+        with self.write_lock():
+            sprints, idx, sp = self._find_sprint_unlocked(sprint_ref)
+            if sp.get("state") == "completed":
+                raise HTTPException(status_code=400, detail=f"Sprint '{sp['id']}' is already completed.")
+            try:
+                sd = validate_calendar_date(start_date, "start_date") if start_date else (sp.get("start_date") or today_iso())
+                ed = validate_calendar_date(end_date, "end_date") if end_date else sp.get("end_date")
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            ts = now_iso()
+            sp["state"] = "active"
+            sp["start_date"] = sd
+            if ed:
+                sp["end_date"] = ed
+            sp["started_at"] = sp.get("started_at") or ts
+            sp["updated_at"] = ts
+            sprints[idx] = sp
+            self._atomic_write_json(self.sprints_path, {"sprints": sprints})
+            self._update_disk_sig_in_db()
+            return self._enrich_sprint_unlocked(sp)
+
+    def complete_sprint(self, sprint_ref: str, rollover_to: Optional[str] = None) -> Dict[str, Any]:
+        with self.write_lock():
+            assert self._db is not None
+            sprints, idx, sp = self._find_sprint_unlocked(sprint_ref)
+            sid = sp["id"]
+            target_sid: Optional[str] = None
+            if rollover_to and str(rollover_to).strip().lower() not in ("", "none", "null", "backlog"):
+                _, _, target_sp = self._find_sprint_unlocked(str(rollover_to))
+                if target_sp["id"] == sid:
+                    raise HTTPException(status_code=400, detail="Cannot roll over incomplete issues to the same sprint.")
+                target_sid = target_sp["id"]
+
+            ts = now_iso()
+            sp["state"] = "completed"
+            sp["completed_at"] = ts
+            sp["updated_at"] = ts
+            sprints[idx] = sp
+            self._atomic_write_json(self.sprints_path, {"sprints": sprints})
+
+            inc_rows = self._db.execute(
+                "SELECT key FROM issues WHERE sprint = ? AND state NOT IN ('done', 'cancelled', 'archived') ORDER BY seq ASC",
+                (sid,),
+            ).fetchall()
+            rolled_keys: List[str] = []
+            for r in inc_rows:
+                self.update_issue(r["key"], {"sprint": target_sid, "clear_sprint": target_sid is None})
+                rolled_keys.append(r["key"])
+
+            self._update_disk_sig_in_db()
             return {
-                "status": "imported",
-                "imported_issues": n_issues,
-                "imported_sprints": n_sprints,
-                "imported_milestones": n_milestones,
+                "sprint": self._enrich_sprint_unlocked(sp),
+                "rolled_over_keys": rolled_keys,
+                "rollover_to": target_sid,
             }
 
+    def assign_sprint_issues(self, sprint_ref: str, issue_refs: List[str]) -> Dict[str, Any]:
+        if not issue_refs:
+            raise HTTPException(status_code=400, detail="Provide at least one issue to assign to sprint.")
+        with self.write_lock():
+            _, _, sp = self._find_sprint_unlocked(sprint_ref)
+            assigned: List[str] = []
+            for iref in issue_refs:
+                updated = self.update_issue(iref, {"sprint": sp["id"]})
+                assigned.append(updated["key"])
+            return {"sprint": self._enrich_sprint_unlocked(sp), "assigned_keys": assigned}
+
+    def remove_sprint_issues(self, sprint_ref: str, issue_refs: List[str]) -> Dict[str, Any]:
+        if not issue_refs:
+            raise HTTPException(status_code=400, detail="Provide at least one issue to remove from sprint.")
+        with self.write_lock():
+            _, _, sp = self._find_sprint_unlocked(sprint_ref)
+            removed: List[str] = []
+            for iref in issue_refs:
+                iss, _ = self._resolve_issue_unlocked(iref)
+                if iss.get("sprint") == sp["id"]:
+                    self.update_issue(iss["key"], {"clear_sprint": True})
+                    removed.append(iss["key"])
+            return {"sprint": self._enrich_sprint_unlocked(sp), "removed_keys": removed}
+
+    def delete_sprint(self, sprint_ref: str) -> Dict[str, Any]:
+        with self.write_lock():
+            assert self._db is not None
+            sprints, idx, sp = self._find_sprint_unlocked(sprint_ref)
+            sid = sp["id"]
+            sprints.pop(idx)
+            self._atomic_write_json(self.sprints_path, {"sprints": sprints})
+            rows = self._db.execute("SELECT key FROM issues WHERE sprint = ?", (sid,)).fetchall()
+            for r in rows:
+                self.update_issue(r["key"], {"clear_sprint": True})
+            self._update_disk_sig_in_db()
+            return {"deleted": True, "id": sid}
+
+    # --- Milestones ---
+
+    def _enrich_milestone_unlocked(self, ms: Dict[str, Any]) -> Dict[str, Any]:
+        assert self._db is not None
+        out = dict(ms)
+        mid = ms["id"]
+        rows = self._db.execute("SELECT state FROM issues WHERE milestone = ?", (mid,)).fetchall()
+        total = len(rows)
+        done = sum(1 for r in rows if r["state"] == "done")
+        out["total_issues"] = total
+        out["done_issues"] = done
+        out["progress_pct"] = round(done / total * 100.0, 1) if total else 0.0
+        return out
+
+    def list_milestones(self, state: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self.read_lock():
+            items = list(self._read_json(self.milestones_path, {"milestones": []}).get("milestones", []))
+            if state and state.strip().lower() != "all":
+                st = state.strip().lower()
+                if st not in ("open", "closed"):
+                    raise HTTPException(status_code=400, detail="Invalid milestone state. Expected open, closed, or all.")
+                items = [m for m in items if m.get("state", "open") == st]
+            return [self._enrich_milestone_unlocked(m) for m in items]
+
+    def create_milestone(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        name = str(data.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Milestone name is required.")
+        try:
+            due = validate_calendar_date(data.get("due_date"), "due_date")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        with self.write_lock():
+            items = list(self._read_json(self.milestones_path, {"milestones": []}).get("milestones", []))
+            if any(m["name"].lower() == name.lower() for m in items):
+                raise HTTPException(status_code=409, detail=f"Milestone '{name}' already exists.")
+            cfg = self._read_json(self.config_path)
+            seq = self._next_seq(cfg, "next_milestone_seq")
+            mid = f"MIL-{seq}"
+            ts = now_iso()
+            ms = {
+                "id": mid,
+                "seq": seq,
+                "name": name,
+                "description": str(data.get("description") or "").strip(),
+                "due_date": due,
+                "state": "open",
+                "closed_at": None,
+                "created_at": ts,
+                "updated_at": ts,
+            }
+            items.append(ms)
+            self._atomic_write_json(self.config_path, cfg)
+            self._atomic_write_json(self.milestones_path, {"milestones": items})
+            self._update_disk_sig_in_db()
+            return self._enrich_milestone_unlocked(ms)
+
+    def get_milestone(self, milestone_ref: str) -> Dict[str, Any]:
+        with self.read_lock():
+            assert self._db is not None
+            _, _, ms = self._find_milestone_unlocked(milestone_ref)
+            out = self._enrich_milestone_unlocked(ms)
+            folders = [
+                r["folder"]
+                for r in self._db.execute("SELECT folder FROM issues WHERE milestone = ? ORDER BY priority_rank DESC, seq ASC", (ms["id"],)).fetchall()
+            ]
+            pairs = [(self._read_json(self.issues_dir / f / "issue.json"), self.issues_dir / f) for f in folders if (self.issues_dir / f / "issue.json").exists()]
+            out["issues"] = self._enrich_issues_unlocked(pairs)
+            return out
+
+    def update_milestone(self, milestone_ref: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+        with self.write_lock():
+            items, idx, ms = self._find_milestone_unlocked(milestone_ref)
+            if "name" in patch and patch["name"] is not None:
+                nn = str(patch["name"]).strip()
+                if not nn:
+                    raise HTTPException(status_code=400, detail="Milestone name cannot be empty.")
+                ms["name"] = nn
+            if "description" in patch and patch["description"] is not None:
+                ms["description"] = str(patch["description"]).strip()
+            if "due_date" in patch:
+                try:
+                    ms["due_date"] = validate_calendar_date(patch["due_date"], "due_date")
+                except ValueError as e:
+                    raise HTTPException(status_code=400, detail=str(e))
+            ms["updated_at"] = now_iso()
+            items[idx] = ms
+            self._atomic_write_json(self.milestones_path, {"milestones": items})
+            self._update_disk_sig_in_db()
+            return self._enrich_milestone_unlocked(ms)
+
+    def set_milestone_state(self, milestone_ref: str, closed: bool) -> Dict[str, Any]:
+        with self.write_lock():
+            items, idx, ms = self._find_milestone_unlocked(milestone_ref)
+            ts = now_iso()
+            ms["state"] = "closed" if closed else "open"
+            ms["closed_at"] = ts if closed else None
+            ms["updated_at"] = ts
+            items[idx] = ms
+            self._atomic_write_json(self.milestones_path, {"milestones": items})
+            self._update_disk_sig_in_db()
+            return self._enrich_milestone_unlocked(ms)
+
+    def delete_milestone(self, milestone_ref: str) -> Dict[str, Any]:
+        with self.write_lock():
+            assert self._db is not None
+            items, idx, ms = self._find_milestone_unlocked(milestone_ref)
+            mid = ms["id"]
+            items.pop(idx)
+            self._atomic_write_json(self.milestones_path, {"milestones": items})
+            rows = self._db.execute("SELECT key FROM issues WHERE milestone = ?", (mid,)).fetchall()
+            for r in rows:
+                self.update_issue(r["key"], {"clear_milestone": True})
+            self._update_disk_sig_in_db()
+            return {"deleted": True, "id": mid}
+
+    # --- Saved Views ---
+
+    def list_views(self) -> List[Dict[str, Any]]:
+        with self.read_lock():
+            return list(self._read_json(self.views_path, {"views": []}).get("views", []))
+
+    def _validate_view_fields_unlocked(self, query_str: str, tab: Optional[str], sort: Optional[str], order: Optional[str], swimlane: Optional[str]) -> Tuple[str, str, Optional[str], str, str]:
+        try:
+            eff_tab = normalize_tab(tab) if tab else "all"
+            eff_sw = normalize_swimlane(swimlane) if swimlane else "none"
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        eff_order = (order or "asc").strip().lower()
+        if eff_order not in ("asc", "desc"):
+            raise HTTPException(status_code=400, detail="order must be 'asc' or 'desc'.")
+        compiler = self._make_compiler_unlocked()
+        if query_str.strip():
+            try:
+                ast = parse_iql(query_str)
+                compiler.compile_where(ast["where"])
+                compiler.compile_order_by(ast["order_by"], sort_field=sort, sort_order=eff_order)
+            except IQLError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid iQL in saved view: {e.message}")
+        elif sort:
+            try:
+                compiler.compile_order_by([], sort_field=sort, sort_order=eff_order)
+            except IQLError as e:
+                raise HTTPException(status_code=400, detail=e.message)
+        return query_str.strip(), eff_tab, (sort.strip() if sort else None), eff_order, eff_sw
+
+    def create_view(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        name = str(data.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Saved view name is required.")
+        raw_q = str(data.get("query") if "query" in data else (data.get("iql") or ""))
+        with self.write_lock():
+            views = list(self._read_json(self.views_path, {"views": []}).get("views", []))
+            if any(v["name"].lower() == name.lower() for v in views):
+                raise HTTPException(status_code=409, detail=f"Saved view '{name}' already exists.")
+            q_clean, tab_c, sort_c, ord_c, sw_c = self._validate_view_fields_unlocked(
+                raw_q, data.get("tab"), data.get("sort"), data.get("order"), data.get("swimlane")
+            )
+            cfg = self._read_json(self.config_path)
+            seq = self._next_seq(cfg, "next_view_seq")
+            vid = f"VIEW-{seq}"
+            ts = now_iso()
+            vw = {
+                "id": vid,
+                "seq": seq,
+                "name": name,
+                "query": q_clean,
+                "tab": tab_c,
+                "sort": sort_c,
+                "order": ord_c,
+                "swimlane": sw_c,
+                "description": str(data.get("description") or "").strip(),
+                "created_at": ts,
+                "updated_at": ts,
+            }
+            views.append(vw)
+            self._atomic_write_json(self.config_path, cfg)
+            self._atomic_write_json(self.views_path, {"views": views})
+            self._update_disk_sig_in_db()
+            return vw
+
+    def get_view(self, view_ref: str) -> Dict[str, Any]:
+        with self.read_lock():
+            _, _, vw = self._find_view_unlocked(view_ref)
+            return dict(vw)
+
+    def run_view(self, view_ref: str, page: int = 1, page_size: int = 25) -> Dict[str, Any]:
+        vw = self.get_view(view_ref)
+        res = self.query_issues(
+            tab=vw.get("tab", "all"),
+            iql=vw.get("query") or None,
+            sort=vw.get("sort") or None,
+            order=vw.get("order") or "asc",
+            page=page,
+            page_size=page_size,
+        )
+        res["view"] = vw
+        return res
+
+    def update_view(self, view_ref: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+        with self.write_lock():
+            views, idx, vw = self._find_view_unlocked(view_ref)
+            if "name" in patch and patch["name"] is not None:
+                nn = str(patch["name"]).strip()
+                if not nn:
+                    raise HTTPException(status_code=400, detail="View name cannot be empty.")
+                vw["name"] = nn
+            q_raw = str(patch["query"]) if ("query" in patch and patch["query"] is not None) else vw.get("query", "")
+            tab_raw = patch["tab"] if ("tab" in patch and patch["tab"] is not None) else vw.get("tab", "all")
+            sort_raw = patch["sort"] if "sort" in patch else vw.get("sort")
+            ord_raw = patch["order"] if ("order" in patch and patch["order"] is not None) else vw.get("order", "asc")
+            sw_raw = patch["swimlane"] if ("swimlane" in patch and patch["swimlane"] is not None) else vw.get("swimlane", "none")
+            q_c, tab_c, sort_c, ord_c, sw_c = self._validate_view_fields_unlocked(q_raw, tab_raw, sort_raw, ord_raw, sw_raw)
+            vw["query"] = q_c
+            vw["tab"] = tab_c
+            vw["sort"] = sort_c
+            vw["order"] = ord_c
+            vw["swimlane"] = sw_c
+            if "description" in patch and patch["description"] is not None:
+                vw["description"] = str(patch["description"]).strip()
+            vw["updated_at"] = now_iso()
+            views[idx] = vw
+            self._atomic_write_json(self.views_path, {"views": views})
+            self._update_disk_sig_in_db()
+            return vw
+
+    def delete_view(self, view_ref: str) -> Dict[str, Any]:
+        with self.write_lock():
+            views, idx, vw = self._find_view_unlocked(view_ref)
+            vid = vw["id"]
+            views.pop(idx)
+            self._atomic_write_json(self.views_path, {"views": views})
+            self._update_disk_sig_in_db()
+            return {"deleted": True, "id": vid}
+
 
 # ============================================================================
-# Pydantic Request Schemas & FastAPI Factory (All 73 REST/Multipart Routes)
+# Section 5: FastAPI Application Factory & All /api/v1/* Routes
 # ============================================================================
 
-class FlexModel(BaseModel):
-    model_config = ConfigDict(extra="allow")
+def _parse_str_list_value(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        out: List[str] = []
+        for item in raw:
+            out.extend(_parse_str_list_value(item))
+        return out
+    s = str(raw).strip()
+    if not s:
+        return []
+    if s.startswith("["):
+        with contextlib.suppress(Exception):
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+    return [part.strip() for part in s.split(",") if part.strip()]
+
+
+def _extract_form_str_list(form: Any, *keys: str) -> List[str]:
+    out: List[str] = []
+    for k in keys:
+        for val in form.getlist(k):
+            if hasattr(val, "read"):
+                continue
+            out.extend(_parse_str_list_value(val))
+    return out
+
+
+async def _extract_uploaded_files(form: Any, *field_names: str) -> List[Tuple[str, Optional[str], bytes]]:
+    files_out: List[Tuple[str, Optional[str], bytes]] = []
+    for fn in field_names:
+        for item in form.getlist(fn):
+            if hasattr(item, "read"):
+                raw_bytes = await item.read()
+                filename = getattr(item, "filename", None) or "upload.bin"
+                ctype = getattr(item, "content_type", None)
+                files_out.append((filename, ctype, raw_bytes))
+    return files_out
+
+
+async def _read_optional_json(request: Request) -> Dict[str, Any]:
+    raw = await request.body()
+    if not raw or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object.")
+    return parsed
 
 
 def create_app(
@@ -3800,23 +4908,22 @@ def create_app(
             "started_at": started_at_iso,
             "version": VERSION,
         }
-        with storage.write_lock():
-            storage._atomic_write_json(storage.daemon_path, daemon_meta)
+        storage.runtime_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json_standalone(storage.daemon_path, daemon_meta)
         try:
             yield
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 if storage.daemon_path.exists():
-                    cur_meta = storage._read_json(storage.daemon_path)
+                    cur_meta = storage._read_json(storage.daemon_path, {})
                     if cur_meta.get("pid") == os.getpid():
                         storage.daemon_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+            storage.close()
 
     app = FastAPI(
-        title="itrack API",
+        title="iTrack API",
         version=VERSION,
-        description="Local-First Issue Tracker, iQL Engine & Agent Coordination Daemon",
+        description="Local-First Folder-Per-Issue Tracker, Self-Healing FTS5 Index & Offline SPA",
         lifespan=lifespan,
     )
     app.add_middleware(
@@ -3827,11 +4934,24 @@ def create_app(
     )
     app.state.storage = storage
 
-    # --- Embedded Offline SPA & Favicon Routes ---
+    @app.middleware("http")
+    async def surface_telemetry_middleware(request: Request, call_next: Callable) -> Response:
+        response = await call_next(request)
+        if request.url.path.startswith("/api/v1/"):
+            route_obj = request.scope.get("route")
+            route_path = getattr(route_obj, "path", request.url.path)
+            record_surface_event({
+                "kind": "api_route",
+                "method": request.method,
+                "route": route_path,
+                "status": response.status_code,
+            })
+        return response
+
     favicon_svg = (
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
         '<rect width="32" height="32" rx="7" fill="#2563eb"/>'
-        '<text x="16" y="22" font-family="monospace" font-size="16" font-weight="bold" text-anchor="middle" fill="#ffffff">it</text>'
+        '<text x="16" y="22" font-family="monospace" font-size="16" font-weight="bold" text-anchor="middle" fill="#ffffff">iT</text>'
         "</svg>"
     )
 
@@ -3845,38 +4965,41 @@ def create_app(
     def serve_spa() -> HTMLResponse:
         return HTMLResponse(content=SPA_HTML)
 
-    # --- 1..10 System, Config & Workspace ---
+    # --- Workspace, System & Config (Routes 1..8) ---
+
     @app.get("/api/v1/health")
     def api_health() -> Dict[str, Any]:
         actual_port = int(state_holder.get("port", port))
         connect_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+        initialized = storage.is_initialized()
         return {
             "status": "ok",
+            "initialized": initialized,
             "pid": os.getpid(),
             "host": connect_host,
             "port": actual_port,
             "base_url": state_holder.get("base_url", f"http://{connect_host}:{actual_port}"),
             "repo_root": str(repo_root),
-            "issues_dir": str(storage.issues_root),
-            "issue_count": storage.issue_count(),
+            "issues_root": str(storage.issues_root),
+            "issue_count": storage.issue_count() if initialized else 0,
             "uptime_seconds": round(time.monotonic() - started_mono, 3),
             "version": VERSION,
         }
 
     @app.post("/api/v1/shutdown")
     def api_shutdown(background_tasks: BackgroundTasks) -> Dict[str, Any]:
-        def _trigger_stop() -> None:
+        def _stop() -> None:
             time.sleep(0.05)
             srv = state_holder.get("uvicorn_server")
             if srv is not None:
                 srv.should_exit = True
 
-        background_tasks.add_task(_trigger_stop)
+        background_tasks.add_task(_stop)
         return {"status": "shutting_down", "pid": os.getpid()}
 
-    @app.get("/api/v1/stats")
-    def api_stats() -> Dict[str, Any]:
-        return storage.get_stats()
+    @app.get("/api/v1/status")
+    def api_status() -> Dict[str, Any]:
+        return storage.get_status()
 
     @app.post("/api/v1/reindex")
     def api_reindex() -> Dict[str, Any]:
@@ -3887,3082 +5010,3656 @@ def create_app(
         return storage.get_config()
 
     @app.patch("/api/v1/config")
-    def api_patch_config(body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
+    async def api_patch_config(request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
         return storage.update_config(body)
 
-    @app.get("/api/v1/workflows")
-    def api_get_workflows() -> Dict[str, Any]:
-        return storage.get_workflows()
+    @app.get("/api/v1/stats")
+    def api_stats() -> Dict[str, Any]:
+        return storage.get_stats()
 
-    @app.put("/api/v1/workflows")
-    def api_put_workflows(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        return storage.set_workflows(
-            statuses=body.get("statuses", []),
-            transitions=body.get("transitions", {}),
-        )
+    @app.get("/api/v1/tree")
+    def api_tree(root: Optional[str] = Query(default=None)) -> Dict[str, Any]:
+        return storage.get_tree(root_ref=root)
 
-    @app.get("/api/v1/export")
-    def api_export() -> Dict[str, Any]:
-        return storage.export_bundle()
+    # --- Issues Core, Lifecycle, Rename, Context, History & Embeds (Routes 9..21) ---
 
-    @app.post("/api/v1/import")
-    def api_import(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        bundle = body.get("bundle") if "bundle" in body else body
-        mode = body.get("mode", "merge") if "bundle" in body else "merge"
-        return storage.import_bundle(bundle=bundle, mode=mode)
-
-    # --- 11..13 Board, Epics & Dependency Graph ---
-    @app.get("/api/v1/board")
-    def api_board(
-        sprint_id: Optional[str] = Query(default=None),
-        epic_id: Optional[str] = Query(default=None),
-        assignee: Optional[str] = Query(default=None),
-        iql: Optional[str] = Query(default=None),
-    ) -> Dict[str, Any]:
-        return storage.get_board(sprint_id=sprint_id, epic_id=epic_id, assignee=assignee, iql=iql)
-
-    @app.get("/api/v1/epics")
-    def api_epics() -> Dict[str, Any]:
-        return storage.get_epics()
-
-    @app.get("/api/v1/graph/dependencies")
-    def api_graph_dependencies() -> Dict[str, Any]:
-        return storage.get_dependency_graph()
-
-    # --- 14..18 Users / Agents ---
-    @app.get("/api/v1/users")
-    def api_list_users() -> Dict[str, Any]:
-        return {"users": storage.list_users()}
-
-    @app.post("/api/v1/users", status_code=201)
-    def api_create_user(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        return storage.upsert_user(body)
-
-    @app.get("/api/v1/users/{username}")
-    def api_get_user(username: str) -> Dict[str, Any]:
-        return storage.get_user_detail(username)
-
-    @app.patch("/api/v1/users/{username}")
-    def api_patch_user(username: str, body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
-        return storage.update_user(username, body)
-
-    @app.delete("/api/v1/users/{username}")
-    def api_delete_user(username: str) -> Dict[str, Any]:
-        return storage.delete_user(username)
-
-    # --- 19..33 Issues Core, Lifecycle, Subtasks, Bulk & Agent Coordination ---
     @app.get("/api/v1/issues")
     def api_list_issues(
-        iql: Optional[str] = Query(default=None),
+        tab: Optional[str] = Query(default=None),
         q: Optional[str] = Query(default=None),
-        status: Optional[str] = Query(default=None),
+        iql: Optional[str] = Query(default=None),
+        category: Optional[str] = Query(default=None),
+        state: Optional[str] = Query(default=None),
         priority: Optional[str] = Query(default=None),
-        type: Optional[str] = Query(default=None),
+        severity: Optional[str] = Query(default=None),
+        resolution: Optional[str] = Query(default=None),
         assignee: Optional[str] = Query(default=None),
         reporter: Optional[str] = Query(default=None),
-        label: Optional[str] = Query(default=None),
+        tag: Optional[str] = Query(default=None),
         component: Optional[str] = Query(default=None),
-        epic_id: Optional[str] = Query(default=None),
-        parent_id: Optional[str] = Query(default=None),
-        sprint_id: Optional[str] = Query(default=None),
-        milestone_id: Optional[str] = Query(default=None),
+        parent: Optional[str] = Query(default=None),
+        sprint: Optional[str] = Query(default=None),
+        milestone: Optional[str] = Query(default=None),
+        overdue: Optional[bool] = Query(default=None),
         sort: Optional[str] = Query(default=None),
-        limit: int = Query(default=200, ge=0, le=5000),
-        offset: int = Query(default=0, ge=0),
+        order: Optional[str] = Query(default=None),
+        page: int = Query(default=1),
+        page_size: int = Query(default=25),
     ) -> Dict[str, Any]:
-        extra: List[Dict[str, Any]] = []
-        if q:
-            extra.append({"type": "cmp", "field": "text", "raw_field": "q", "op": "~", "value": q})
-        for field_name, raw_val in (
-            ("status", status),
-            ("priority", priority),
-            ("type", type),
-            ("assignee", assignee),
-            ("reporter", reporter),
-            ("labels", label),
-            ("components", component),
-            ("epic_id", epic_id),
-            ("parent_id", parent_id),
-            ("sprint_id", sprint_id),
-            ("milestone_id", milestone_id),
-        ):
-            if raw_val is not None and str(raw_val).strip() != "":
-                if "," in str(raw_val) and field_name in ("status", "priority", "type", "labels", "components"):
-                    vals = [v.strip() for v in str(raw_val).split(",") if v.strip()]
-                    extra.append({"type": "in", "field": field_name, "raw_field": field_name, "negated": False, "values": vals})
-                else:
-                    extra.append({"type": "cmp", "field": field_name, "raw_field": field_name, "op": "=", "value": str(raw_val).strip()})
-
-        issues, total, ast = storage.execute_iql(
+        return storage.query_issues(
+            tab=tab,
+            q=q,
             iql=iql,
-            extra_filters=extra or None,
+            category=category,
+            state=state,
+            priority=priority,
+            severity=severity,
+            resolution=resolution,
+            assignee=assignee,
+            reporter=reporter,
+            tag=tag,
+            component=component,
+            parent=parent,
+            sprint=sprint,
+            milestone=milestone,
+            overdue=overdue,
             sort=sort,
-            limit=limit,
-            offset=offset,
+            order=order,
+            page=page,
+            page_size=page_size,
         )
-        eff_limit = ast["limit"] if ast["limit"] is not None else limit
-        eff_offset = ast["offset"] if ast["offset"] is not None else offset
-        return {"issues": issues, "total": total, "limit": eff_limit, "offset": eff_offset}
 
     @app.post("/api/v1/issues", status_code=201)
-    def api_create_issue(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    async def api_create_issue(request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
         return storage.create_issue(body)
 
-    @app.get("/api/v1/issues/ready")
-    def api_ready_issues(
-        assignee: Optional[str] = Query(default=None),
-        sprint_id: Optional[str] = Query(default=None),
-        limit: int = Query(default=50, ge=1, le=1000),
+    @app.get("/api/v1/issues/{issue_ref}")
+    def api_get_issue(issue_ref: str) -> Dict[str, Any]:
+        return storage.get_issue(issue_ref)
+
+    @app.patch("/api/v1/issues/{issue_ref}")
+    async def api_patch_issue(issue_ref: str, request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        return storage.update_issue(issue_ref, body)
+
+    @app.post("/api/v1/issues/{issue_ref}/rename")
+    async def api_rename_issue(issue_ref: str, request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        new_name = body.get("new_name") if "new_name" in body else body.get("name")
+        return storage.rename_issue(issue_ref, new_name=new_name, actor=body.get("actor"))
+
+    @app.post("/api/v1/issues/{issue_ref}/clone", status_code=201)
+    async def api_clone_issue(issue_ref: str, request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        new_name = body.get("new_name") if "new_name" in body else body.get("name")
+        return storage.clone_issue(issue_ref, new_name=new_name, actor=body.get("actor"))
+
+    @app.post("/api/v1/issues/{issue_ref}/archive")
+    async def api_archive_issue(issue_ref: str, request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        return storage.archive_issue(issue_ref, actor=body.get("actor"))
+
+    @app.post("/api/v1/issues/{issue_ref}/unarchive")
+    async def api_unarchive_issue(issue_ref: str, request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        return storage.unarchive_issue(issue_ref, actor=body.get("actor"))
+
+    @app.delete("/api/v1/issues/{issue_ref}")
+    def api_delete_issue(issue_ref: str) -> Dict[str, Any]:
+        return storage.delete_issue(issue_ref)
+
+    @app.get("/api/v1/issues/{issue_ref}/context")
+    def api_issue_context(issue_ref: str) -> Dict[str, Any]:
+        return storage.get_issue_context(issue_ref)
+
+    @app.get("/api/v1/issues/{issue_ref}/history")
+    def api_issue_history(issue_ref: str) -> Dict[str, Any]:
+        return storage.get_issue_history(issue_ref)
+
+    @app.post("/api/v1/issues/{issue_ref}/embeds", status_code=201)
+    async def api_add_description_embeds(issue_ref: str, request: Request) -> Dict[str, Any]:
+        form = await request.form()
+        files_payload = await _extract_uploaded_files(form, "files", "file", "embeds", "embed")
+        uploaded_by = str(form.get("uploaded_by") or form.get("actor") or "") or None
+        return storage.add_description_embeds(issue_ref, files_payload=files_payload, uploaded_by=uploaded_by)
+
+    @app.delete("/api/v1/issues/{issue_ref}/embeds/{att_id}")
+    def api_delete_description_embed(issue_ref: str, att_id: str) -> Dict[str, Any]:
+        return storage.delete_description_embed(issue_ref, att_id)
+
+    # --- Whole-Issue & Unified Attachments (Routes 22..26) ---
+
+    @app.post("/api/v1/issues/{issue_ref}/attachments", status_code=201)
+    async def api_add_attachments(issue_ref: str, request: Request) -> Dict[str, Any]:
+        form = await request.form()
+        files_payload = await _extract_uploaded_files(form, "files", "file", "attachments")
+        uploaded_by = str(form.get("uploaded_by") or form.get("by") or form.get("actor") or "") or None
+        return storage.add_issue_attachments(issue_ref, files_payload=files_payload, uploaded_by=uploaded_by)
+
+    @app.get("/api/v1/issues/{issue_ref}/attachments")
+    def api_list_attachments(
+        issue_ref: str,
+        scope: str = Query(default="all"),
     ) -> Dict[str, Any]:
-        return storage.get_ready_issues(assignee=assignee, sprint_id=sprint_id, limit=limit)
+        return storage.list_attachments(issue_ref, scope=scope)
 
-    @app.post("/api/v1/issues/bulk")
-    def api_bulk_issues(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        keys = body.get("keys") or []
-        if not isinstance(keys, list) or not keys:
-            raise HTTPException(status_code=400, detail="keys must be a non-empty list of issue keys.")
-        action = body.get("action", "")
-        fields = dict(body.get("fields") or {})
-        for k in ("status", "priority", "assignee", "label", "labels", "sprint_id", "sprint", "resolution", "force"):
-            if k in body and k not in fields:
-                fields[k] = body[k]
-        return storage.bulk_action(keys=keys, action=action, fields=fields, actor=body.get("actor"))
+    @app.get("/api/v1/issues/{issue_ref}/attachments/{att_id}")
+    def api_get_attachment_info(issue_ref: str, att_id: str) -> Dict[str, Any]:
+        return storage.get_attachment_info(issue_ref, att_id)
 
-    @app.get("/api/v1/issues/{key}")
-    def api_get_issue(key: str) -> Dict[str, Any]:
-        return storage.get_issue(key)
+    @app.get("/api/v1/issues/{issue_ref}/attachments/{att_id}/download")
+    def api_download_attachment(issue_ref: str, att_id: str) -> FileResponse:
+        fpath, meta = storage.get_attachment_download(issue_ref, att_id)
+        return FileResponse(
+            path=str(fpath),
+            media_type=meta.get("mime_type") or "application/octet-stream",
+            filename=meta.get("filename") or fpath.name,
+        )
 
-    @app.patch("/api/v1/issues/{key}")
-    def api_patch_issue(key: str, body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
-        return storage.update_issue(key, body)
+    @app.delete("/api/v1/issues/{issue_ref}/attachments/{att_id}")
+    def api_delete_attachment(issue_ref: str, att_id: str) -> Dict[str, Any]:
+        return storage.delete_attachment(issue_ref, att_id)
 
-    @app.delete("/api/v1/issues/{key}")
-    def api_delete_issue(key: str) -> Dict[str, Any]:
-        return storage.delete_issue(key)
+    # --- Rich Comments, Embeds, Comment Attachments & Cross-Links (Routes 27..31) ---
 
-    @app.post("/api/v1/issues/{key}/transition")
-    def api_transition_issue(key: str, body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        if "status" not in body:
-            raise HTTPException(status_code=400, detail="status is required.")
-        return storage.transition_issue(
-            key=key,
-            target_status=body["status"],
-            resolution=body.get("resolution"),
-            comment=body.get("comment"),
-            force=bool(body.get("force", False)),
+    @app.get("/api/v1/issues/{issue_ref}/comments")
+    def api_list_comments(issue_ref: str) -> Dict[str, Any]:
+        return storage.list_comments(issue_ref)
+
+    @app.post("/api/v1/issues/{issue_ref}/comments", status_code=201)
+    async def api_add_comment(issue_ref: str, request: Request) -> Dict[str, Any]:
+        ctype = (request.headers.get("content-type") or "").lower()
+        if "application/json" in ctype:
+            body_json = await _read_optional_json(request)
+            return storage.add_comment(
+                issue_ref=issue_ref,
+                body=str(body_json.get("body") or ""),
+                author=body_json.get("author") or body_json.get("actor"),
+                linked_attachment_ids=_parse_str_list_value(
+                    body_json.get("linked_attachment_ids") or body_json.get("link_attachments")
+                ),
+            )
+        form = await request.form()
+        body_text = str(form.get("body") or "")
+        author = str(form.get("author") or form.get("actor") or "") or None
+        linked_ids = _extract_form_str_list(form, "linked_attachment_ids", "link_attachments")
+        embeds = await _extract_uploaded_files(form, "embeds", "embed")
+        attachments = await _extract_uploaded_files(form, "attachments", "attach", "files")
+        return storage.add_comment(
+            issue_ref=issue_ref,
+            body=body_text,
+            author=author,
+            embeds_payload=embeds,
+            attachments_payload=attachments,
+            linked_attachment_ids=linked_ids,
+        )
+
+    @app.get("/api/v1/issues/{issue_ref}/comments/{comment_id}")
+    def api_get_comment(issue_ref: str, comment_id: str) -> Dict[str, Any]:
+        return storage.get_comment(issue_ref, comment_id)
+
+    @app.patch("/api/v1/issues/{issue_ref}/comments/{comment_id}")
+    async def api_patch_comment(issue_ref: str, comment_id: str, request: Request) -> Dict[str, Any]:
+        ctype = (request.headers.get("content-type") or "").lower()
+        if "application/json" in ctype:
+            bj = await _read_optional_json(request)
+            return storage.update_comment(
+                issue_ref=issue_ref,
+                comment_id=comment_id,
+                body=str(bj["body"]) if ("body" in bj and bj["body"] is not None) else None,
+                actor=bj.get("actor") or bj.get("author"),
+                remove_embeds=_parse_str_list_value(bj.get("remove_embeds")),
+                remove_attachments=_parse_str_list_value(bj.get("remove_attachments")),
+                link_attachments=_parse_str_list_value(bj.get("link_attachments") or bj.get("linked_attachment_ids")),
+                unlink_attachments=_parse_str_list_value(bj.get("unlink_attachments")),
+            )
+        form = await request.form()
+        body_opt = str(form["body"]) if "body" in form and not hasattr(form["body"], "read") else None
+        actor = str(form.get("actor") or form.get("author") or "") or None
+        remove_embeds = _extract_form_str_list(form, "remove_embeds", "remove_embed")
+        remove_attachments = _extract_form_str_list(form, "remove_attachments", "remove_attach")
+        link_attachments = _extract_form_str_list(form, "link_attachments", "linked_attachment_ids")
+        unlink_attachments = _extract_form_str_list(form, "unlink_attachments", "unlink_attachment")
+        add_embeds = await _extract_uploaded_files(form, "add_embeds", "embeds", "embed")
+        add_attachments = await _extract_uploaded_files(form, "add_attachments", "attachments", "attach")
+        return storage.update_comment(
+            issue_ref=issue_ref,
+            comment_id=comment_id,
+            body=body_opt,
+            actor=actor,
+            add_embeds=add_embeds,
+            remove_embeds=remove_embeds,
+            add_attachments=add_attachments,
+            remove_attachments=remove_attachments,
+            link_attachments=link_attachments,
+            unlink_attachments=unlink_attachments,
+        )
+
+    @app.delete("/api/v1/issues/{issue_ref}/comments/{comment_id}")
+    def api_delete_comment(issue_ref: str, comment_id: str) -> Dict[str, Any]:
+        return storage.delete_comment(issue_ref, comment_id)
+
+    # --- Links, Worklogs, Bulk, Board & Search (Routes 32..41) ---
+
+    @app.get("/api/v1/issues/{issue_ref}/links")
+    def api_list_links(issue_ref: str) -> Dict[str, Any]:
+        return storage.list_links(issue_ref)
+
+    @app.post("/api/v1/issues/{issue_ref}/links", status_code=201)
+    async def api_add_link(issue_ref: str, request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        ltype = body.get("type") or body.get("link_type") or ""
+        target = body.get("target") or body.get("target_key") or ""
+        return storage.add_link(issue_ref, link_type=str(ltype), target_ref=str(target), actor=body.get("actor"))
+
+    @app.delete("/api/v1/issues/{issue_ref}/links/{link_id}")
+    def api_remove_link(issue_ref: str, link_id: str) -> Dict[str, Any]:
+        return storage.remove_link(issue_ref, link_id)
+
+    @app.get("/api/v1/issues/{issue_ref}/worklogs")
+    def api_list_worklogs(issue_ref: str) -> Dict[str, Any]:
+        return storage.list_worklogs(issue_ref)
+
+    @app.post("/api/v1/issues/{issue_ref}/worklogs", status_code=201)
+    async def api_add_worklog(issue_ref: str, request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        return storage.add_worklog(
+            issue_ref=issue_ref,
+            minutes=body.get("minutes"),
+            duration=body.get("duration"),
+            author=body.get("author") or body.get("actor"),
+            note=body.get("note"),
+        )
+
+    @app.delete("/api/v1/issues/{issue_ref}/worklogs/{worklog_id}")
+    def api_delete_worklog(issue_ref: str, worklog_id: str) -> Dict[str, Any]:
+        return storage.delete_worklog(issue_ref, worklog_id)
+
+    @app.post("/api/v1/bulk/update")
+    async def api_bulk_update(request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        return storage.bulk_update(
+            issues=body.get("issues"),
+            query=body.get("query"),
+            updates=body.get("updates"),
             actor=body.get("actor"),
         )
 
-    @app.post("/api/v1/issues/{key}/assign")
-    def api_assign_issue(key: str, body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        return storage.assign_issue(key=key, assignee=body.get("assignee"), actor=body.get("actor"))
-
-    @app.post("/api/v1/issues/{key}/clone", status_code=201)
-    def api_clone_issue(key: str, body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
-        return storage.clone_issue(
-            key=key,
-            title_prefix=body.get("title_prefix", "[Clone] "),
-            include_subtasks=bool(body.get("include_subtasks", False)),
+    @app.post("/api/v1/bulk/delete")
+    async def api_bulk_delete(request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        return storage.bulk_delete(
+            issues=body.get("issues"),
+            query=body.get("query"),
             actor=body.get("actor"),
         )
 
-    @app.post("/api/v1/issues/{key}/claim")
-    def api_claim_issue(key: str, body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        return storage.claim_issue(
-            key=key,
-            agent=body.get("agent", ""),
-            note=body.get("note"),
-            force=bool(body.get("force", False)),
+    @app.get("/api/v1/board")
+    def api_board(
+        swimlane: Optional[str] = Query(default="none"),
+        category: Optional[str] = Query(default=None),
+        priority: Optional[str] = Query(default=None),
+        assignee: Optional[str] = Query(default=None),
+        sprint: Optional[str] = Query(default=None),
+        tag: Optional[str] = Query(default=None),
+        q: Optional[str] = Query(default=None),
+    ) -> Dict[str, Any]:
+        return storage.get_board(
+            swimlane=swimlane,
+            category=category,
+            priority=priority,
+            assignee=assignee,
+            sprint=sprint,
+            tag=tag,
+            q=q,
         )
 
-    @app.post("/api/v1/issues/{key}/release")
-    def api_release_issue(key: str, body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
-        return storage.release_issue(
-            key=key,
-            agent=body.get("agent"),
-            status=body.get("status"),
-            note=body.get("note"),
-        )
-
-    @app.get("/api/v1/issues/{key}/subtasks")
-    def api_list_subtasks(key: str) -> Dict[str, Any]:
-        return storage.list_subtasks(key)
-
-    @app.post("/api/v1/issues/{key}/subtasks", status_code=201)
-    def api_create_subtask(key: str, body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        return storage.create_subtask(key, body)
-
-    @app.get("/api/v1/issues/{key}/history")
-    def api_issue_history(key: str) -> Dict[str, Any]:
-        iss = storage.get_issue(key)
-        return {"key": iss["key"], "history": iss.get("history", [])}
-
-    # --- 34..35 Watchers ---
-    @app.post("/api/v1/issues/{key}/watchers")
-    def api_add_watcher(key: str, body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        return storage.add_watcher(key, body.get("username", ""))
-
-    @app.delete("/api/v1/issues/{key}/watchers/{username}")
-    def api_remove_watcher(key: str, username: str) -> Dict[str, Any]:
-        return storage.remove_watcher(key, username)
-
-    # --- 36..42 Search, iQL & Saved Views ---
     @app.get("/api/v1/search")
     def api_search(
         q: Optional[str] = Query(default=None),
         iql: Optional[str] = Query(default=None),
-        limit: int = Query(default=50, ge=1, le=1000),
-        offset: int = Query(default=0, ge=0),
+        page: int = Query(default=1),
+        page_size: int = Query(default=25),
+        sort: Optional[str] = Query(default=None),
+        order: Optional[str] = Query(default=None),
     ) -> Dict[str, Any]:
-        return storage.search_issues(q=q, iql=iql, limit=limit, offset=offset)
-
-    @app.post("/api/v1/iql/query")
-    def api_iql_query(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        iql_str = body.get("iql", "")
-        limit = int(body.get("limit", 200))
-        offset = int(body.get("offset", 0))
-        current_user = body.get("current_user")
-        issues, total, ast = storage.execute_iql(
-            iql=iql_str,
-            limit=limit,
-            offset=offset,
-            current_user=current_user,
+        return storage.query_issues(
+            tab="all",
+            q=q,
+            iql=iql,
+            sort=sort,
+            order=order,
+            page=page,
+            page_size=page_size,
         )
-        return {"issues": issues, "total": total, "ast": ast}
 
-    @app.post("/api/v1/iql/validate")
-    def api_iql_validate(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        iql_str = body.get("iql", "")
-        try:
-            ast = parse_iql(iql_str)
-            # Also dry-run SQL compilation to catch any semantic issues
-            compiler = storage._make_compiler()
-            compiler.compile_where(ast["where"])
-            compiler.compile_order_by(ast["order_by"])
-            return {"valid": True, "ast": ast, "error": None, "position": None}
-        except IQLError as e:
-            return {"valid": False, "ast": None, "error": e.message, "position": e.position}
+    # --- Tags (Routes 42..45) ---
+
+    @app.get("/api/v1/tags")
+    def api_list_tags() -> Dict[str, Any]:
+        return {"tags": storage.list_tags()}
+
+    @app.post("/api/v1/tags", status_code=201)
+    async def api_create_tag(request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        return storage.create_tag(body)
+
+    @app.patch("/api/v1/tags/{tag_name}")
+    async def api_patch_tag(tag_name: str, request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        return storage.update_tag(tag_name, body)
+
+    @app.delete("/api/v1/tags/{tag_name}")
+    def api_delete_tag(tag_name: str) -> Dict[str, Any]:
+        return storage.delete_tag(tag_name)
+
+    # --- Sprints (Routes 46..54) ---
+
+    @app.get("/api/v1/sprints")
+    def api_list_sprints(state: Optional[str] = Query(default=None)) -> Dict[str, Any]:
+        return {"sprints": storage.list_sprints(state=state)}
+
+    @app.post("/api/v1/sprints", status_code=201)
+    async def api_create_sprint(request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        return storage.create_sprint(body)
+
+    @app.get("/api/v1/sprints/{sprint_ref}")
+    def api_get_sprint(sprint_ref: str) -> Dict[str, Any]:
+        return storage.get_sprint(sprint_ref)
+
+    @app.patch("/api/v1/sprints/{sprint_ref}")
+    async def api_patch_sprint(sprint_ref: str, request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        return storage.update_sprint(sprint_ref, body)
+
+    @app.post("/api/v1/sprints/{sprint_ref}/start")
+    async def api_start_sprint(sprint_ref: str, request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        return storage.start_sprint(sprint_ref, start_date=body.get("start_date"), end_date=body.get("end_date"))
+
+    @app.post("/api/v1/sprints/{sprint_ref}/complete")
+    async def api_complete_sprint(sprint_ref: str, request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        return storage.complete_sprint(sprint_ref, rollover_to=body.get("rollover_to"))
+
+    @app.post("/api/v1/sprints/{sprint_ref}/assign")
+    async def api_assign_sprint(sprint_ref: str, request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        return storage.assign_sprint_issues(sprint_ref, issue_refs=_parse_str_list_value(body.get("issues")))
+
+    @app.post("/api/v1/sprints/{sprint_ref}/remove")
+    async def api_remove_sprint(sprint_ref: str, request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        return storage.remove_sprint_issues(sprint_ref, issue_refs=_parse_str_list_value(body.get("issues")))
+
+    @app.delete("/api/v1/sprints/{sprint_ref}")
+    def api_delete_sprint(sprint_ref: str) -> Dict[str, Any]:
+        return storage.delete_sprint(sprint_ref)
+
+    # --- Milestones (Routes 55..61) ---
+
+    @app.get("/api/v1/milestones")
+    def api_list_milestones(state: Optional[str] = Query(default=None)) -> Dict[str, Any]:
+        return {"milestones": storage.list_milestones(state=state)}
+
+    @app.post("/api/v1/milestones", status_code=201)
+    async def api_create_milestone(request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        return storage.create_milestone(body)
+
+    @app.get("/api/v1/milestones/{milestone_ref}")
+    def api_get_milestone(milestone_ref: str) -> Dict[str, Any]:
+        return storage.get_milestone(milestone_ref)
+
+    @app.patch("/api/v1/milestones/{milestone_ref}")
+    async def api_patch_milestone(milestone_ref: str, request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        return storage.update_milestone(milestone_ref, body)
+
+    @app.post("/api/v1/milestones/{milestone_ref}/close")
+    def api_close_milestone(milestone_ref: str) -> Dict[str, Any]:
+        return storage.set_milestone_state(milestone_ref, closed=True)
+
+    @app.post("/api/v1/milestones/{milestone_ref}/reopen")
+    def api_reopen_milestone(milestone_ref: str) -> Dict[str, Any]:
+        return storage.set_milestone_state(milestone_ref, closed=False)
+
+    @app.delete("/api/v1/milestones/{milestone_ref}")
+    def api_delete_milestone(milestone_ref: str) -> Dict[str, Any]:
+        return storage.delete_milestone(milestone_ref)
+
+    # --- Saved Views (Routes 62..67) ---
 
     @app.get("/api/v1/views")
     def api_list_views() -> Dict[str, Any]:
         return {"views": storage.list_views()}
 
     @app.post("/api/v1/views", status_code=201)
-    def api_create_view(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    async def api_create_view(request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
         return storage.create_view(body)
 
-    @app.patch("/api/v1/views/{view_id}")
-    def api_patch_view(view_id: str, body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
-        return storage.update_view(view_id, body)
+    @app.get("/api/v1/views/{view_ref}")
+    def api_get_view(view_ref: str) -> Dict[str, Any]:
+        return storage.get_view(view_ref)
 
-    @app.delete("/api/v1/views/{view_id}")
-    def api_delete_view(view_id: str) -> Dict[str, Any]:
-        return storage.delete_view(view_id)
+    @app.post("/api/v1/views/{view_ref}/run")
+    async def api_run_view(view_ref: str, request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        page = int(body.get("page", 1))
+        page_size = int(body.get("page_size", 25))
+        return storage.run_view(view_ref, page=page, page_size=page_size)
 
-    # --- 43..46 Comments ---
-    @app.get("/api/v1/issues/{key}/comments")
-    def api_list_comments(key: str) -> Dict[str, Any]:
-        return storage.list_comments(key)
+    @app.patch("/api/v1/views/{view_ref}")
+    async def api_patch_view(view_ref: str, request: Request) -> Dict[str, Any]:
+        body = await _read_optional_json(request)
+        return storage.update_view(view_ref, body)
 
-    @app.post("/api/v1/issues/{key}/comments", status_code=201)
-    def api_add_comment(key: str, body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        return storage.add_comment(key=key, body=body.get("body", ""), author=body.get("author"))
-
-    @app.patch("/api/v1/issues/{key}/comments/{comment_id}")
-    def api_edit_comment(key: str, comment_id: str, body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        return storage.edit_comment(
-            key=key,
-            comment_id=comment_id,
-            body=body.get("body", ""),
-            actor=body.get("actor"),
-        )
-
-    @app.delete("/api/v1/issues/{key}/comments/{comment_id}")
-    def api_delete_comment(key: str, comment_id: str) -> Dict[str, Any]:
-        return storage.delete_comment(key=key, comment_id=comment_id)
-
-    # --- 47..50 Multipart Attachments ---
-    @app.get("/api/v1/issues/{key}/attachments")
-    def api_list_attachments(key: str) -> Dict[str, Any]:
-        return storage.list_attachments(key)
-
-    @app.post("/api/v1/issues/{key}/attachments", status_code=201)
-    def api_upload_attachment(
-        key: str,
-        file: UploadFile = File(...),
-        uploaded_by: str = Form("system"),
-        description: str = Form(""),
-    ) -> Dict[str, Any]:
-        return storage.save_attachment(
-            key=key,
-            filename=file.filename,
-            content_type=file.content_type,
-            stream=file.file,
-            uploaded_by=uploaded_by,
-            description=description,
-        )
-
-    @app.get("/api/v1/issues/{key}/attachments/{attachment_id}/download")
-    def api_download_attachment(key: str, attachment_id: str) -> FileResponse:
-        fpath, att = storage.get_attachment_download_info(key, attachment_id)
-        return FileResponse(
-            path=str(fpath),
-            media_type=att.get("mime_type") or "application/octet-stream",
-            filename=att.get("filename") or fpath.name,
-        )
-
-    @app.delete("/api/v1/issues/{key}/attachments/{attachment_id}")
-    def api_delete_attachment(key: str, attachment_id: str) -> Dict[str, Any]:
-        return storage.delete_attachment(key, attachment_id)
-
-    # --- 51..53 Issue Links ---
-    @app.get("/api/v1/issues/{key}/links")
-    def api_list_links(key: str) -> Dict[str, Any]:
-        return storage.list_links(key)
-
-    @app.post("/api/v1/issues/{key}/links", status_code=201)
-    def api_add_link(key: str, body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        return storage.add_link(
-            source_key=key,
-            target_key=body.get("target_key", ""),
-            link_type=body.get("link_type", ""),
-            actor=body.get("actor"),
-        )
-
-    @app.delete("/api/v1/issues/{key}/links/{link_id}")
-    def api_delete_link(key: str, link_id: str) -> Dict[str, Any]:
-        return storage.delete_link(key, link_id)
-
-    # --- 54..56 Worklogs ---
-    @app.get("/api/v1/issues/{key}/worklogs")
-    def api_list_worklogs(key: str) -> Dict[str, Any]:
-        return storage.list_worklogs(key)
-
-    @app.post("/api/v1/issues/{key}/worklogs", status_code=201)
-    def api_add_worklog(key: str, body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        return storage.add_worklog(
-            key=key,
-            minutes=body.get("minutes"),
-            duration=body.get("duration"),
-            author=body.get("author"),
-            note=body.get("note"),
-            started_at=body.get("started_at"),
-        )
-
-    @app.delete("/api/v1/issues/{key}/worklogs/{worklog_id}")
-    def api_delete_worklog(key: str, worklog_id: str) -> Dict[str, Any]:
-        return storage.delete_worklog(key, worklog_id)
-
-    # --- 57..62 Labels & Components ---
-    @app.get("/api/v1/labels")
-    def api_list_labels() -> Dict[str, Any]:
-        return {"labels": storage.list_labels()}
-
-    @app.post("/api/v1/labels", status_code=201)
-    def api_add_label(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        return storage.add_label(
-            name=body.get("name", ""),
-            color=body.get("color"),
-            description=body.get("description"),
-        )
-
-    @app.delete("/api/v1/labels/{name}")
-    def api_delete_label(name: str) -> Dict[str, Any]:
-        return storage.delete_label(name)
-
-    @app.get("/api/v1/components")
-    def api_list_components() -> Dict[str, Any]:
-        return {"components": storage.list_components()}
-
-    @app.post("/api/v1/components", status_code=201)
-    def api_add_component(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        return storage.add_component(
-            name=body.get("name", ""),
-            lead=body.get("lead"),
-            description=body.get("description"),
-        )
-
-    @app.delete("/api/v1/components/{name}")
-    def api_delete_component(name: str) -> Dict[str, Any]:
-        return storage.delete_component(name)
-
-    # --- 63..73 Sprints & Milestones ---
-    @app.get("/api/v1/sprints")
-    def api_list_sprints(state: Optional[str] = Query(default=None)) -> Dict[str, Any]:
-        return {"sprints": storage.list_sprints(state=state)}
-
-    @app.post("/api/v1/sprints", status_code=201)
-    def api_create_sprint(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        return storage.create_sprint(body)
-
-    @app.get("/api/v1/sprints/{sprint_id}")
-    def api_get_sprint(sprint_id: str) -> Dict[str, Any]:
-        return storage.get_sprint_detail(sprint_id)
-
-    @app.patch("/api/v1/sprints/{sprint_id}")
-    def api_patch_sprint(sprint_id: str, body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
-        return storage.update_sprint(sprint_id, body)
-
-    @app.post("/api/v1/sprints/{sprint_id}/start")
-    def api_start_sprint(sprint_id: str, body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
-        return storage.start_sprint(
-            sprint_id=sprint_id,
-            start_date=body.get("start_date"),
-            end_date=body.get("end_date"),
-        )
-
-    @app.post("/api/v1/sprints/{sprint_id}/complete")
-    def api_complete_sprint(sprint_id: str, body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
-        return storage.complete_sprint(sprint_id=sprint_id, rollover_to=body.get("rollover_to"))
-
-    @app.delete("/api/v1/sprints/{sprint_id}")
-    def api_delete_sprint(sprint_id: str) -> Dict[str, Any]:
-        return storage.delete_sprint(sprint_id)
-
-    @app.get("/api/v1/milestones")
-    def api_list_milestones() -> Dict[str, Any]:
-        return {"milestones": storage.list_milestones()}
-
-    @app.post("/api/v1/milestones", status_code=201)
-    def api_create_milestone(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-        return storage.create_milestone(body)
-
-    @app.patch("/api/v1/milestones/{milestone_id}")
-    def api_patch_milestone(milestone_id: str, body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
-        return storage.update_milestone(milestone_id, body)
-
-    @app.delete("/api/v1/milestones/{milestone_id}")
-    def api_delete_milestone(milestone_id: str) -> Dict[str, Any]:
-        return storage.delete_milestone(milestone_id)
+    @app.delete("/api/v1/views/{view_ref}")
+    def api_delete_view(view_ref: str) -> Dict[str, Any]:
+        return storage.delete_view(view_ref)
 
     return app
 
 
 # ============================================================================
-# Embedded 100% Offline Jira/Linear Single-Page Application (Zero External URLs)
+# Section 6: Embedded Air-Gapped Offline Web UI (SPA_HTML)
 # ============================================================================
 
 SPA_HTML = r"""<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>itrack — Local-First Issue &amp; Agent Workspace</title>
-  <meta name="description" content="Local-first Git-backed issue tracker, iQL query engine, Kanban board, dependency graph, and AI agent coordination workspace." />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>iTrack — Local-First Issue Tracker</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <style>
     :root, [data-theme="dark"] {
-      --bg-canvas: hsl(220, 14%, 8%);
-      --bg-sidebar: hsl(220, 13%, 10.5%);
-      --bg-surface-1: hsl(220, 13%, 12.5%);
-      --bg-surface-2: hsl(220, 12%, 15.5%);
-      --bg-surface-3: hsl(220, 12%, 19%);
-      --bg-overlay: hsla(220, 18%, 4%, 0.72);
-      --border-subtle: hsl(220, 11%, 18%);
-      --border-strong: hsl(220, 11%, 25%);
-      --text-primary: hsl(215, 20%, 93%);
-      --text-secondary: hsl(215, 12%, 65%);
-      --text-muted: hsl(215, 10%, 46%);
-      --accent: hsl(212, 90%, 56%);
-      --accent-hover: hsl(212, 92%, 62%);
-      --accent-soft: hsla(212, 90%, 56%, 0.14);
-      --ok: hsl(152, 60%, 45%);
-      --ok-soft: hsla(152, 60%, 45%, 0.14);
-      --warn: hsl(38, 92%, 54%);
-      --warn-soft: hsla(38, 92%, 54%, 0.15);
-      --danger: hsl(356, 75%, 58%);
-      --danger-soft: hsla(356, 75%, 58%, 0.15);
-      --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
-      --shadow-lg: 0 16px 40px rgba(0, 0, 0, 0.55);
+      --bg-app: #0b0f19;
+      --bg-panel: #111827;
+      --bg-card: #1a2234;
+      --bg-hover: #243047;
+      --bg-input: #0f172a;
+      --text-main: #f1f5f9;
+      --text-muted: #94a3b8;
+      --border: #293548;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --danger: #ef4444;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --shadow: 0 10px 30px rgba(0,0,0,0.45);
     }
-
     [data-theme="light"] {
-      --bg-canvas: hsl(40, 20%, 97.5%);
-      --bg-sidebar: hsl(38, 16%, 94%);
-      --bg-surface-1: hsl(0, 0%, 100%);
-      --bg-surface-2: hsl(220, 14%, 95.5%);
-      --bg-surface-3: hsl(220, 14%, 91.5%);
-      --bg-overlay: hsla(220, 20%, 12%, 0.42);
-      --border-subtle: hsl(220, 13%, 88%);
-      --border-strong: hsl(220, 13%, 78%);
-      --text-primary: hsl(220, 22%, 12%);
-      --text-secondary: hsl(220, 12%, 38%);
-      --text-muted: hsl(220, 10%, 54%);
-      --accent: hsl(212, 86%, 45%);
-      --accent-hover: hsl(212, 86%, 39%);
-      --accent-soft: hsla(212, 86%, 45%, 0.11);
-      --ok: hsl(152, 64%, 34%);
-      --ok-soft: hsla(152, 64%, 34%, 0.12);
-      --warn: hsl(34, 90%, 42%);
-      --warn-soft: hsla(34, 90%, 42%, 0.13);
-      --danger: hsl(356, 72%, 48%);
-      --danger-soft: hsla(356, 72%, 48%, 0.12);
-      --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
-      --shadow-lg: 0 16px 38px rgba(15, 23, 42, 0.16);
+      --bg-app: #f8fafc;
+      --bg-panel: #ffffff;
+      --bg-card: #f1f5f9;
+      --bg-hover: #e2e8f0;
+      --bg-input: #ffffff;
+      --text-main: #0f172a;
+      --text-muted: #475569;
+      --border: #cbd5e1;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --danger: #dc2626;
+      --success: #059669;
+      --warning: #d97706;
+      --shadow: 0 10px 25px rgba(15,23,42,0.12);
     }
-
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body {
-      height: 100%;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Ubuntu, sans-serif;
       font-size: 13px;
-      line-height: 1.45;
-      background: var(--bg-canvas);
-      color: var(--text-primary);
-      -webkit-font-smoothing: antialiased;
+      background: var(--bg-app);
+      color: var(--text-main);
+      height: 100vh;
+      display: flex;
       overflow: hidden;
     }
-    code, pre, .mono {
-      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-    }
+    code, pre, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
     button, input, select, textarea {
       font: inherit;
-      color: inherit;
+      color: var(--text-main);
     }
-
-    /* App Shell */
-    .app-shell {
-      display: grid;
-      grid-template-columns: 232px 1fr;
-      grid-template-rows: 52px 1fr;
-      height: 100vh;
-      width: 100vw;
-    }
-
-    /* Sidebar */
-    .sidebar {
-      grid-row: 1 / -1;
-      grid-column: 1;
-      background: var(--bg-sidebar);
-      border-right: 1px solid var(--border-subtle);
-      display: flex;
-      flex-direction: column;
-      padding: 12px 10px;
-      gap: 14px;
-      overflow-y: auto;
-    }
-    .brand-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 2px 6px 6px;
-      border-bottom: 1px solid var(--border-subtle);
-    }
-    .brand-left {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      min-width: 0;
-    }
-    .brand-mark {
-      width: 24px;
-      height: 24px;
+    input, select, textarea {
+      background: var(--bg-input);
+      border: 1px solid var(--border);
       border-radius: 6px;
-      background: var(--accent);
-      color: #fff;
-      font-weight: 700;
-      font-size: 12px;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      letter-spacing: -0.03em;
-      flex-shrink: 0;
-    }
-    .brand-title {
-      font-size: 13.5px;
-      font-weight: 650;
-      letter-spacing: -0.02em;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .project-key-pill {
-      font-size: 10.5px;
-      font-weight: 600;
-      padding: 2px 6px;
-      border-radius: 4px;
-      background: var(--bg-surface-2);
-      border: 1px solid var(--border-subtle);
-      color: var(--text-secondary);
-    }
-
-    .nav-group-label {
-      font-size: 10.5px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: var(--text-muted);
-      padding: 0 8px 4px;
-    }
-    .nav-list {
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
-    }
-    .nav-btn {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      width: 100%;
-      padding: 6.5px 9px;
-      border-radius: 6px;
-      border: 1px solid transparent;
-      background: transparent;
-      color: var(--text-secondary);
-      cursor: pointer;
-      text-align: left;
-      transition: background 120ms ease, color 120ms ease;
-    }
-    .nav-btn:hover {
-      background: var(--bg-surface-2);
-      color: var(--text-primary);
-    }
-    .nav-btn.active {
-      background: var(--bg-surface-2);
-      border-color: var(--border-subtle);
-      color: var(--text-primary);
-      font-weight: 550;
-    }
-    .nav-btn-left {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      min-width: 0;
-    }
-    .nav-count {
-      font-size: 11px;
-      color: var(--text-muted);
-      padding: 0 5px;
-      border-radius: 999px;
-      background: var(--bg-surface-1);
-    }
-    .saved-view-item {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 4px;
-      padding: 5px 8px;
-      border-radius: 5px;
-      cursor: pointer;
-      color: var(--text-secondary);
-      font-size: 12px;
-    }
-    .saved-view-item:hover {
-      background: var(--bg-surface-2);
-      color: var(--text-primary);
-    }
-    .sidebar-footer {
-      margin-top: auto;
-      padding-top: 10px;
-      border-top: 1px solid var(--border-subtle);
-      font-size: 11px;
-      color: var(--text-muted);
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-    .kbd-hint {
-      display: inline-block;
-      padding: 1px 5px;
-      font-size: 10px;
-      border-radius: 4px;
-      background: var(--bg-surface-2);
-      border: 1px solid var(--border-subtle);
-      color: var(--text-secondary);
-      font-family: monospace;
-    }
-
-    /* Top Header & iQL Bar */
-    .topbar {
-      grid-row: 1;
-      grid-column: 2;
-      background: var(--bg-surface-1);
-      border-bottom: 1px solid var(--border-subtle);
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 0 16px;
-      min-width: 0;
-    }
-    .iql-bar-wrap {
-      flex: 1;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      background: var(--bg-canvas);
-      border: 1px solid var(--border-subtle);
-      border-radius: 7px;
-      padding: 3px 8px;
-      min-width: 200px;
-      transition: border-color 120ms ease;
-    }
-    .iql-bar-wrap:focus-within {
-      border-color: var(--accent);
-    }
-    .iql-prefix {
-      font-size: 11px;
-      font-weight: 650;
-      color: var(--accent);
-      padding: 1px 5px;
-      background: var(--accent-soft);
-      border-radius: 4px;
-      user-select: none;
-    }
-    #global-iql-input {
-      flex: 1;
-      border: none;
+      padding: 6px 8px;
       outline: none;
-      background: transparent;
-      font-size: 12.5px;
-      padding: 3px 2px;
-      min-width: 100px;
     }
-    .status-badge {
-      font-size: 11px;
-      padding: 2px 7px;
-      border-radius: 4px;
-      white-space: nowrap;
-      font-weight: 500;
-    }
-    .status-badge.valid { color: var(--ok); background: var(--ok-soft); }
-    .status-badge.invalid { color: var(--danger); background: var(--danger-soft); }
-    .status-badge.idle { color: var(--text-muted); background: var(--bg-surface-2); }
-
-    /* Buttons & Inputs */
+    input:focus, select:focus, textarea:focus { border-color: var(--accent); }
     .btn {
       display: inline-flex;
       align-items: center;
-      justify-content: center;
-      gap: 6px;
-      padding: 5.5px 11px;
+      gap: 5px;
+      padding: 6px 11px;
       border-radius: 6px;
-      border: 1px solid var(--border-subtle);
-      background: var(--bg-surface-2);
-      color: var(--text-primary);
-      font-size: 12.5px;
-      font-weight: 500;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
       cursor: pointer;
+      font-weight: 500;
       white-space: nowrap;
-      transition: background 120ms ease, border-color 120ms ease;
     }
-    .btn:hover { background: var(--bg-surface-3); border-color: var(--border-strong); }
-    .btn-primary {
-      background: var(--accent);
-      border-color: var(--accent);
-      color: #fff;
-    }
-    .btn-primary:hover {
-      background: var(--accent-hover);
-      border-color: var(--accent-hover);
-    }
-    .btn-danger {
-      color: var(--danger);
-      border-color: var(--border-subtle);
-      background: var(--danger-soft);
-    }
-    .btn-sm { padding: 3px 8px; font-size: 11.5px; border-radius: 5px; }
-    .btn-ghost { background: transparent; border-color: transparent; color: var(--text-secondary); }
-    .btn-ghost:hover { background: var(--bg-surface-2); color: var(--text-primary); }
+    .btn:hover { background: var(--bg-hover); }
+    .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+    .btn-sm { padding: 3px 7px; font-size: 12px; }
+    .btn-ghost { background: transparent; border-color: transparent; }
+    .btn-ghost:hover { background: var(--bg-hover); }
 
-    .input, .select, .textarea {
-      width: 100%;
-      padding: 6px 9px;
-      border-radius: 6px;
-      border: 1px solid var(--border-subtle);
-      background: var(--bg-canvas);
-      color: var(--text-primary);
-      font-size: 12.5px;
-      outline: none;
+    /* App Layout */
+    #sidebar {
+      width: 230px;
+      background: var(--bg-panel);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      transition: width 0.15s ease;
+      flex-shrink: 0;
     }
-    .input:focus, .select:focus, .textarea:focus { border-color: var(--accent); }
-    .textarea { resize: vertical; min-height: 76px; line-height: 1.5; }
-
-    /* Main Workspace Content */
-    .workspace-main {
-      grid-row: 2;
-      grid-column: 2;
-      overflow: auto;
-      padding: 16px 18px 64px;
-      position: relative;
+    #sidebar.collapsed { width: 54px; }
+    #sidebar.collapsed .nav-label, #sidebar.collapsed .sidebar-section-title, #sidebar.collapsed #sidebar-saved-views, #sidebar.collapsed #brand-title {
+      display: none;
     }
-    .view-panel { display: none; }
-    .view-panel.active { display: block; }
-
-    .view-toolbar {
+    .sidebar-header {
+      padding: 12px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-bottom: 14px;
+      border-bottom: 1px solid var(--border);
+      font-weight: 700;
+      font-size: 15px;
     }
-    .filter-pills {
-      display: flex;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 6px;
+    .nav-list { padding: 8px; display: flex; flex-direction: column; gap: 3px; flex: 1; overflow-y: auto; }
+    .nav-item {
+      display: flex; align-items: center; gap: 9px;
+      width: 100%; text-align: left;
+      padding: 7px 10px; border-radius: 6px;
+      border: none; background: transparent; cursor: pointer;
+      color: var(--text-muted); font-weight: 500;
     }
-    .pill {
-      padding: 3.5px 9px;
-      border-radius: 999px;
-      font-size: 11.5px;
-      border: 1px solid var(--border-subtle);
-      background: var(--bg-surface-1);
-      color: var(--text-secondary);
-      cursor: pointer;
+    .nav-item:hover { background: var(--bg-hover); color: var(--text-main); }
+    .nav-item.active { background: var(--accent); color: #fff; }
+    .sidebar-section-title {
+      font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+      color: var(--text-muted); margin: 12px 8px 4px;
     }
-    .pill.active, .pill:hover {
-      background: var(--accent-soft);
-      color: var(--accent);
-      border-color: var(--accent);
+    #main-shell { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+    #topbar {
+      height: 52px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+      padding: 0 14px;
+      display: flex; align-items: center; gap: 10px;
+      flex-shrink: 0;
+    }
+    #global-search-input { flex: 1; max-width: 560px; }
+    #content-area { flex: 1; overflow: auto; padding: 16px; }
+    .view-pane { display: none; }
+    .view-pane.active { display: block; }
+
+    /* Badges & Chips */
+    .badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 2px 7px; border-radius: 999px; font-size: 11px; font-weight: 600;
+      background: var(--bg-hover); border: 1px solid var(--border);
+    }
+    .badge-overdue { background: rgba(239,68,68,0.18); color: #f87171; border-color: #ef4444; }
+    .badge-blocked { background: rgba(245,158,11,0.18); color: #fbbf24; border-color: #f59e0b; }
+    .badge-done { background: rgba(16,185,129,0.18); color: #34d399; border-color: #10b981; }
+    .prio-critical { color: #ef4444; font-weight: 700; }
+    .prio-high { color: #f97316; font-weight: 600; }
+    .prio-medium { color: #3b82f6; }
+    .prio-low { color: #10b981; }
+    .prio-trivial { color: #94a3b8; }
+
+    /* Tabs, Filters & Table */
+    .preset-tabs { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 10px; }
+    .tab-chip {
+      padding: 5px 11px; border-radius: 6px; border: 1px solid var(--border);
+      background: var(--bg-panel); cursor: pointer; font-weight: 500; color: var(--text-muted);
+    }
+    .tab-chip.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .filters-bar {
+      display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+      background: var(--bg-panel); padding: 8px 10px; border-radius: 8px;
+      border: 1px solid var(--border); margin-bottom: 10px;
+    }
+    .bulk-bar {
+      display: none; align-items: center; gap: 8px; flex-wrap: wrap;
+      background: rgba(59,130,246,0.14); border: 1px solid var(--accent);
+      padding: 8px 12px; border-radius: 8px; margin-bottom: 10px;
+    }
+    .bulk-bar.open { display: flex; }
+    table.issues-table {
+      width: 100%; border-collapse: collapse; background: var(--bg-panel);
+      border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+    }
+    table.issues-table th, table.issues-table td {
+      padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left;
+    }
+    table.issues-table th {
+      background: var(--bg-card); color: var(--text-muted); font-size: 11px;
+      text-transform: uppercase; cursor: pointer; user-select: none;
+    }
+    table.issues-table tr:hover td { background: var(--bg-hover); }
+    .pagination-bar {
+      display: flex; justify-content: space-between; align-items: center;
+      margin-top: 10px; padding: 8px; background: var(--bg-panel);
+      border: 1px solid var(--border); border-radius: 8px; flex-wrap: wrap; gap: 8px;
     }
 
     /* Kanban Board */
-    .board-grid {
-      display: flex;
-      gap: 12px;
-      align-items: flex-start;
-      overflow-x: auto;
-      padding-bottom: 14px;
-      min-height: calc(100vh - 135px);
+    .swimlane-block { margin-bottom: 18px; }
+    .swimlane-header {
+      padding: 7px 12px; background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: 6px; font-weight: 700; margin-bottom: 8px; display: flex; justify-content: space-between;
     }
-    .board-col {
-      width: 278px;
-      min-width: 278px;
-      background: var(--bg-surface-1);
-      border: 1px solid var(--border-subtle);
-      border-radius: 8px;
-      display: flex;
-      flex-direction: column;
-      max-height: calc(100vh - 135px);
+    .kanban-row { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 8px; }
+    .kanban-column {
+      min-width: 172px; width: 172px; background: var(--bg-panel);
+      border: 1px solid var(--border); border-radius: 8px;
+      display: flex; flex-direction: column; max-height: 70vh; flex-shrink: 0;
     }
-    .board-col.drag-over {
-      border-color: var(--accent);
-      background: var(--bg-surface-2);
+    .kanban-column.drag-over { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+    .kanban-col-head {
+      padding: 8px 10px; border-bottom: 1px solid var(--border);
+      display: flex; justify-content: space-between; align-items: center; font-weight: 600;
     }
-    .board-col-header {
-      padding: 9px 11px;
-      border-bottom: 1px solid var(--border-subtle);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 6px;
+    .wip-exceeded { background: rgba(239,68,68,0.2); border-color: var(--danger); color: #f87171; }
+    .kanban-cards { padding: 8px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; min-height: 110px; flex: 1; }
+    .kanban-card {
+      background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px;
+      padding: 9px; cursor: grab; display: flex; flex-direction: column; gap: 5px;
+      user-select: none; -webkit-user-select: none; -webkit-user-drag: element;
     }
-    .col-title-wrap {
-      display: flex;
-      align-items: center;
-      gap: 7px;
-      font-weight: 600;
-      font-size: 12px;
-      text-transform: capitalize;
-    }
-    .status-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      display: inline-block;
-      flex-shrink: 0;
-    }
-    .dot-backlog { background: hsl(215, 10%, 50%); }
-    .dot-todo { background: hsl(212, 85%, 58%); }
-    .dot-in_progress { background: hsl(38, 92%, 54%); }
-    .dot-in_review { background: hsl(190, 80%, 46%); }
-    .dot-blocked { background: hsl(356, 75%, 58%); }
-    .dot-done { background: hsl(152, 60%, 45%); }
-    .dot-canceled { background: hsl(215, 8%, 38%); }
+    .kanban-card * { pointer-events: none; }
+    .kanban-card:hover { border-color: var(--accent); }
 
-    .board-cards {
-      padding: 8px;
-      display: flex;
-      flex-direction: column;
-      gap: 7px;
-      overflow-y: auto;
-      min-height: 80px;
-    }
-    .issue-card {
-      background: var(--bg-surface-2);
-      border: 1px solid var(--border-subtle);
-      border-radius: 6px;
-      padding: 9px 10px;
-      cursor: pointer;
-      box-shadow: var(--shadow-sm);
-      transition: transform 100ms ease, border-color 120ms ease;
-    }
-    .issue-card:hover {
-      border-color: var(--border-strong);
-      transform: translateY(-1px);
-    }
-    .card-top {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 6px;
-      margin-bottom: 5px;
-      font-size: 11px;
-      color: var(--text-muted);
-    }
-    .card-title {
-      font-size: 12.5px;
-      font-weight: 550;
-      color: var(--text-primary);
-      margin-bottom: 7px;
-      line-height: 1.35;
-      word-break: break-word;
-    }
-    .card-meta {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      flex-wrap: wrap;
-      gap: 5px;
-    }
-    .tag-row { display: flex; flex-wrap: wrap; gap: 4px; }
-    .tag {
-      font-size: 10.5px;
-      padding: 1px 6px;
-      border-radius: 4px;
-      background: var(--bg-surface-1);
-      border: 1px solid var(--border-subtle);
-      color: var(--text-secondary);
-    }
-    .tag-blocked {
-      color: var(--danger);
-      background: var(--danger-soft);
-      border-color: transparent;
-      font-weight: 600;
-    }
-    .tag-claimed {
-      color: var(--warn);
-      background: var(--warn-soft);
-      border-color: transparent;
-      font-weight: 600;
-    }
-    .prio-badge {
-      font-size: 10.5px;
-      font-weight: 600;
-      text-transform: uppercase;
-      padding: 1px 5px;
-      border-radius: 3px;
-    }
-    .prio-urgent { color: var(--danger); background: var(--danger-soft); }
-    .prio-high { color: var(--warn); background: var(--warn-soft); }
-    .prio-medium { color: var(--accent); background: var(--accent-soft); }
-    .prio-low, .prio-none { color: var(--text-muted); background: var(--bg-surface-1); }
-
-    /* Linear High-Density List */
-    .list-table-wrap {
-      background: var(--bg-surface-1);
-      border: 1px solid var(--border-subtle);
-      border-radius: 8px;
-      overflow: hidden;
-    }
-    table.issue-table {
-      width: 100%;
-      border-collapse: collapse;
-      text-align: left;
-    }
-    .issue-table th {
-      padding: 8px 10px;
-      font-size: 11px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      color: var(--text-muted);
-      border-bottom: 1px solid var(--border-subtle);
-      background: var(--bg-surface-2);
-    }
-    .issue-table td {
-      padding: 8px 10px;
-      border-bottom: 1px solid var(--border-subtle);
-      vertical-align: middle;
-    }
-    .issue-table tr:last-child td { border-bottom: none; }
-    .issue-table tbody tr:hover { background: var(--bg-surface-2); cursor: pointer; }
-
-    /* Bulk Triage Floating Bar */
-    #bulk-action-bar {
-      position: fixed;
-      bottom: 18px;
-      left: calc(50% + 116px);
-      transform: translateX(-50%);
-      max-width: calc(100vw - 260px);
-      background: var(--bg-surface-2);
-      border: 1px solid var(--border-strong);
-      box-shadow: var(--shadow-lg);
-      border-radius: 9px;
-      padding: 8px 14px;
-      display: none;
-      align-items: center;
-      gap: 8px;
-      z-index: 40;
-      overflow-x: auto;
-    }
-    #bulk-action-bar.visible { display: flex; }
-    #bulk-selected-count { white-space: nowrap; flex-shrink: 0; }
-
-    /* Cards & Panels for Sprints, Epics, Ready, Stats */
-    .panel-card {
-      background: var(--bg-surface-1);
-      border: 1px solid var(--border-subtle);
-      border-radius: 8px;
-      padding: 14px 16px;
-      margin-bottom: 12px;
-    }
-    .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
-    .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-bottom: 14px; }
-    .kpi-box {
-      background: var(--bg-surface-1);
-      border: 1px solid var(--border-subtle);
-      border-radius: 8px;
-      padding: 12px 14px;
-    }
-    .kpi-label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
-    .kpi-val { font-size: 22px; font-weight: 700; margin-top: 3px; letter-spacing: -0.02em; }
-
-    .progress-track {
-      height: 7px;
-      width: 100%;
-      background: var(--bg-surface-3);
-      border-radius: 999px;
-      overflow: hidden;
-      margin: 6px 0;
-    }
-    .progress-fill {
-      height: 100%;
-      background: var(--ok);
-      border-radius: 999px;
-      transition: width 200ms ease;
-    }
-    .bar-row {
-      display: grid;
-      grid-template-columns: 110px 1fr 40px;
-      align-items: center;
-      gap: 8px;
-      margin: 6px 0;
-      font-size: 12px;
-    }
-
-    /* Modals & Slide-over Issue Drawer */
+    /* Drawer & Modals */
     .modal-backdrop {
-      position: fixed;
-      inset: 0;
-      background: var(--bg-overlay);
-      display: none;
-      align-items: center;
-      justify-content: center;
-      z-index: 60;
-      padding: 20px;
+      position: fixed; inset: 0; background: rgba(0,0,0,0.62);
+      display: none; align-items: center; justify-content: center; z-index: 1000; padding: 16px;
     }
     .modal-backdrop.open { display: flex; }
     .modal-box {
-      width: 100%;
-      max-width: 580px;
-      background: var(--bg-surface-1);
-      border: 1px solid var(--border-strong);
-      border-radius: 10px;
-      box-shadow: var(--shadow-lg);
-      padding: 18px 20px;
-      max-height: 90vh;
-      overflow-y: auto;
+      background: var(--bg-panel); border: 1px solid var(--border); border-radius: 10px;
+      box-shadow: var(--shadow); width: 100%; max-width: 720px; max-height: 90vh;
+      display: flex; flex-direction: column; overflow: hidden;
     }
-    .form-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-      margin-top: 10px;
+    .modal-header {
+      padding: 12px 16px; border-bottom: 1px solid var(--border);
+      display: flex; justify-content: space-between; align-items: center; font-weight: 700; font-size: 15px;
     }
-    .form-field { display: flex; flex-direction: column; gap: 4px; }
-    .form-field.full { grid-column: 1 / -1; }
-    .form-field label { font-size: 11px; font-weight: 600; color: var(--text-secondary); }
+    .modal-body { padding: 16px; overflow-y: auto; flex: 1; }
+    .modal-footer { padding: 10px 16px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; }
 
-    /* Issue Drawer */
-    .drawer-backdrop {
-      position: fixed;
-      inset: 0;
-      background: var(--bg-overlay);
-      display: none;
-      justify-content: flex-end;
-      z-index: 55;
-    }
-    .drawer-backdrop.open { display: flex; }
     #issue-drawer {
-      width: min(780px, 94vw);
-      height: 100vh;
-      background: var(--bg-surface-1);
-      border-left: 1px solid var(--border-strong);
-      box-shadow: var(--shadow-lg);
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
+      position: fixed; top: 0; right: 0; bottom: 0; width: min(980px, 94vw);
+      background: var(--bg-panel); border-left: 1px solid var(--border);
+      box-shadow: var(--shadow); z-index: 900; display: none; flex-direction: column;
     }
-    .drawer-header {
-      padding: 12px 18px;
-      border-bottom: 1px solid var(--border-subtle);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      background: var(--bg-surface-2);
+    #issue-drawer.open { display: flex; }
+    .detail-grid { display: grid; grid-template-columns: 1fr 310px; gap: 16px; padding: 16px; overflow-y: auto; flex: 1; }
+    @media (max-width: 860px) { .detail-grid { grid-template-columns: 1fr; } }
+    .meta-sidebar { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 9px; }
+    .meta-row { display: flex; flex-direction: column; gap: 3px; }
+    .meta-row label { font-size: 11px; color: var(--text-muted); font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
+    .progress-track { height: 7px; background: var(--bg-input); border-radius: 999px; overflow: hidden; border: 1px solid var(--border); }
+    .progress-fill { height: 100%; background: var(--success); transition: width 0.2s; }
+    .dropzone {
+      border: 2px dashed var(--border); border-radius: 8px; padding: 12px;
+      text-align: center; color: var(--text-muted); cursor: pointer;
     }
-    .drawer-body {
-      flex: 1;
-      overflow-y: auto;
-      padding: 16px 20px 36px;
-      display: grid;
-      grid-template-columns: 1fr 235px;
-      gap: 18px;
+    .dropzone.drag-over { border-color: var(--accent); background: rgba(59,130,246,0.08); }
+
+    /* Markdown Rendered Content */
+    .md-body { line-height: 1.55; word-break: break-word; }
+    .md-body pre { background: var(--bg-input); padding: 10px; border-radius: 6px; border: 1px solid var(--border); overflow-x: auto; }
+    .md-body code { background: var(--bg-input); padding: 1px 5px; border-radius: 4px; }
+    .md-body blockquote { margin: 6px 0; padding: 4px 12px; border-left: 3px solid var(--accent); color: var(--text-muted); }
+    .md-body table { border-collapse: collapse; width: 100%; margin: 8px 0; }
+    .md-body th, .md-body td { border: 1px solid var(--border); padding: 6px 8px; }
+    .md-inline-embed { max-width: 280px; max-height: 200px; border-radius: 6px; border: 1px solid var(--border); cursor: zoom-in; display: inline-block; margin: 4px 0; }
+    .deleted-att-badge {
+      display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 4px;
+      background: rgba(239,68,68,0.15); border: 1px dashed var(--danger); color: #f87171; font-size: 11px;
     }
-    @media (max-width: 820px) {
-      .app-shell { grid-template-columns: 190px 1fr; }
-      .drawer-body { grid-template-columns: 1fr; }
-      #bulk-action-bar { left: calc(50% + 95px); max-width: calc(100vw - 210px); }
-    }
-    .drawer-section {
-      margin-top: 16px;
-      padding-top: 14px;
-      border-top: 1px solid var(--border-subtle);
-    }
-    .drawer-section h3 {
-      font-size: 12px;
-      font-weight: 650;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      color: var(--text-secondary);
-      margin-bottom: 8px;
-    }
-    .meta-prop {
-      display: flex;
-      flex-direction: column;
-      gap: 3px;
-      margin-bottom: 10px;
-    }
-    .meta-prop label {
-      font-size: 11px;
-      color: var(--text-muted);
-      font-weight: 600;
-    }
-    .comment-item {
-      background: var(--bg-surface-2);
-      border: 1px solid var(--border-subtle);
-      border-radius: 6px;
-      padding: 8px 10px;
-      margin-bottom: 8px;
-    }
-    .toast-stack {
-      position: fixed;
-      bottom: 72px;
-      right: 16px;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      z-index: 90;
-    }
+    .card-panel { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+    .grid-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+
+    /* Toast */
+    #toast-container { position: fixed; bottom: 16px; right: 16px; z-index: 2000; display: flex; flex-direction: column; gap: 6px; }
     .toast {
-      padding: 8px 13px;
-      border-radius: 6px;
-      background: var(--bg-surface-2);
-      border: 1px solid var(--border-strong);
-      box-shadow: var(--shadow-lg);
-      font-size: 12px;
+      padding: 9px 14px; border-radius: 8px; background: var(--bg-card);
+      border: 1px solid var(--accent); box-shadow: var(--shadow); font-weight: 500;
     }
-    .toast.err { border-color: var(--danger); color: var(--danger); }
+    .toast-error { border-color: var(--danger); background: #3b1219; color: #fecaca; }
   </style>
 </head>
 <body>
-  <div class="app-shell">
-    <!-- Navigation Sidebar -->
-    <aside class="sidebar" aria-label="Workspace Navigation">
-      <div class="brand-row">
-        <div class="brand-left">
-          <span class="brand-mark">it</span>
-          <h1 class="brand-title" id="workspace-project-name">itrack</h1>
-        </div>
-        <span class="project-key-pill mono" id="workspace-project-key">ITK</span>
-      </div>
+  <!-- Sidebar -->
+  <aside id="sidebar">
+    <div class="sidebar-header">
+      <span id="brand-title">iTrack</span>
+      <button id="btn-toggle-sidebar" class="btn btn-sm btn-ghost" title="Collapse/Expand Sidebar">&#9776;</button>
+    </div>
+    <nav class="nav-list">
+      <button class="nav-item active" data-view="issues"><span>&#9776;</span><span class="nav-label">Issues List</span></button>
+      <button class="nav-item" data-view="board"><span>&#9638;</span><span class="nav-label">Kanban Board</span></button>
+      <button class="nav-item" data-view="sprints"><span>&#9889;</span><span class="nav-label">Backlog &amp; Sprints</span></button>
+      <button class="nav-item" data-view="milestones"><span>&#9873;</span><span class="nav-label">Milestones</span></button>
+      <button class="nav-item" data-view="views"><span>&#9733;</span><span class="nav-label">Saved Views</span></button>
+      <button class="nav-item" data-view="analytics"><span>&#9650;</span><span class="nav-label">Analytics Dashboard</span></button>
+      <button class="nav-item" data-view="tags"><span>&#9830;</span><span class="nav-label">Tags</span></button>
+      <button class="nav-item" data-view="settings"><span>&#9881;</span><span class="nav-label">Workspace Settings</span></button>
 
-      <div>
-        <div class="nav-group-label">Views</div>
-        <nav class="nav-list">
-          <button class="nav-btn active" id="nav-board" data-view="board">
-            <span class="nav-btn-left">&#9638; Kanban Board</span>
-            <span class="nav-count" id="cnt-board">0</span>
-          </button>
-          <button class="nav-btn" id="nav-list" data-view="list">
-            <span class="nav-btn-left">&#9776; Issue List</span>
-            <span class="nav-count" id="cnt-list">0</span>
-          </button>
-          <button class="nav-btn" id="nav-ready" data-view="ready">
-            <span class="nav-btn-left">&#9889; Ready Queue</span>
-            <span class="nav-count" id="cnt-ready">0</span>
-          </button>
-          <button class="nav-btn" id="nav-sprints" data-view="sprints">
-            <span class="nav-btn-left">&#10227; Sprints</span>
-            <span class="nav-count" id="cnt-sprints">0</span>
-          </button>
-          <button class="nav-btn" id="nav-epics" data-view="epics">
-            <span class="nav-btn-left">&#9670; Epics &amp; Releases</span>
-            <span class="nav-count" id="cnt-epics">0</span>
-          </button>
-          <button class="nav-btn" id="nav-graph" data-view="graph">
-            <span class="nav-btn-left">&#8644; Dependency DAG</span>
-            <span class="nav-count" id="cnt-blocked">0</span>
-          </button>
-          <button class="nav-btn" id="nav-stats" data-view="stats">
-            <span class="nav-btn-left">&#9636; Analytics &amp; Config</span>
-          </button>
-        </nav>
-      </div>
+      <div class="sidebar-section-title">Saved Views</div>
+      <div id="sidebar-saved-views"></div>
+    </nav>
+  </aside>
 
-      <div>
-        <div class="nav-group-label">Saved iQL Views</div>
-        <div id="saved-views-list" class="nav-list"></div>
-      </div>
-
-      <div class="sidebar-footer">
-        <div>Shortcuts: <span class="kbd-hint">c</span> Create <span class="kbd-hint">/</span> iQL <span class="kbd-hint">b</span> Board <span class="kbd-hint">l</span> List</div>
-        <div class="mono" id="daemon-status-line">Local Git Storage</div>
-      </div>
-    </aside>
-
-    <!-- Top Header Bar -->
-    <header class="topbar">
-      <div class="iql-bar-wrap">
-        <span class="iql-prefix mono">iQL</span>
-        <input id="global-iql-input" type="text" placeholder="Filter with iQL, e.g. priority >= high AND blocked = false ORDER BY priority DESC" autocomplete="off" />
-        <span id="iql-status-badge" class="status-badge idle">All Issues</span>
-      </div>
-      <button class="btn btn-sm" id="btn-run-iql" title="Execute iQL query">Run</button>
-      <button class="btn btn-sm" id="btn-save-view" title="Save current iQL as a named view">Save View</button>
-      <button class="btn btn-sm" id="btn-cmd-palette" title="Command Palette (Ctrl+K)">&#8984;K</button>
-      <button class="btn btn-sm" id="btn-theme-toggle" title="Toggle Dark / Light Theme">Theme</button>
-      <button class="btn btn-primary" id="btn-new-issue">+ New Issue</button>
+  <!-- Main Shell -->
+  <div id="main-shell">
+    <header id="topbar">
+      <input id="global-search-input" type="text" placeholder="Search full-text or iQL (e.g. priority = critical AND state != done)... Press '/'" />
+      <button id="btn-run-search" class="btn btn-sm">Search</button>
+      <button id="btn-save-current-view" class="btn btn-sm" title="Save current filter as Named View">Save View</button>
+      <div style="flex:1"></div>
+      <button id="btn-open-create" class="btn btn-primary">+ New Issue (c)</button>
+      <button id="btn-reindex" class="btn btn-sm" title="Rebuild SQLite + FTS5 index from disk">Reindex</button>
+      <button id="btn-theme-toggle" class="btn btn-sm" title="Toggle Dark/Light Mode">Theme</button>
     </header>
 
-    <!-- Main Workspace Views -->
-    <main class="workspace-main">
-      <!-- 1. Kanban Board -->
-      <section id="view-board" class="view-panel active">
-        <div class="view-toolbar">
-          <div class="filter-pills" id="board-filter-pills"></div>
-          <div style="font-size:12px;color:var(--text-muted);" id="board-summary-label">Drag cards across columns to transition</div>
+    <main id="content-area">
+      <!-- 1. Issues List View -->
+      <section id="view-issues" class="view-pane active">
+        <div class="preset-tabs" id="issues-preset-tabs">
+          <button class="tab-chip" data-tab="active">Active</button>
+          <button class="tab-chip" data-tab="open">Open</button>
+          <button class="tab-chip" data-tab="in-progress">In Progress</button>
+          <button class="tab-chip" data-tab="blocked">Blocked</button>
+          <button class="tab-chip" data-tab="completed">Completed</button>
+          <button class="tab-chip" data-tab="cancelled">Cancelled</button>
+          <button class="tab-chip" data-tab="archived">Archived</button>
+          <button class="tab-chip active" data-tab="all">All</button>
         </div>
-        <div class="board-grid" id="board-columns"></div>
-      </section>
 
-      <!-- 2. Linear High-Density List + Bulk Triage -->
-      <section id="view-list" class="view-panel">
-        <div class="view-toolbar">
-          <div style="font-weight:600;" id="list-summary-count">Issues</div>
-          <div style="display:flex;gap:6px;align-items:center;">
-            <input type="text" class="input" id="list-fts-input" placeholder="Full-text FTS5 search..." style="width:220px;" />
-            <button class="btn btn-sm" id="btn-list-fts">Search</button>
-          </div>
+        <div class="filters-bar">
+          <select id="filter-category"><option value="">All Categories</option></select>
+          <select id="filter-state"><option value="">All States</option></select>
+          <select id="filter-priority"><option value="">All Priorities</option></select>
+          <select id="filter-severity"><option value="">All Severities</option></select>
+          <input id="filter-assignee" type="text" placeholder="Assignee..." style="width:110px" />
+          <select id="filter-tag"><option value="">All Tags</option></select>
+          <select id="filter-sprint"><option value="">All Sprints</option></select>
+          <select id="filter-milestone"><option value="">All Milestones</option></select>
+          <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer">
+            <input id="filter-overdue" type="checkbox" /> Overdue
+          </label>
+          <button id="btn-clear-filters" class="btn btn-sm">Clear Filters</button>
+          <button id="btn-open-global-tree" class="btn btn-sm">Hierarchy Tree</button>
         </div>
-        <div class="list-table-wrap">
-          <table class="issue-table">
+
+        <div id="bulk-action-bar" class="bulk-bar">
+          <strong><span id="bulk-selected-count">0</span> selected:</strong>
+          <select id="bulk-state"><option value="">Set State...</option></select>
+          <select id="bulk-priority"><option value="">Set Priority...</option></select>
+          <input id="bulk-assignee" type="text" placeholder="Assignee..." style="width:110px" />
+          <input id="bulk-tag" type="text" placeholder="Add Tag..." style="width:100px" />
+          <select id="bulk-sprint"><option value="">Assign Sprint...</option></select>
+          <button id="btn-bulk-apply" class="btn btn-sm btn-primary">Apply Bulk Update</button>
+          <button id="btn-bulk-archive" class="btn btn-sm">Archive</button>
+          <button id="btn-bulk-delete" class="btn btn-sm btn-danger">Bulk Delete</button>
+        </div>
+
+        <div id="issues-table-wrap">
+          <table class="issues-table">
             <thead>
               <tr>
-                <th style="width:32px;"><input type="checkbox" id="list-select-all" /></th>
-                <th style="width:88px;">Key</th>
-                <th style="width:76px;">Priority</th>
-                <th>Title</th>
-                <th style="width:118px;">Status</th>
-                <th style="width:84px;">Type</th>
-                <th style="width:110px;">Assignee</th>
-                <th style="width:66px;">Pts</th>
+                <th style="width:32px"><input type="checkbox" id="check-all-issues" /></th>
+                <th data-sort="key">Key</th>
+                <th data-sort="name">Name</th>
+                <th data-sort="category">Category</th>
+                <th data-sort="state">State</th>
+                <th data-sort="priority">Priority</th>
+                <th data-sort="severity">Severity</th>
+                <th data-sort="assignee">Assignee</th>
+                <th data-sort="story_points">Pts</th>
+                <th data-sort="due_date">Due</th>
+                <th data-sort="updated_at">Updated</th>
               </tr>
             </thead>
-            <tbody id="list-tbody"></tbody>
+            <tbody id="issues-tbody"></tbody>
           </table>
+          <div id="issues-empty-state" class="card-panel" style="display:none;text-align:center;margin-top:12px;">
+            <p>No issues match your current filters or query.</p>
+            <button id="btn-empty-clear-filters" class="btn btn-sm btn-primary">Clear All Filters</button>
+          </div>
         </div>
-        <div id="bulk-action-bar">
-          <span class="mono" id="bulk-selected-count" style="font-weight:650;">0 selected</span>
-          <select class="select" id="bulk-status-select" style="width:130px;"></select>
-          <button class="btn btn-sm" id="btn-bulk-transition">Move</button>
-          <select class="select" id="bulk-priority-select" style="width:110px;">
-            <option value="">Priority...</option>
-            <option value="urgent">Urgent</option>
-            <option value="high">High</option>
-            <option value="medium">Medium</option>
-            <option value="low">Low</option>
-            <option value="none">None</option>
-          </select>
-          <button class="btn btn-sm" id="btn-bulk-priority">Set Prio</button>
-          <input class="input" id="bulk-assignee-input" placeholder="Assignee..." style="width:105px;" />
-          <button class="btn btn-sm" id="btn-bulk-assign">Assign</button>
-          <input class="input" id="bulk-label-input" placeholder="+Label..." style="width:95px;" />
-          <button class="btn btn-sm" id="btn-bulk-label">Tag</button>
-          <select class="select" id="bulk-sprint-select" style="width:120px;"></select>
-          <button class="btn btn-sm" id="btn-bulk-sprint">Sprint</button>
-          <button class="btn btn-sm btn-danger" id="btn-bulk-delete">Delete</button>
-        </div>
-      </section>
 
-      <!-- 3. Ready Queue (Agent & Operator Actionable Work) -->
-      <section id="view-ready" class="view-panel">
-        <div class="view-toolbar">
+        <div class="pagination-bar">
           <div>
-            <h2 style="font-size:15px;font-weight:650;">Ready Queue — Unblocked Actionable Work</h2>
-            <p style="font-size:12px;color:var(--text-secondary);">Issues in backlog/todo with zero unresolved blockers and no active claim.</p>
-          </div>
-          <div style="display:flex;align-items:center;gap:8px;">
-            <label style="font-size:11.5px;color:var(--text-secondary);">Claim as:</label>
-            <input class="input mono" id="ready-agent-input" value="agent-1" style="width:140px;" />
-          </div>
-        </div>
-        <div class="grid-2">
-          <div>
-            <h3 style="font-size:12px;text-transform:uppercase;color:var(--text-muted);margin-bottom:8px;">Ready to Claim</h3>
-            <div id="ready-queue-cards"></div>
-          </div>
-          <div>
-            <h3 style="font-size:12px;text-transform:uppercase;color:var(--text-muted);margin-bottom:8px;">Currently Claimed / In Progress</h3>
-            <div id="claimed-active-cards"></div>
-          </div>
-        </div>
-      </section>
-
-      <!-- 4. Sprints & Backlog Planner -->
-      <section id="view-sprints" class="view-panel">
-        <div class="panel-card">
-          <div style="display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap;">
-            <div class="form-field" style="flex:1;min-width:180px;">
-              <label>New Sprint Name</label>
-              <input class="input" id="sprint-name-input" placeholder="Sprint 1 — Core Engine" />
-            </div>
-            <div class="form-field" style="flex:2;min-width:200px;">
-              <label>Sprint Goal</label>
-              <input class="input" id="sprint-goal-input" placeholder="Ship iQL + Kanban + Agent Claims" />
-            </div>
-            <div class="form-field">
-              <label>Start Date</label>
-              <input class="input" type="date" id="sprint-start-input" />
-            </div>
-            <div class="form-field">
-              <label>End Date</label>
-              <input class="input" type="date" id="sprint-end-input" />
-            </div>
-            <button class="btn btn-primary" id="btn-create-sprint">+ Create Sprint</button>
-          </div>
-        </div>
-        <div id="sprints-container"></div>
-        <div class="panel-card">
-          <h3 style="font-size:13px;font-weight:650;margin-bottom:8px;">Unscheduled Backlog (Assign to Sprint)</h3>
-          <div id="backlog-planner-list"></div>
-        </div>
-      </section>
-
-      <!-- 5. Epics & Milestones -->
-      <section id="view-epics" class="view-panel">
-        <div class="grid-2">
-          <div>
-            <div class="view-toolbar">
-              <h2 style="font-size:15px;font-weight:650;">Epics Rollup</h2>
-              <button class="btn btn-sm btn-primary" id="btn-quick-epic">+ New Epic</button>
-            </div>
-            <div id="epics-list-container"></div>
-          </div>
-          <div>
-            <div class="view-toolbar">
-              <h2 style="font-size:15px;font-weight:650;">Milestones &amp; Releases</h2>
-            </div>
-            <div class="panel-card">
-              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
-                <div class="form-field" style="flex:1;">
-                  <label>Milestone Name</label>
-                  <input class="input" id="ms-name-input" placeholder="v1.0.0 GA" />
-                </div>
-                <div class="form-field">
-                  <label>Target Date</label>
-                  <input class="input" type="date" id="ms-date-input" />
-                </div>
-                <button class="btn btn-primary" id="btn-create-milestone">Add</button>
-              </div>
-            </div>
-            <div id="milestones-list-container"></div>
-          </div>
-        </div>
-      </section>
-
-      <!-- 6. Dependency DAG Graph -->
-      <section id="view-graph" class="view-panel">
-        <div class="panel-card" style="display:flex;align-items:flex-end;gap:8px;flex-wrap:wrap;">
-          <div class="form-field">
-            <label>Source Issue</label>
-            <input class="input mono" id="graph-src-input" placeholder="ITK-1" style="width:110px;" />
-          </div>
-          <div class="form-field">
-            <label>Relationship</label>
-            <select class="select" id="graph-type-select" style="width:140px;">
-              <option value="blocks">blocks</option>
-              <option value="blocked_by">blocked_by</option>
-              <option value="relates_to">relates_to</option>
-              <option value="duplicates">duplicates</option>
+            Showing <span id="page-summary">0</span> issues |
+            Page Size:
+            <select id="page-size-select">
+              <option value="10">10</option>
+              <option value="25" selected>25</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
             </select>
           </div>
-          <div class="form-field">
-            <label>Target Issue</label>
-            <input class="input mono" id="graph-tgt-input" placeholder="ITK-2" style="width:110px;" />
-          </div>
-          <button class="btn btn-primary" id="btn-graph-add-link">Add Dependency Link</button>
-          <span style="font-size:11.5px;color:var(--text-muted);margin-left:auto;">DAG Cycle Prevention Active (HTTP 409 on circular blocks)</span>
-        </div>
-        <div class="panel-card" style="overflow-x:auto;">
-          <h3 style="font-size:12px;text-transform:uppercase;color:var(--text-muted);margin-bottom:8px;">Directed Blocker &amp; Link Topology (Click any node to inspect)</h3>
-          <div id="graph-svg-container" style="min-height:240px;"></div>
-        </div>
-        <div class="grid-2">
-          <div class="panel-card">
-            <h3 style="font-size:12px;color:var(--danger);text-transform:uppercase;margin-bottom:8px;">Blocked Issues</h3>
-            <div id="graph-blocked-list"></div>
-          </div>
-          <div class="panel-card">
-            <h3 style="font-size:12px;color:var(--ok);text-transform:uppercase;margin-bottom:8px;">Ready (Unblocked) Issues</h3>
-            <div id="graph-ready-list"></div>
+          <div style="display:flex;align-items:center;gap:5px;">
+            <button id="btn-page-first" class="btn btn-sm">&laquo; First</button>
+            <button id="btn-page-prev" class="btn btn-sm">&lsaquo; Prev</button>
+            <span id="pagination-pages" style="display:inline-flex;gap:4px;"></span>
+            <button id="btn-page-next" class="btn btn-sm">Next &rsaquo;</button>
+            <button id="btn-page-last" class="btn btn-sm">Last &raquo;</button>
           </div>
         </div>
       </section>
 
-      <!-- 7. Analytics & Workspace Settings -->
-      <section id="view-stats" class="view-panel">
-        <div class="grid-4" id="stats-kpi-grid"></div>
-        <div class="grid-2">
-          <div class="panel-card">
-            <h3 style="font-size:13px;font-weight:650;margin-bottom:8px;">Breakdown by Status &amp; Priority</h3>
-            <div id="stats-bars-left"></div>
-          </div>
-          <div class="panel-card">
-            <h3 style="font-size:13px;font-weight:650;margin-bottom:8px;">Breakdown by Type &amp; Assignee</h3>
-            <div id="stats-bars-right"></div>
+      <!-- 2. Kanban Board View -->
+      <section id="view-board" class="view-pane">
+        <div class="filters-bar">
+          <label>Swimlane:
+            <select id="board-swimlane-select">
+              <option value="none">None</option>
+              <option value="category">Category</option>
+              <option value="priority">Priority</option>
+              <option value="assignee">Assignee</option>
+              <option value="sprint">Sprint</option>
+            </select>
+          </label>
+          <select id="board-filter-category"><option value="">All Categories</option></select>
+          <select id="board-filter-priority"><option value="">All Priorities</option></select>
+          <input id="board-filter-assignee" type="text" placeholder="Filter Assignee..." style="width:130px" />
+          <select id="board-filter-sprint"><option value="">All Sprints</option></select>
+          <input id="board-filter-q" type="text" placeholder="Filter Board..." style="width:150px" />
+          <button id="btn-refresh-board" class="btn btn-sm">Apply</button>
+        </div>
+        <div id="board-lanes-container"></div>
+      </section>
+
+      <!-- 3. Backlog & Sprints View -->
+      <section id="view-sprints" class="view-pane">
+        <div class="card-panel">
+          <h3 style="margin-top:0">Create Sprint</h3>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <input id="sprint-create-name" type="text" placeholder="Sprint Name (e.g. Sprint 1)" />
+            <input id="sprint-create-goal" type="text" placeholder="Sprint Goal" style="width:240px" />
+            <input id="sprint-create-start" type="date" />
+            <input id="sprint-create-end" type="date" />
+            <button id="btn-create-sprint" class="btn btn-primary">Create Sprint</button>
           </div>
         </div>
-        <div class="grid-2">
-          <div class="panel-card">
-            <h3 style="font-size:13px;font-weight:650;margin-bottom:8px;">Labels &amp; Components</h3>
-            <div style="display:flex;gap:6px;margin-bottom:8px;">
-              <input class="input" id="new-label-name" placeholder="Label name" />
-              <input class="input" type="color" id="new-label-color" value="#3b82f6" style="width:42px;padding:2px;" />
-              <button class="btn btn-sm btn-primary" id="btn-add-label">Add Label</button>
-            </div>
-            <div id="settings-labels-list" class="tag-row" style="margin-bottom:12px;"></div>
-            <div style="display:flex;gap:6px;margin-bottom:8px;">
-              <input class="input" id="new-comp-name" placeholder="Component name" />
-              <input class="input" id="new-comp-lead" placeholder="Lead" style="width:110px;" />
-              <button class="btn btn-sm btn-primary" id="btn-add-comp">Add Component</button>
-            </div>
-            <div id="settings-comps-list" class="tag-row"></div>
-          </div>
+        <div id="sprints-list-container"></div>
+      </section>
 
-          <div class="panel-card">
-            <h3 style="font-size:13px;font-weight:650;margin-bottom:8px;">Users, Agents &amp; Project Index</h3>
-            <div style="display:flex;gap:6px;margin-bottom:8px;align-items:center;">
-              <input class="input" id="new-user-name" placeholder="username / agent-id" />
-              <label style="display:flex;align-items:center;gap:4px;font-size:11.5px;white-space:nowrap;">
-                <input type="checkbox" id="new-user-agent" /> AI Agent
-              </label>
-              <button class="btn btn-sm btn-primary" id="btn-add-user">Register</button>
-            </div>
-            <div id="settings-users-list" class="tag-row" style="margin-bottom:14px;"></div>
-
-            <div style="display:flex;gap:6px;margin-bottom:10px;align-items:flex-end;">
-              <div class="form-field" style="width:95px;">
-                <label>Project Key</label>
-                <input class="input mono" id="cfg-project-key" />
-              </div>
-              <div class="form-field" style="flex:1;">
-                <label>Project Name</label>
-                <input class="input" id="cfg-project-name" />
-              </div>
-              <button class="btn btn-sm" id="btn-save-config">Save Config</button>
-            </div>
-
-            <div style="display:flex;gap:8px;padding-top:8px;border-top:1px solid var(--border-subtle);">
-              <button class="btn btn-sm" id="btn-reindex">&#8635; Rebuild SQLite/FTS5 Index</button>
-              <button class="btn btn-sm" id="btn-export-json">&#8681; Export Bundle JSON</button>
-            </div>
+      <!-- 4. Milestones View -->
+      <section id="view-milestones" class="view-pane">
+        <div class="card-panel">
+          <h3 style="margin-top:0">Create Milestone</h3>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <input id="ms-create-name" type="text" placeholder="Milestone Name (e.g. v2.0 GA)" />
+            <input id="ms-create-desc" type="text" placeholder="Description" style="width:260px" />
+            <input id="ms-create-due" type="date" />
+            <button id="btn-create-milestone" class="btn btn-primary">Create Milestone</button>
           </div>
         </div>
+        <div id="milestones-list-container" class="grid-cards"></div>
+      </section>
+
+      <!-- 5. Saved Views View -->
+      <section id="view-views" class="view-pane">
+        <div class="card-panel" style="display:flex;justify-content:space-between;align-items:center;">
+          <div>
+            <h3 style="margin:0">Named Saved Views</h3>
+            <div style="color:var(--text-muted)">Save frequently used iQL queries, tabs, and sorts.</div>
+          </div>
+          <button id="btn-views-open-save-modal" class="btn btn-primary">+ New Saved View</button>
+        </div>
+        <div id="views-list-container" class="grid-cards"></div>
+      </section>
+
+      <!-- 6. Analytics Dashboard View -->
+      <section id="view-analytics" class="view-pane">
+        <div id="analytics-summary-cards" class="grid-cards" style="margin-bottom:16px;"></div>
+        <div id="analytics-distributions" class="grid-cards"></div>
+      </section>
+
+      <!-- 7. Tags View -->
+      <section id="view-tags" class="view-pane">
+        <div class="card-panel">
+          <h3 style="margin-top:0">Create Colored Tag</h3>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+            <input id="tag-create-name" type="text" placeholder="Tag Name" />
+            <input id="tag-create-color" type="color" value="#3b82f6" style="padding:2px;height:32px;width:48px" />
+            <input id="tag-create-desc" type="text" placeholder="Description" style="width:240px" />
+            <button id="btn-create-tag" class="btn btn-primary">Create Tag</button>
+          </div>
+        </div>
+        <div id="tags-list-container" class="grid-cards"></div>
+      </section>
+
+      <!-- 8. Workspace Settings View -->
+      <section id="view-settings" class="view-pane">
+        <div class="card-panel" style="max-width:640px;">
+          <h3 style="margin-top:0">Workspace Configuration</h3>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+            <label class="meta-row">Project Title <input id="cfg-project-title" type="text" /></label>
+            <label class="meta-row">Project Prefix <input id="cfg-project-prefix" type="text" /></label>
+            <label class="meta-row">Default Category <select id="cfg-default-category"></select></label>
+            <label class="meta-row">Default State <select id="cfg-default-state"></select></label>
+            <label class="meta-row">Default Priority <select id="cfg-default-priority"></select></label>
+            <label class="meta-row">Default Severity <select id="cfg-default-severity"></select></label>
+            <label class="meta-row">In-Progress WIP Limit <input id="cfg-wip-in-progress" type="number" min="0" placeholder="0 = unlimited" /></label>
+            <label class="meta-row">Default Assignee <input id="cfg-default-assignee" type="text" /></label>
+          </div>
+          <div style="margin-top:12px;">
+            <button id="btn-save-settings" class="btn btn-primary">Save Settings</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Permalink Full-Page Issue Container (#/issues/<ref>) -->
+      <section id="view-issue-permalink" class="view-pane">
+        <div style="margin-bottom:10px;">
+          <button id="btn-permalink-back" class="btn btn-sm">&larr; Back to Issues</button>
+        </div>
+        <div id="permalink-detail-mount" class="card-panel" style="padding:0;"></div>
       </section>
     </main>
   </div>
 
-  <!-- Create Issue Modal -->
-  <div class="modal-backdrop" id="create-issue-modal">
+  <!-- Slide-Over Issue Detail Drawer (data-modal="issue-detail") -->
+  <div id="issue-drawer" data-modal="issue-detail">
+    <div class="modal-header">
+      <div style="display:flex;align-items:center;gap:8px;flex:1;min-width:0;">
+        <span id="detail-key-badge" class="badge mono"></span>
+        <input id="detail-title-input" type="text" style="flex:1;font-weight:700;font-size:15px;" />
+        <button id="btn-save-title" class="btn btn-sm">Rename</button>
+      </div>
+      <div style="display:flex;gap:5px;align-items:center;margin-left:8px;">
+        <button id="btn-open-permalink" class="btn btn-sm" title="Open Full-Page Permalink">Permalink</button>
+        <button id="btn-clone-issue" class="btn btn-sm">Clone</button>
+        <button id="btn-copy-context" class="btn btn-sm">Copy Agent Context</button>
+        <button id="btn-archive-issue" class="btn btn-sm">Archive</button>
+        <button id="btn-unarchive-issue" class="btn btn-sm" style="display:none;">Unarchive</button>
+        <button id="btn-delete-issue" class="btn btn-sm btn-danger">Delete</button>
+        <button id="btn-close-drawer" class="btn btn-sm btn-ghost">&#10005;</button>
+      </div>
+    </div>
+    <div id="drawer-detail-body" class="detail-grid">
+      <!-- Left Column -->
+      <div style="min-width:0;display:flex;flex-direction:column;gap:14px;">
+        <div id="detail-status-banners" style="display:flex;gap:6px;flex-wrap:wrap;"></div>
+
+        <!-- Description & Inline Embeds -->
+        <div class="card-panel" style="margin:0;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <strong>Description</strong>
+            <div style="display:flex;gap:5px;">
+              <label class="btn btn-sm" style="cursor:pointer;">
+                + Embed Image <input id="detail-desc-embed-input" type="file" accept="image/*" multiple style="display:none" />
+              </label>
+              <button id="btn-edit-desc" class="btn btn-sm">Edit</button>
+              <button id="btn-clear-desc" class="btn btn-sm">Clear</button>
+            </div>
+          </div>
+          <div id="detail-desc-rendered" class="md-body"></div>
+          <div id="detail-desc-editor" style="display:none;margin-top:8px;">
+            <textarea id="detail-desc-textarea" rows="5" style="width:100%;"></textarea>
+            <div style="display:flex;gap:6px;margin-top:6px;">
+              <button id="btn-save-desc" class="btn btn-sm btn-primary">Save Description</button>
+              <button id="btn-cancel-desc" class="btn btn-sm">Cancel</button>
+            </div>
+          </div>
+          <div id="detail-desc-embeds-bar" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;"></div>
+        </div>
+
+        <!-- Acceptance Criteria -->
+        <div class="card-panel" style="margin:0;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+            <strong>Acceptance Criteria (<span id="detail-ac-summary">0/0</span>)</strong>
+            <button id="btn-clear-ac" class="btn btn-sm">Clear All AC</button>
+          </div>
+          <div class="progress-track" style="margin-bottom:8px;"><div id="detail-ac-progress" class="progress-fill" style="width:0%"></div></div>
+          <div id="detail-ac-list" style="display:flex;flex-direction:column;gap:5px;margin-bottom:8px;"></div>
+          <div style="display:flex;gap:6px;">
+            <input id="detail-ac-input" type="text" placeholder="Add acceptance criterion..." style="flex:1" />
+            <button id="btn-add-ac" class="btn btn-sm btn-primary">Add AC</button>
+          </div>
+        </div>
+
+        <!-- Subtasks & Hierarchy -->
+        <div class="card-panel" style="margin:0;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+            <strong>Subtasks (<span id="detail-subtask-summary">0/0</span>)</strong>
+            <button id="btn-view-tree" class="btn btn-sm">Hierarchy / Dependency Tree</button>
+          </div>
+          <div class="progress-track" style="margin-bottom:8px;"><div id="detail-subtask-progress" class="progress-fill" style="width:0%"></div></div>
+          <div id="detail-subtasks-list" style="display:flex;flex-direction:column;gap:5px;margin-bottom:8px;"></div>
+          <div style="display:flex;gap:6px;">
+            <input id="detail-subtask-input" type="text" placeholder="New subtask title (spaces allowed)..." style="flex:1" />
+            <button id="btn-add-subtask" class="btn btn-sm btn-primary">Add Subtask</button>
+          </div>
+        </div>
+
+        <!-- Links -->
+        <div class="card-panel" style="margin:0;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+            <strong>Linked Issues</strong>
+            <button id="btn-open-link-modal" class="btn btn-sm">+ Link Issue</button>
+          </div>
+          <div id="detail-links-list" style="display:flex;flex-direction:column;gap:5px;"></div>
+        </div>
+
+        <!-- Whole-Issue Attachments -->
+        <div class="card-panel" style="margin:0;">
+          <strong>Whole-Issue Attachments</strong>
+          <div id="detail-attach-dropzone" class="dropzone" style="margin:8px 0;">
+            Drag &amp; drop files here or
+            <label style="color:var(--accent);cursor:pointer;font-weight:600;">
+              browse <input id="detail-attach-input" type="file" multiple style="display:none" />
+            </label>
+          </div>
+          <div id="detail-attachments-list" style="display:flex;flex-direction:column;gap:6px;"></div>
+        </div>
+
+        <!-- Comments & History Tabs -->
+        <div class="card-panel" style="margin:0;">
+          <div style="display:flex;gap:6px;margin-bottom:10px;border-bottom:1px solid var(--border);padding-bottom:8px;">
+            <button id="tab-btn-comments" class="btn btn-sm btn-primary">Comments (<span id="detail-comment-count">0</span>)</button>
+            <button id="tab-btn-history" class="btn btn-sm">History Diffs</button>
+          </div>
+
+          <div id="detail-comments-pane">
+            <!-- Rich Comment Composer -->
+            <div id="cmt-composer-dropzone" style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:12px;background:var(--bg-card);">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:6px;">
+                <div style="display:flex;gap:4px;">
+                  <button id="cmt-tab-write" type="button" class="btn btn-sm btn-primary">Write</button>
+                  <button id="cmt-tab-preview" type="button" class="btn btn-sm">Preview</button>
+                </div>
+                <div style="display:flex;gap:5px;flex-wrap:wrap;">
+                  <label class="btn btn-sm" style="cursor:pointer;">
+                    Embed Image <input id="cmt-embed-input" type="file" accept="image/*" multiple style="display:none" />
+                  </label>
+                  <label class="btn btn-sm" style="cursor:pointer;">
+                    Attach File <input id="cmt-attach-input" type="file" multiple style="display:none" />
+                  </label>
+                  <button id="btn-cmt-link-att" type="button" class="btn btn-sm">Link Existing Issue Attachment</button>
+                </div>
+              </div>
+              <textarea id="cmt-body-input" rows="4" style="width:100%;" placeholder="Write Markdown comment... Paste image (Ctrl+V) or drag &amp; drop files here!"></textarea>
+              <div id="cmt-preview-box" class="md-body" style="display:none;min-height:80px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);"></div>
+              <div id="cmt-staged-bar" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;"></div>
+              <div style="display:flex;justify-content:flex-end;margin-top:8px;">
+                <button id="btn-submit-comment" type="button" class="btn btn-primary">Post Comment</button>
+              </div>
+            </div>
+
+            <div id="detail-comments-list" style="display:flex;flex-direction:column;gap:10px;"></div>
+          </div>
+
+          <div id="detail-history-pane" style="display:none;">
+            <div id="detail-history-list" style="display:flex;flex-direction:column;gap:8px;"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right Metadata Sidebar -->
+      <div class="meta-sidebar">
+        <div class="meta-row"><label>Category</label><select id="detail-category"></select></div>
+        <div class="meta-row"><label>State</label><select id="detail-state"></select></div>
+        <div class="meta-row"><label>Priority</label><select id="detail-priority"></select></div>
+        <div class="meta-row"><label>Severity</label><select id="detail-severity"></select></div>
+        <div class="meta-row">
+          <label>Resolution <button id="btn-clear-resolution" class="btn btn-sm btn-ghost">Clear</button></label>
+          <select id="detail-resolution"><option value="">(Unresolved)</option></select>
+        </div>
+        <div class="meta-row">
+          <label>Assignee <button id="btn-clear-assignee" class="btn btn-sm btn-ghost">Clear</button></label>
+          <input id="detail-assignee" type="text" placeholder="Unassigned" />
+        </div>
+        <div class="meta-row">
+          <label>Reporter <button id="btn-clear-reporter" class="btn btn-sm btn-ghost">Clear</button></label>
+          <input id="detail-reporter" type="text" placeholder="Reporter" />
+        </div>
+        <div class="meta-row">
+          <label>Parent / Epic <button id="btn-clear-parent" class="btn btn-sm btn-ghost">Clear</button></label>
+          <input id="detail-parent" type="text" placeholder="ITR-N or Name" />
+        </div>
+        <div class="meta-row">
+          <label>Sprint <button id="btn-clear-sprint" class="btn btn-sm btn-ghost">Clear</button></label>
+          <select id="detail-sprint"><option value="">(No Sprint)</option></select>
+        </div>
+        <div class="meta-row">
+          <label>Milestone <button id="btn-clear-milestone" class="btn btn-sm btn-ghost">Clear</button></label>
+          <select id="detail-milestone"><option value="">(No Milestone)</option></select>
+        </div>
+        <div class="meta-row">
+          <label>Story Points <button id="btn-clear-points" class="btn btn-sm btn-ghost">Clear</button></label>
+          <input id="detail-points" type="number" step="0.5" min="0" />
+        </div>
+        <div class="meta-row">
+          <label>Estimate (min) <button id="btn-clear-estimate" class="btn btn-sm btn-ghost">Clear</button></label>
+          <input id="detail-estimate" type="number" step="1" min="0" />
+        </div>
+        <div class="meta-row">
+          <label>Due Date <span id="detail-overdue-badge"></span> <button id="btn-clear-due" class="btn btn-sm btn-ghost">Clear</button></label>
+          <input id="detail-due" type="date" />
+        </div>
+        <div class="meta-row">
+          <label>Tags (comma-sep) <button id="btn-clear-tags" class="btn btn-sm btn-ghost">Clear</button></label>
+          <input id="detail-tags" type="text" placeholder="auth, backend" />
+        </div>
+        <div class="meta-row">
+          <label>Components (comma-sep) <button id="btn-clear-components" class="btn btn-sm btn-ghost">Clear</button></label>
+          <input id="detail-components" type="text" placeholder="api, ui" />
+        </div>
+
+        <!-- Custom Fields -->
+        <div class="meta-row" style="border-top:1px solid var(--border);padding-top:8px;">
+          <label>Custom Fields <button id="btn-clear-cf" class="btn btn-sm btn-ghost">Clear All</button></label>
+          <div id="detail-cf-list" style="display:flex;flex-direction:column;gap:4px;"></div>
+          <div style="display:flex;gap:4px;margin-top:4px;">
+            <input id="detail-cf-key" type="text" placeholder="key" style="width:42%" />
+            <input id="detail-cf-val" type="text" placeholder="value" style="width:42%" />
+            <button id="btn-add-cf" class="btn btn-sm">+</button>
+          </div>
+        </div>
+
+        <!-- Time Tracking / Worklogs -->
+        <div class="meta-row" style="border-top:1px solid var(--border);padding-top:8px;">
+          <label>Time Logged (<span id="detail-time-summary">0m</span>) <button id="btn-open-worklog-modal" class="btn btn-sm">+ Log Work</button></label>
+          <div class="progress-track"><div id="detail-time-progress" class="progress-fill" style="width:0%"></div></div>
+          <div id="detail-worklogs-list" style="display:flex;flex-direction:column;gap:4px;margin-top:4px;"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal 1: Create Issue (data-modal="create-issue") -->
+  <div id="modal-create-issue" class="modal-backdrop" data-modal="create-issue">
     <div class="modal-box">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-        <h2 style="font-size:15px;font-weight:650;">Create Issue</h2>
-        <button class="btn btn-sm btn-ghost" id="btn-close-create-modal">&#10005;</button>
+      <div class="modal-header">
+        <span>Create Issue</span>
+        <button class="btn btn-sm btn-ghost" data-close-modal="create-issue">&#10005;</button>
       </div>
-      <form id="form-create-issue">
-        <div class="form-grid">
-          <div class="form-field full">
-            <label for="ci-title">Title *</label>
-            <input class="input" id="ci-title" required placeholder="Concise actionable summary..." />
-          </div>
-          <div class="form-field full">
-            <label for="ci-desc">Description (Markdown)</label>
-            <textarea class="textarea" id="ci-desc" placeholder="Context, acceptance criteria, notes..."></textarea>
-          </div>
-          <div class="form-field">
-            <label for="ci-type">Type</label>
-            <select class="select" id="ci-type"></select>
-          </div>
-          <div class="form-field">
-            <label for="ci-priority">Priority</label>
-            <select class="select" id="ci-priority">
-              <option value="urgent">urgent</option>
-              <option value="high">high</option>
-              <option value="medium" selected>medium</option>
-              <option value="low">low</option>
-              <option value="none">none</option>
-            </select>
-          </div>
-          <div class="form-field">
-            <label for="ci-status">Status</label>
-            <select class="select" id="ci-status"></select>
-          </div>
-          <div class="form-field">
-            <label for="ci-assignee">Assignee</label>
-            <input class="input" id="ci-assignee" placeholder="alice or agent-1" />
-          </div>
-          <div class="form-field">
-            <label for="ci-labels">Labels (comma-separated)</label>
-            <input class="input" id="ci-labels" placeholder="backend, security" />
-          </div>
-          <div class="form-field">
-            <label for="ci-points">Story Points</label>
-            <input class="input" type="number" step="0.5" id="ci-points" placeholder="3" />
-          </div>
-          <div class="form-field">
-            <label for="ci-epic">Epic</label>
-            <select class="select" id="ci-epic"><option value="">None</option></select>
-          </div>
-          <div class="form-field">
-            <label for="ci-sprint">Sprint</label>
-            <select class="select" id="ci-sprint"><option value="">Backlog</option></select>
-          </div>
-          <div class="form-field">
-            <label for="ci-due">Due Date</label>
-            <input class="input" type="date" id="ci-due" />
-          </div>
-          <div class="form-field">
-            <label for="ci-components">Components (CSV)</label>
-            <input class="input" id="ci-components" placeholder="api, ui" />
-          </div>
+      <div class="modal-body" style="display:flex;flex-direction:column;gap:10px;">
+        <label class="meta-row">Issue Name (Spaces &amp; Unicode supported — creates exact folder) *
+          <input id="create-name" type="text" placeholder="e.g. OAuth2 Token Refresh Race Condition" />
+        </label>
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;">
+          <label class="meta-row">Category <select id="create-category"></select></label>
+          <label class="meta-row">Initial State <select id="create-state"></select></label>
+          <label class="meta-row">Priority <select id="create-priority"></select></label>
+          <label class="meta-row">Severity <select id="create-severity"></select></label>
         </div>
-        <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px;">
-          <button type="button" class="btn" id="btn-cancel-create">Cancel</button>
-          <button type="submit" class="btn btn-primary" id="btn-submit-create">Create Issue</button>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">
+          <label class="meta-row">Assignee <input id="create-assignee" type="text" /></label>
+          <label class="meta-row">Parent / Epic <input id="create-parent" type="text" placeholder="ITR-N or Name" /></label>
+          <label class="meta-row">Due Date <input id="create-due" type="date" /></label>
+          <label class="meta-row">Sprint <select id="create-sprint"><option value="">(None)</option></select></label>
+          <label class="meta-row">Milestone <select id="create-milestone"><option value="">(None)</option></select></label>
+          <label class="meta-row">Story Points <input id="create-points" type="number" step="0.5" min="0" /></label>
         </div>
-      </form>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
+          <label class="meta-row">Estimate (min) <input id="create-estimate" type="number" min="0" /></label>
+          <label class="meta-row">Tags (comma-sep) <input id="create-tags" type="text" /></label>
+          <label class="meta-row">Components (comma-sep) <input id="create-components" type="text" /></label>
+        </div>
+        <label class="meta-row">Description (Markdown)
+          <textarea id="create-description" rows="4" placeholder="Rich Markdown description..."></textarea>
+        </label>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <label class="btn btn-sm" style="cursor:pointer;">
+            + Inline Embed Image <input id="create-embed-input" type="file" accept="image/*" multiple style="display:none" />
+          </label>
+          <span id="create-embeds-queued" style="color:var(--text-muted);font-size:12px;"></span>
+        </div>
+        <label class="meta-row">Acceptance Criteria (one per line)
+          <textarea id="create-ac" rows="2" placeholder="Concurrent 401 responses trigger single refresh"></textarea>
+        </label>
+        <label class="meta-row">Custom Fields (key=value per line)
+          <textarea id="create-custom-fields" rows="2" placeholder="env=prod"></textarea>
+        </label>
+        <div id="create-attach-dropzone" class="dropzone">
+          Drag &amp; drop whole-issue attachments or
+          <label style="color:var(--accent);cursor:pointer;font-weight:600;">
+            choose files <input id="create-attach-input" type="file" multiple style="display:none" />
+          </label>
+          <div id="create-attach-queued" style="font-size:12px;margin-top:4px;"></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" data-close-modal="create-issue">Cancel</button>
+        <button id="btn-submit-create-issue" class="btn btn-primary">Create Issue</button>
+      </div>
     </div>
   </div>
 
-  <!-- Command Palette Modal -->
-  <div class="modal-backdrop" id="cmd-palette-modal">
+  <!-- Modal 3: Delete Confirm (data-modal="delete-confirm") -->
+  <div id="modal-delete-confirm" class="modal-backdrop" data-modal="delete-confirm">
+    <div class="modal-box" style="max-width:440px;">
+      <div class="modal-header">
+        <span>Confirm Permanent Delete</span>
+        <button class="btn btn-sm btn-ghost" data-close-modal="delete-confirm">&#10005;</button>
+      </div>
+      <div class="modal-body">
+        <p id="delete-confirm-message">Permanently delete this issue folder and all its attachments &amp; comments?</p>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-cancel-delete" class="btn" data-close-modal="delete-confirm">Cancel</button>
+        <button id="btn-confirm-delete" class="btn btn-danger">Confirm Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal 4: Link Issue & Hierarchy Tree (data-modal="link-issue") -->
+  <div id="modal-link-issue" class="modal-backdrop" data-modal="link-issue">
+    <div class="modal-box" style="max-width:580px;">
+      <div class="modal-header">
+        <span>Link Issue &amp; Dependency / Hierarchy Tree</span>
+        <button class="btn btn-sm btn-ghost" data-close-modal="link-issue">&#10005;</button>
+      </div>
+      <div class="modal-body" style="display:flex;flex-direction:column;gap:12px;">
+        <div id="link-form-row" style="display:flex;gap:8px;flex-wrap:wrap;">
+          <select id="link-modal-type">
+            <option value="blocks">blocks</option>
+            <option value="blocked-by">blocked-by</option>
+            <option value="relates-to">relates-to</option>
+            <option value="duplicates">duplicates</option>
+            <option value="parent-of">parent-of</option>
+            <option value="clones">clones</option>
+          </select>
+          <input id="link-modal-target" type="text" placeholder="Target Key (ITR-2) or Exact Issue Name" style="flex:1" />
+          <button id="btn-submit-link" class="btn btn-primary">Add Link</button>
+        </div>
+        <div>
+          <strong>Hierarchy &amp; Dependency Tree</strong>
+          <pre id="modal-tree-hierarchy" style="background:var(--bg-input);padding:10px;border-radius:6px;border:1px solid var(--border);max-height:280px;overflow:auto;margin-top:6px;"></pre>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" data-close-modal="link-issue">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal 5: Log Work (data-modal="log-work") -->
+  <div id="modal-log-work" class="modal-backdrop" data-modal="log-work">
+    <div class="modal-box" style="max-width:460px;">
+      <div class="modal-header">
+        <span>Log Work</span>
+        <button class="btn btn-sm btn-ghost" data-close-modal="log-work">&#10005;</button>
+      </div>
+      <div class="modal-body" style="display:flex;flex-direction:column;gap:10px;">
+        <label class="meta-row">Duration (e.g. 90, 1h 30m, 45m)
+          <input id="worklog-modal-duration" type="text" placeholder="1h 30m" />
+        </label>
+        <label class="meta-row">Note
+          <input id="worklog-modal-note" type="text" placeholder="Investigated root cause" />
+        </label>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" data-close-modal="log-work">Cancel</button>
+        <button id="btn-submit-worklog" class="btn btn-primary">Log Time</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal 6: Sprint Rollover (data-modal="sprint-rollover") -->
+  <div id="modal-sprint-rollover" class="modal-backdrop" data-modal="sprint-rollover">
     <div class="modal-box" style="max-width:480px;">
-      <input class="input" id="cmd-palette-input" placeholder="Jump to issue key, view, or command..." />
-      <div id="cmd-palette-results" style="margin-top:10px;display:flex;flex-direction:column;gap:4px;max-height:320px;overflow-y:auto;"></div>
+      <div class="modal-header">
+        <span>Complete Sprint &amp; Rollover Incomplete Issues</span>
+        <button class="btn btn-sm btn-ghost" data-close-modal="sprint-rollover">&#10005;</button>
+      </div>
+      <div class="modal-body" style="display:flex;flex-direction:column;gap:10px;">
+        <p id="rollover-modal-info" style="margin:0;"></p>
+        <label class="meta-row">Move incomplete issues to:
+          <select id="rollover-target-select"><option value="">Backlog (No Sprint)</option></select>
+        </label>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" data-close-modal="sprint-rollover">Cancel</button>
+        <button id="btn-confirm-sprint-complete" class="btn btn-primary">Complete Sprint</button>
+      </div>
     </div>
   </div>
 
-  <!-- Slide-Over Issue Detail Drawer -->
-  <div class="drawer-backdrop" id="issue-drawer-backdrop">
-    <aside id="issue-drawer" aria-label="Issue Detail Drawer">
-      <div class="drawer-header">
-        <div style="display:flex;align-items:center;gap:8px;">
-          <span class="mono" style="font-weight:700;font-size:14px;" id="dr-key">ITK-1</span>
-          <span class="tag tag-blocked" id="dr-blocked-badge" style="display:none;">BLOCKED</span>
-          <span class="tag tag-claimed" id="dr-claimed-badge" style="display:none;"></span>
-        </div>
-        <div style="display:flex;align-items:center;gap:6px;">
-          <button class="btn btn-sm" id="dr-btn-claim">Claim</button>
-          <button class="btn btn-sm" id="dr-btn-release" style="display:none;">Release</button>
-          <button class="btn btn-sm" id="dr-btn-clone">Clone</button>
-          <button class="btn btn-sm btn-danger" id="dr-btn-delete">Delete</button>
-          <button class="btn btn-sm btn-ghost" id="dr-btn-close">&#10005;</button>
+  <!-- Modal 7: Image Lightbox (data-modal="image-lightbox") -->
+  <div id="modal-image-lightbox" class="modal-backdrop" data-modal="image-lightbox">
+    <div class="modal-box" style="max-width:88vw;">
+      <div class="modal-header">
+        <span id="lightbox-title">Image Preview</span>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <a id="lightbox-download-link" class="btn btn-sm" href="#" download>Download</a>
+          <button class="btn btn-sm btn-ghost" data-close-modal="image-lightbox">&#10005;</button>
         </div>
       </div>
-
-      <div class="drawer-body">
-        <!-- Left Column: Title, Description, Subtasks, Links, Attachments, Comments, Worklogs, History -->
-        <div>
-          <input class="input" id="dr-title" style="font-size:16px;font-weight:650;margin-bottom:8px;" />
-          <textarea class="textarea" id="dr-desc" placeholder="Add Markdown description..." style="min-height:92px;"></textarea>
-          <div style="display:flex;justify-content:flex-end;margin-top:6px;">
-            <button class="btn btn-sm btn-primary" id="dr-btn-save-text">Save Title &amp; Description</button>
-          </div>
-
-          <!-- Subtasks -->
-          <div class="drawer-section">
-            <h3>Subtasks (<span id="dr-subtasks-count">0/0</span>)</h3>
-            <div id="dr-subtasks-list" style="margin-bottom:8px;"></div>
-            <div style="display:flex;gap:6px;">
-              <input class="input" id="dr-subtask-title" placeholder="Add subtask..." />
-              <button class="btn btn-sm" id="dr-btn-add-subtask">Add</button>
-            </div>
-          </div>
-
-          <!-- Links & Blockers -->
-          <div class="drawer-section">
-            <h3>Links &amp; Dependencies</h3>
-            <div id="dr-links-list" style="margin-bottom:8px;"></div>
-            <div style="display:flex;gap:6px;">
-              <select class="select" id="dr-link-type" style="width:130px;">
-                <option value="blocks">blocks</option>
-                <option value="blocked_by">blocked_by</option>
-                <option value="relates_to">relates_to</option>
-                <option value="duplicates">duplicates</option>
-              </select>
-              <input class="input mono" id="dr-link-target" placeholder="Target key (e.g. ITK-2)" />
-              <button class="btn btn-sm" id="dr-btn-add-link">Link</button>
-            </div>
-          </div>
-
-          <!-- Multipart File Attachments -->
-          <div class="drawer-section">
-            <h3>Attachments</h3>
-            <div id="dr-attachments-list" style="margin-bottom:8px;"></div>
-            <div style="display:flex;gap:6px;align-items:center;">
-              <input type="file" class="input" id="attachment-file-input" style="padding:3px;" />
-              <button class="btn btn-sm" id="dr-btn-upload-att">Upload</button>
-            </div>
-          </div>
-
-          <!-- Comments -->
-          <div class="drawer-section">
-            <h3>Comments</h3>
-            <div id="dr-comments-list"></div>
-            <textarea class="textarea" id="comment-body-input" placeholder="Write a comment..." style="min-height:60px;margin-top:6px;"></textarea>
-            <div style="display:flex;justify-content:flex-end;margin-top:6px;">
-              <button class="btn btn-sm btn-primary" id="btn-add-comment">Post Comment</button>
-            </div>
-          </div>
-
-          <!-- Worklogs -->
-          <div class="drawer-section">
-            <h3>Worklogs (<span id="dr-worklog-total">0m</span>)</h3>
-            <div id="dr-worklogs-list" style="margin-bottom:6px;"></div>
-            <div style="display:flex;gap:6px;">
-              <input class="input mono" id="worklog-duration-input" placeholder="e.g. 1h 30m" style="width:120px;" />
-              <input class="input" id="worklog-note-input" placeholder="Work note..." />
-              <button class="btn btn-sm" id="dr-btn-add-worklog">Log Time</button>
-            </div>
-          </div>
-
-          <!-- Audit History -->
-          <div class="drawer-section">
-            <h3>Audit History</h3>
-            <div id="dr-history-list" style="font-size:11.5px;color:var(--text-secondary);"></div>
-          </div>
-        </div>
-
-        <!-- Right Metadata Sidebar inside Drawer -->
-        <div>
-          <div class="meta-prop">
-            <label>Status</label>
-            <select class="select" id="dr-status"></select>
-          </div>
-          <div class="meta-prop">
-            <label>Priority</label>
-            <select class="select" id="dr-priority">
-              <option value="urgent">urgent</option>
-              <option value="high">high</option>
-              <option value="medium">medium</option>
-              <option value="low">low</option>
-              <option value="none">none</option>
-            </select>
-          </div>
-          <div class="meta-prop">
-            <label>Type</label>
-            <select class="select" id="dr-type"></select>
-          </div>
-          <div class="meta-prop">
-            <label>Assignee</label>
-            <input class="input" id="dr-assignee" placeholder="Unassigned" />
-          </div>
-          <div class="meta-prop">
-            <label>Story Points</label>
-            <input class="input" type="number" step="0.5" id="dr-points" />
-          </div>
-          <div class="meta-prop">
-            <label>Sprint</label>
-            <select class="select" id="dr-sprint"><option value="">Backlog</option></select>
-          </div>
-          <div class="meta-prop">
-            <label>Epic</label>
-            <select class="select" id="dr-epic"><option value="">None</option></select>
-          </div>
-          <div class="meta-prop">
-            <label>Milestone</label>
-            <select class="select" id="dr-milestone"><option value="">None</option></select>
-          </div>
-          <div class="meta-prop">
-            <label>Due Date</label>
-            <input class="input" type="date" id="dr-due" />
-          </div>
-          <div class="meta-prop">
-            <label>Labels (CSV)</label>
-            <input class="input" id="dr-labels" placeholder="tag1, tag2" />
-          </div>
-          <div class="meta-prop">
-            <label>Components (CSV)</label>
-            <input class="input" id="dr-components" placeholder="backend, cli" />
-          </div>
-          <div style="font-size:11px;color:var(--text-muted);margin-top:12px;" id="dr-timestamps"></div>
-        </div>
+      <div class="modal-body" style="text-align:center;background:var(--bg-input);">
+        <img id="lightbox-img" src="" alt="Preview" style="max-width:100%;max-height:74vh;border-radius:6px;" />
       </div>
-    </aside>
+    </div>
   </div>
 
-  <div class="toast-stack" id="toast-stack"></div>
+  <!-- Modal 8: Attachment Text/Code Preview (data-modal="attachment-preview") -->
+  <div id="modal-attachment-preview" class="modal-backdrop" data-modal="attachment-preview">
+    <div class="modal-box" style="max-width:740px;">
+      <div class="modal-header">
+        <span id="att-preview-title">Attachment Preview</span>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <a id="att-preview-download" class="btn btn-sm" href="#" download>Download</a>
+          <button class="btn btn-sm btn-ghost" data-close-modal="attachment-preview">&#10005;</button>
+        </div>
+      </div>
+      <div class="modal-body">
+        <div id="att-preview-meta" style="color:var(--text-muted);font-size:12px;margin-bottom:8px;"></div>
+        <pre id="att-preview-content" style="background:var(--bg-input);padding:12px;border-radius:6px;border:1px solid var(--border);max-height:60vh;overflow:auto;white-space:pre-wrap;"></pre>
+      </div>
+    </div>
+  </div>
 
-  <script>
-    const state = {
-      view: 'board',
-      iql: '',
-      boardSprint: '',
-      boardAssignee: '',
-      config: null,
-      issues: [],
-      board: null,
-      sprints: [],
-      epics: [],
-      milestones: [],
-      views: [],
-      labels: [],
-      components: [],
-      users: [],
+  <!-- Modal 9: Link Existing Issue Attachment Picker (data-modal="link-attachment") -->
+  <div id="modal-link-attachment" class="modal-backdrop" data-modal="link-attachment">
+    <div class="modal-box" style="max-width:500px;">
+      <div class="modal-header">
+        <span>Link Existing Issue Attachment</span>
+        <button class="btn btn-sm btn-ghost" data-close-modal="link-attachment">&#10005;</button>
+      </div>
+      <div class="modal-body">
+        <div id="link-att-picker-list" style="display:flex;flex-direction:column;gap:6px;"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" data-close-modal="link-attachment">Cancel</button>
+        <button id="btn-confirm-link-att" class="btn btn-primary">Link Selected</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal 10: Save Named View (data-modal="save-view") -->
+  <div id="modal-save-view" class="modal-backdrop" data-modal="save-view">
+    <div class="modal-box" style="max-width:480px;">
+      <div class="modal-header">
+        <span>Save Named View</span>
+        <button class="btn btn-sm btn-ghost" data-close-modal="save-view">&#10005;</button>
+      </div>
+      <div class="modal-body" style="display:flex;flex-direction:column;gap:10px;">
+        <label class="meta-row">View Name * <input id="save-view-name" type="text" placeholder="Critical Auth Bugs" /></label>
+        <label class="meta-row">iQL Query <input id="save-view-query" type="text" placeholder="priority = critical AND category = bug" /></label>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+          <label class="meta-row">Preset Tab <select id="save-view-tab"></select></label>
+          <label class="meta-row">Description <input id="save-view-desc" type="text" /></label>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" data-close-modal="save-view">Cancel</button>
+        <button id="btn-submit-save-view" class="btn btn-primary">Save View</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast-container"></div>
+"""
+
+SPA_HTML += r"""  <script>
+  (function() {
+    'use strict';
+
+    // Telemetry hook for 100% UI Coverage Gate
+    window.__itrackTelemetry = { views: new Set(), modals: new Set(), actions: new Set() };
+    window.getItrackTelemetry = function() {
+      return {
+        views: Array.from(window.__itrackTelemetry.views),
+        modals: Array.from(window.__itrackTelemetry.modals),
+        actions: Array.from(window.__itrackTelemetry.actions),
+      };
+    };
+
+    const CATEGORIES = ['epic','story','task','subtask','bug','feature','improvement','refactor','spike','incident','security','chore','docs'];
+    const STATES = ['triage','backlog','todo','ready','in-progress','in-review','in-qa','on-hold','blocked','done','cancelled','archived'];
+    const PRIORITIES = ['critical','high','medium','low','trivial'];
+    const SEVERITIES = ['sev1','sev2','sev3','sev4','sev5'];
+    const RESOLUTIONS = ['fixed','wont-fix','duplicate','cannot-reproduce','by-design','obsolete'];
+    const PRESET_TABS = ['active','open','in-progress','blocked','completed','cancelled','archived','all'];
+
+    const appState = {
+      currentView: 'issues',
+      tab: 'all',
+      sort: 'key',
+      order: 'asc',
+      page: 1,
+      pageSize: 25,
       selectedKeys: new Set(),
       activeIssue: null,
+      permalinkMode: false,
+      sprints: [],
+      milestones: [],
+      tags: [],
+      views: [],
+      config: {},
+      createEmbedFiles: [],
+      createAttachFiles: [],
+      cmtEmbedFiles: [],
+      cmtAttachFiles: [],
+      cmtLinkedIds: [],
+      pendingRolloverSprintId: null,
+      suppressHashHandler: false,
     };
 
     const $ = (id) => document.getElementById(id);
 
-    function esc(s) {
-      return String(s ?? '').replace(/[&<>"']/g, (c) => ({
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-      }[c]));
+    function esc(val) {
+      return String(val === null || val === undefined ? '' : val)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
     }
 
-    function toast(msg, isErr = false) {
+    function toast(msg, isError) {
+      const box = $('toast-container');
       const el = document.createElement('div');
-      el.className = 'toast' + (isErr ? ' err' : '');
+      el.className = 'toast' + (isError ? ' toast-error' : '');
       el.textContent = msg;
-      $('toast-stack').appendChild(el);
-      setTimeout(() => el.remove(), 3400);
+      box.appendChild(el);
+      setTimeout(() => { if (el.parentNode) el.parentNode.removeChild(el); }, 3600);
     }
 
-    async function api(path, opts = {}) {
-      const headers = Object.assign({}, opts.headers || {});
-      if (opts.body && !(opts.body instanceof FormData) && typeof opts.body === 'object') {
-        headers['Content-Type'] = 'application/json';
-        opts.body = JSON.stringify(opts.body);
+    async function api(url, opts) {
+      const options = Object.assign({ method: 'GET', headers: {} }, opts || {});
+      if (options.body && !(options.body instanceof FormData) && typeof options.body === 'object') {
+        options.headers['Content-Type'] = 'application/json';
+        options.body = JSON.stringify(options.body);
       }
-      const resp = await fetch(path, Object.assign({}, opts, { headers }));
-      const data = await resp.json().catch(() => ({}));
+      const resp = await fetch(url, options);
       if (!resp.ok) {
-        throw new Error(data.detail || `HTTP ${resp.status}`);
-      }
-      return data;
-    }
-
-    // Theme Management
-    function initTheme() {
-      const saved = localStorage.getItem('itrack_theme') || 'dark';
-      document.documentElement.setAttribute('data-theme', saved);
-    }
-    $('btn-theme-toggle').addEventListener('click', () => {
-      const cur = document.documentElement.getAttribute('data-theme') || 'dark';
-      const nxt = cur === 'dark' ? 'light' : 'dark';
-      document.documentElement.setAttribute('data-theme', nxt);
-      localStorage.setItem('itrack_theme', nxt);
-    });
-
-    // Navigation
-    function switchView(v) {
-      state.view = v;
-      document.querySelectorAll('.nav-btn[data-view]').forEach((b) => {
-        b.classList.toggle('active', b.dataset.view === v);
-      });
-      document.querySelectorAll('.view-panel').forEach((p) => {
-        p.classList.toggle('active', p.id === `view-${v}`);
-      });
-      refreshCurrentView();
-    }
-    document.querySelectorAll('.nav-btn[data-view]').forEach((btn) => {
-      btn.addEventListener('click', () => switchView(btn.dataset.view));
-    });
-
-    // Live iQL Validation & Execution
-    let iqlTimer = null;
-    $('global-iql-input').addEventListener('input', (e) => {
-      const val = e.target.value.trim();
-      clearTimeout(iqlTimer);
-      if (!val) {
-        $('iql-status-badge').className = 'status-badge idle';
-        $('iql-status-badge').textContent = 'All Issues';
-        return;
-      }
-      iqlTimer = setTimeout(async () => {
+        let errMsg = `HTTP ${resp.status}`;
         try {
-          const res = await api('/api/v1/iql/validate', { method: 'POST', body: { iql: val } });
-          if (res.valid) {
-            $('iql-status-badge').className = 'status-badge valid';
-            $('iql-status-badge').textContent = 'Valid iQL';
-          } else {
-            $('iql-status-badge').className = 'status-badge invalid';
-            $('iql-status-badge').textContent = 'Syntax Err';
-            $('iql-status-badge').title = res.error || '';
+          const data = await resp.json();
+          if (data && data.detail) {
+            errMsg = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail);
           }
         } catch (_) {}
-      }, 180);
-    });
+        throw new Error(errMsg);
+      }
+      const ct = resp.headers.get('content-type') || '';
+      if (ct.includes('application/json')) return await resp.json();
+      return await resp.text();
+    }
 
-    $('global-iql-input').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
+    function populateSelect(sel, values, includeEmptyLabel) {
+      if (!sel) return;
+      const cur = sel.value;
+      let html = includeEmptyLabel !== undefined ? `<option value="">${esc(includeEmptyLabel)}</option>` : '';
+      values.forEach((v) => {
+        const val = typeof v === 'object' ? v.value : v;
+        const lbl = typeof v === 'object' ? v.label : v;
+        html += `<option value="${esc(val)}">${esc(lbl)}</option>`;
+      });
+      if (sel.innerHTML !== html) {
+        sel.innerHTML = html;
+        if (cur) sel.value = cur;
+      }
+    }
+
+    // ----------------------------------------------------------------------
+    // Strict XSS-Safe Rich Markdown Renderer
+    // ----------------------------------------------------------------------
+    function sanitizeHref(rawUrl) {
+      const decoded = String(rawUrl || '').trim();
+      const low = decoded.toLowerCase().replace(/\s+/g, '');
+      if (low.startsWith('javascript:') || low.startsWith('vbscript:') || low.startsWith('data:text/html')) {
+        return '#';
+      }
+      if (/^(https?:\/\/|mailto:|\/|#)/i.test(decoded)) return decoded;
+      return '#';
+    }
+
+    function renderInlineMarkdown(escapedLine, issueCtx) {
+      const codeSpans = [];
+      let s = escapedLine.replace(/`([^`]+)`/g, (_, code) => {
+        const idx = codeSpans.length;
+        codeSpans.push(`<code>${code}</code>`);
+        return `\x00CODE${idx}\x00`;
+      });
+
+      const deletedMap = (issueCtx && issueCtx.deleted_attachments) ? issueCtx.deleted_attachments : {};
+      const issueKey = (issueCtx && issueCtx.key) ? issueCtx.key : '';
+      const stagedMap = (issueCtx && issueCtx.stagedEmbedUrls) ? issueCtx.stagedEmbedUrls : {};
+
+      // Inline images: ![alt](attachment://ATT-X) or ![alt](embed:name)
+      s = s.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt, rawTarget) => {
+        const tgt = rawTarget.replace(/&amp;/g, '&').trim();
+        if (tgt.toLowerCase().startsWith('attachment://')) {
+          const attId = tgt.slice('attachment://'.length).trim().toUpperCase();
+          if (deletedMap[attId]) {
+            const fn = esc(deletedMap[attId].filename || attId);
+            return `<span class="deleted-att-badge" data-att-id="${esc(attId)}">[Deleted attachment: ${fn}]</span>`;
+          }
+          if (issueKey) {
+            const dlUrl = `/api/v1/issues/${encodeURIComponent(issueKey)}/attachments/${encodeURIComponent(attId)}/download`;
+            return `<img class="md-inline-embed" src="${dlUrl}" alt="${alt}" data-att-id="${esc(attId)}" data-full-src="${dlUrl}" />`;
+          }
+        }
+        if (tgt.toLowerCase().startsWith('embed:')) {
+          const fn = tgt.slice('embed:'.length);
+          if (stagedMap[fn]) {
+            return `<img class="md-inline-embed" src="${stagedMap[fn]}" alt="${alt || esc(fn)}" />`;
+          }
+          return `<span class="badge">[Staged embed: ${esc(fn)}]</span>`;
+        }
+        const safeSrc = sanitizeHref(tgt);
+        if (safeSrc === '#') return `[Image: ${alt}]`;
+        return `<img class="md-inline-embed" src="${esc(safeSrc)}" alt="${alt}" data-full-src="${esc(safeSrc)}" />`;
+      });
+
+      // Links: [label](attachment://ATT-X) or [label](url)
+      s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, rawTarget) => {
+        const tgt = rawTarget.replace(/&amp;/g, '&').trim();
+        if (tgt.toLowerCase().startsWith('attachment://')) {
+          const attId = tgt.slice('attachment://'.length).trim().toUpperCase();
+          if (deletedMap[attId]) {
+            const fn = esc(deletedMap[attId].filename || attId);
+            return `<span class="deleted-att-badge" data-att-id="${esc(attId)}">[Deleted attachment: ${fn}]</span>`;
+          }
+          if (issueKey) {
+            const dlUrl = `/api/v1/issues/${encodeURIComponent(issueKey)}/attachments/${encodeURIComponent(attId)}/download`;
+            return `<a href="${dlUrl}" class="md-att-link" data-att-id="${esc(attId)}" download>${label}</a>`;
+          }
+        }
+        const safeHref = sanitizeHref(tgt);
+        return `<a href="${esc(safeHref)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+      });
+
+      s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+      s = s.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+      s = s.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?:;]|$)/g, '$1<em>$2</em>');
+
+      // #ITR-N clickable mentions
+      s = s.replace(/(^|[\s(])#([A-Za-z][A-Za-z0-9]*-\d+)\b/g, (_, pre, ref) => {
+        const up = ref.toUpperCase();
+        return `${pre}<a href="#/issues/${encodeURIComponent(up)}" class="md-issue-mention" data-issue-ref="${esc(up)}">#${esc(up)}</a>`;
+      });
+
+      s = s.replace(/\x00CODE(\d+)\x00/g, (_, idx) => codeSpans[Number(idx)]);
+      return s;
+    }
+
+    function renderMarkdown(rawText, issueCtx) {
+      if (!rawText) return '<span style="color:var(--text-muted)">No content.</span>';
+      // Step 1: Escape ALL raw HTML first to neutralize <script>, onerror=, etc.
+      const escaped = esc(String(rawText).replace(/\r\n/g, '\n'));
+
+      // Step 2: Extract fenced code blocks
+      const codeBlocks = [];
+      const withFences = escaped.replace(/```([A-Za-z0-9_-]*)\n([\s\S]*?)```/g, (_, lang, body) => {
+        const idx = codeBlocks.length;
+        codeBlocks.push(`<pre><code class="lang-${lang}">${body}</code></pre>`);
+        return `\n@@FENCE_${idx}@@\n`;
+      });
+
+      const lines = withFences.split('\n');
+      const out = [];
+      let i = 0;
+      while (i < lines.length) {
+        const line = lines[i];
+        const trimmed = line.trim();
+        if (!trimmed) { i++; continue; }
+
+        const fenceMatch = trimmed.match(/^@@FENCE_(\d+)@@$/);
+        if (fenceMatch) {
+          out.push(codeBlocks[Number(fenceMatch[1])]);
+          i++;
+          continue;
+        }
+
+        const hMatch = line.match(/^(#{1,6})\s+(.+)$/);
+        if (hMatch) {
+          const lvl = hMatch[1].length;
+          out.push(`<h${lvl} style="margin:8px 0 4px;">${renderInlineMarkdown(hMatch[2], issueCtx)}</h${lvl}>`);
+          i++;
+          continue;
+        }
+
+        if (/^---+$/.test(trimmed)) {
+          out.push('<hr style="border:none;border-top:1px solid var(--border);margin:8px 0;" />');
+          i++;
+          continue;
+        }
+
+        if (trimmed.startsWith('&gt;')) {
+          const qLines = [];
+          while (i < lines.length && lines[i].trim().startsWith('&gt;')) {
+            qLines.push(renderInlineMarkdown(lines[i].trim().replace(/^&gt;\s?/, ''), issueCtx));
+            i++;
+          }
+          out.push(`<blockquote>${qLines.join('<br/>')}</blockquote>`);
+          continue;
+        }
+
+        // Markdown Table
+        if (trimmed.includes('|') && i + 1 < lines.length && /^\s*\|?[\s:-]+\|[\s|:-]*$/.test(lines[i + 1])) {
+          const parseCells = (rowStr) => rowStr.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
+          const headers = parseCells(lines[i]);
+          i += 2;
+          const rows = [];
+          while (i < lines.length && lines[i].trim().includes('|')) {
+            rows.push(parseCells(lines[i]));
+            i++;
+          }
+          const thHtml = headers.map((h) => `<th>${renderInlineMarkdown(h, issueCtx)}</th>`).join('');
+          const tbHtml = rows.map((r) => `<tr>${r.map((c) => `<td>${renderInlineMarkdown(c, issueCtx)}</td>`).join('')}</tr>`).join('');
+          out.push(`<table><thead><tr>${thHtml}</tr></thead><tbody>${tbHtml}</tbody></table>`);
+          continue;
+        }
+
+        // Lists & Task Checklists
+        if (/^\s*([-*]|\d+\.)\s+/.test(line)) {
+          const ordered = /^\s*\d+\.\s+/.test(line);
+          const tag = ordered ? 'ol' : 'ul';
+          const items = [];
+          while (i < lines.length && /^\s*([-*]|\d+\.)\s+/.test(lines[i])) {
+            const content = lines[i].replace(/^\s*([-*]|\d+\.)\s+/, '');
+            const chk = content.match(/^\[([xX ])\]\s+(.*)$/);
+            if (chk) {
+              const checked = chk[1].toLowerCase() === 'x' ? 'checked' : '';
+              items.push(`<li class="md-task-item" style="list-style:none;"><label><input type="checkbox" class="md-task-checkbox" ${checked} /> ${renderInlineMarkdown(chk[2], issueCtx)}</label></li>`);
+            } else {
+              items.push(`<li>${renderInlineMarkdown(content, issueCtx)}</li>`);
+            }
+            i++;
+          }
+          out.push(`<${tag} style="margin:6px 0;padding-left:20px;">${items.join('')}</${tag}>`);
+          continue;
+        }
+
+        out.push(`<p style="margin:5px 0;">${renderInlineMarkdown(line, issueCtx)}</p>`);
+        i++;
+      }
+      return out.join('\n');
+    }
+
+    // Delegate clicks on inline images & #ITR-N mentions anywhere in document
+    document.addEventListener('click', (e) => {
+      const img = e.target.closest('.md-inline-embed');
+      if (img && img.getAttribute('src')) {
         e.preventDefault();
-        runGlobalIQL();
-      }
-    });
-    $('btn-run-iql').addEventListener('click', runGlobalIQL);
-
-    async function runGlobalIQL() {
-      state.iql = $('global-iql-input').value.trim();
-      if (state.view !== 'board' && state.view !== 'list') {
-        switchView('list');
-      } else {
-        await refreshCurrentView();
-      }
-    }
-
-    $('btn-save-view').addEventListener('click', async () => {
-      const iql = $('global-iql-input').value.trim();
-      const name = prompt('Saved View Name:', iql ? `Filter: ${iql.slice(0, 24)}` : 'All Open');
-      if (!name) return;
-      try {
-        await api('/api/v1/views', {
-          method: 'POST',
-          body: { name, iql, layout: state.view === 'board' ? 'board' : 'list' }
-        });
-        toast(`Saved view "${name}"`);
-        await loadWorkspaceMeta();
-      } catch (err) {
-        toast(err.message, true);
-      }
-    });
-
-    async function loadWorkspaceMeta() {
-      const [cfg, health, sprintsRes, epicsRes, msRes, viewsRes, labelsRes, compsRes, usersRes, readyRes, statsRes] = await Promise.all([
-        api('/api/v1/config'),
-        api('/api/v1/health'),
-        api('/api/v1/sprints'),
-        api('/api/v1/epics'),
-        api('/api/v1/milestones'),
-        api('/api/v1/views'),
-        api('/api/v1/labels'),
-        api('/api/v1/components'),
-        api('/api/v1/users'),
-        api('/api/v1/issues/ready?limit=200'),
-        api('/api/v1/stats'),
-      ]);
-      state.config = cfg;
-      state.sprints = sprintsRes.sprints || [];
-      state.epics = epicsRes.epics || [];
-      state.milestones = msRes.milestones || [];
-      state.views = viewsRes.views || [];
-      state.labels = labelsRes.labels || [];
-      state.components = compsRes.components || [];
-      state.users = usersRes.users || [];
-
-      $('workspace-project-name').textContent = cfg.project_name || 'itrack';
-      $('workspace-project-key').textContent = cfg.project_key || 'ITK';
-      $('daemon-status-line').textContent = `PID ${health.pid} · :${health.port}`;
-      $('cnt-ready').textContent = readyRes.total ?? 0;
-      $('cnt-sprints').textContent = state.sprints.length;
-      $('cnt-epics').textContent = state.epics.length;
-      $('cnt-blocked').textContent = statsRes.blocked_count ?? 0;
-
-      populateSelectOptions();
-      renderSavedViews();
-    }
-
-    function populateSelectOptions() {
-      if (!state.config) return;
-      const statuses = state.config.statuses || [];
-      const types = state.config.issue_types || [];
-
-      const statusHtml = statuses.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
-      $('ci-status').innerHTML = statusHtml;
-      $('ci-status').value = statuses.includes('todo') ? 'todo' : statuses[0];
-      $('dr-status').innerHTML = statusHtml;
-      $('bulk-status-select').innerHTML = `<option value="">Status...</option>` + statusHtml;
-
-      const typeHtml = types.map((t) => `<option value="${esc(t)}">${esc(t)}</option>`).join('');
-      $('ci-type').innerHTML = typeHtml;
-      $('ci-type').value = state.config.default_type || 'task';
-      $('dr-type').innerHTML = typeHtml;
-
-      const epicOpts = `<option value="">None</option>` + state.epics.map((e) => `<option value="${esc(e.issue.key)}">${esc(e.issue.key)} — ${esc(e.issue.title)}</option>`).join('');
-      $('ci-epic').innerHTML = epicOpts;
-      $('dr-epic').innerHTML = epicOpts;
-
-      const sprintOpts = `<option value="">Backlog</option>` + state.sprints.map((s) => `<option value="${esc(s.id)}">${esc(s.id)}: ${esc(s.name)} (${esc(s.state)})</option>`).join('');
-      $('ci-sprint').innerHTML = sprintOpts;
-      $('dr-sprint').innerHTML = sprintOpts;
-      $('bulk-sprint-select').innerHTML = `<option value="">Sprint...</option><option value="backlog">Backlog</option>` + state.sprints.map((s) => `<option value="${esc(s.id)}">${esc(s.id)}: ${esc(s.name)}</option>`).join('');
-
-      const msOpts = `<option value="">None</option>` + state.milestones.map((m) => `<option value="${esc(m.id)}">${esc(m.id)}: ${esc(m.name)}</option>`).join('');
-      $('dr-milestone').innerHTML = msOpts;
-    }
-
-    function renderSavedViews() {
-      const box = $('saved-views-list');
-      if (!state.views.length) {
-        box.innerHTML = `<div style="padding:4px 8px;font-size:11.5px;color:var(--text-muted);">No saved views yet</div>`;
+        openImageLightbox(img.getAttribute('src'), img.getAttribute('alt') || 'Embedded Image');
         return;
       }
-      box.innerHTML = state.views.map((v) => `
-        <div class="saved-view-item" data-vid="${esc(v.id)}">
-          <span class="sv-run" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(v.name)}</span>
-          <button class="btn btn-sm btn-ghost sv-del" title="Delete view" style="padding:0 4px;">&#10005;</button>
-        </div>
+      const mention = e.target.closest('.md-issue-mention');
+      if (mention && mention.dataset.issueRef) {
+        e.preventDefault();
+        openIssueDetail(mention.dataset.issueRef, { fullPage: false });
+      }
+    });
+
+    // ----------------------------------------------------------------------
+    // Modals & Theme Management
+    // ----------------------------------------------------------------------
+    function openModal(name) {
+      window.__itrackTelemetry.modals.add(name);
+      const el = document.querySelector(`[data-modal="${name}"]`);
+      if (el) el.classList.add('open');
+    }
+
+    function closeModal(name) {
+      const el = document.querySelector(`[data-modal="${name}"]`);
+      if (el) el.classList.remove('open');
+    }
+
+    document.querySelectorAll('[data-close-modal]').forEach((btn) => {
+      btn.addEventListener('click', () => closeModal(btn.dataset.closeModal));
+    });
+    document.querySelectorAll('.modal-backdrop').forEach((bd) => {
+      bd.addEventListener('click', (e) => {
+        if (e.target === bd) bd.classList.remove('open');
+      });
+    });
+
+    function openImageLightbox(src, title) {
+      $('lightbox-img').src = src;
+      $('lightbox-title').textContent = title || 'Image Preview';
+      $('lightbox-download-link').href = src;
+      openModal('image-lightbox');
+    }
+
+    function applyTheme(theme) {
+      const t = theme === 'light' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', t);
+      localStorage.setItem('itrack_theme', t);
+      $('btn-theme-toggle').textContent = t === 'dark' ? 'Light Mode' : 'Dark Mode';
+    }
+
+    function initTheme() {
+      const saved = localStorage.getItem('itrack_theme') || 'dark';
+      applyTheme(saved);
+    }
+
+    $('btn-theme-toggle').addEventListener('click', () => {
+      const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+      applyTheme(cur === 'dark' ? 'light' : 'dark');
+    });
+
+    $('btn-toggle-sidebar').addEventListener('click', () => {
+      $('sidebar').classList.toggle('collapsed');
+    });
+
+    $('btn-reindex').addEventListener('click', async () => {
+      try {
+        const res = await api('/api/v1/reindex', { method: 'POST' });
+        toast(`Reindexed ${res.indexed_issues} issues (${res.duration_ms} ms)`);
+        await refreshMetadataAndCurrentView();
+      } catch (err) { toast(err.message, true); }
+    });
+
+    // ----------------------------------------------------------------------
+    // Metadata Sync & Navigation Views (All 8 Views + Permalink Routing)
+    // ----------------------------------------------------------------------
+    async function loadReferenceData() {
+      const [cfg, tagsRes, spRes, msRes, vwRes] = await Promise.all([
+        api('/api/v1/config'),
+        api('/api/v1/tags'),
+        api('/api/v1/sprints'),
+        api('/api/v1/milestones'),
+        api('/api/v1/views'),
+      ]);
+      appState.config = cfg;
+      appState.tags = tagsRes.tags || [];
+      appState.sprints = spRes.sprints || [];
+      appState.milestones = msRes.milestones || [];
+      appState.views = vwRes.views || [];
+
+      $('brand-title').textContent = cfg.project_title || 'iTrack';
+
+      const spOpts = appState.sprints.map((s) => ({ value: s.id, label: `${s.id} — ${s.name}` }));
+      const msOpts = appState.milestones.map((m) => ({ value: m.id, label: `${m.id} — ${m.name}` }));
+      const tagOpts = appState.tags.map((t) => ({ value: t.name, label: t.name }));
+
+      populateSelect($('filter-category'), CATEGORIES, 'All Categories');
+      populateSelect($('filter-state'), STATES, 'All States');
+      populateSelect($('filter-priority'), PRIORITIES, 'All Priorities');
+      populateSelect($('filter-severity'), SEVERITIES, 'All Severities');
+      populateSelect($('filter-tag'), tagOpts, 'All Tags');
+      populateSelect($('filter-sprint'), spOpts, 'All Sprints');
+      populateSelect($('filter-milestone'), msOpts, 'All Milestones');
+
+      populateSelect($('bulk-state'), STATES, 'Set State...');
+      populateSelect($('bulk-priority'), PRIORITIES, 'Set Priority...');
+      populateSelect($('bulk-sprint'), [{ value: 'none', label: '(Clear Sprint)' }, ...spOpts], 'Assign Sprint...');
+
+      populateSelect($('board-filter-category'), CATEGORIES, 'All Categories');
+      populateSelect($('board-filter-priority'), PRIORITIES, 'All Priorities');
+      populateSelect($('board-filter-sprint'), spOpts, 'All Sprints');
+
+      populateSelect($('create-category'), CATEGORIES);
+      populateSelect($('create-state'), STATES);
+      populateSelect($('create-priority'), PRIORITIES);
+      populateSelect($('create-severity'), SEVERITIES);
+      populateSelect($('create-sprint'), spOpts, '(None)');
+      populateSelect($('create-milestone'), msOpts, '(None)');
+
+      populateSelect($('detail-category'), CATEGORIES);
+      populateSelect($('detail-state'), STATES);
+      populateSelect($('detail-priority'), PRIORITIES);
+      populateSelect($('detail-severity'), SEVERITIES);
+      populateSelect($('detail-resolution'), RESOLUTIONS, '(Unresolved)');
+      populateSelect($('detail-sprint'), spOpts, '(No Sprint)');
+      populateSelect($('detail-milestone'), msOpts, '(No Milestone)');
+
+      populateSelect($('cfg-default-category'), CATEGORIES);
+      populateSelect($('cfg-default-state'), STATES);
+      populateSelect($('cfg-default-priority'), PRIORITIES);
+      populateSelect($('cfg-default-severity'), SEVERITIES);
+      populateSelect($('save-view-tab'), PRESET_TABS);
+
+      renderSidebarViews();
+    }
+
+    function renderSidebarViews() {
+      const box = $('sidebar-saved-views');
+      if (!appState.views.length) {
+        box.innerHTML = '<div style="padding:4px 10px;color:var(--text-muted);font-size:12px;">No saved views</div>';
+        return;
+      }
+      box.innerHTML = appState.views.map((v) => `
+        <button class="nav-item sidebar-view-btn" data-view-id="${esc(v.id)}" title="${esc(v.query)}">
+          <span>&#9733;</span><span class="nav-label">${esc(v.name)}</span>
+        </button>
       `).join('');
-      box.querySelectorAll('.saved-view-item').forEach((row) => {
-        const v = state.views.find((x) => x.id === row.dataset.vid);
-        row.querySelector('.sv-run').addEventListener('click', () => {
-          $('global-iql-input').value = v.iql || '';
-          state.iql = v.iql || '';
-          switchView(v.layout === 'board' ? 'board' : 'list');
-        });
-        row.querySelector('.sv-del').addEventListener('click', async (e) => {
-          e.stopPropagation();
-          await api(`/api/v1/views/${v.id}`, { method: 'DELETE' });
-          await loadWorkspaceMeta();
-        });
+      box.querySelectorAll('.sidebar-view-btn').forEach((b) => {
+        b.addEventListener('click', () => executeSavedView(b.dataset.viewId));
       });
     }
 
-    async function refreshCurrentView() {
+    async function switchView(viewName, updateHash) {
+      if (updateHash === undefined) updateHash = true;
+      appState.currentView = viewName;
+      appState.permalinkMode = false;
+      $('issue-drawer').style.inset = '';
+      $('issue-drawer').style.width = '';
+      if ($('view-issue-permalink').classList.contains('active')) {
+        $('issue-drawer').classList.remove('open');
+      }
+
+      window.__itrackTelemetry.views.add(viewName);
+      document.querySelectorAll('.nav-item[data-view]').forEach((b) => {
+        b.classList.toggle('active', b.dataset.view === viewName);
+      });
+      document.querySelectorAll('.view-pane').forEach((p) => {
+        p.classList.toggle('active', p.id === `view-${viewName}`);
+      });
+
+      if (updateHash) {
+        const targetHash = `#/views/${viewName}`;
+        if (location.hash !== targetHash) {
+          appState.suppressHashHandler = true;
+          location.hash = targetHash;
+          setTimeout(() => { appState.suppressHashHandler = false; }, 0);
+        }
+      }
+      await renderActiveView();
+    }
+
+    async function renderActiveView() {
+      const v = appState.currentView;
+      if (v === 'issues') await loadIssuesList();
+      else if (v === 'board') await loadKanbanBoard();
+      else if (v === 'sprints') await renderSprintsView();
+      else if (v === 'milestones') await renderMilestonesView();
+      else if (v === 'views') await renderSavedViewsView();
+      else if (v === 'analytics') await renderAnalyticsView();
+      else if (v === 'tags') await renderTagsView();
+      else if (v === 'settings') renderSettingsView();
+    }
+
+    async function refreshMetadataAndCurrentView() {
+      await loadReferenceData();
+      if (appState.permalinkMode && appState.activeIssue) {
+        await openIssueDetail(appState.activeIssue.key, { fullPage: true, skipHash: true });
+      } else {
+        await renderActiveView();
+        if (appState.activeIssue && $('issue-drawer').classList.contains('open')) {
+          await openIssueDetail(appState.activeIssue.key, { fullPage: false, skipHash: true });
+        }
+      }
+    }
+
+    document.querySelectorAll('.nav-item[data-view]').forEach((btn) => {
+      btn.addEventListener('click', () => switchView(btn.dataset.view, true));
+    });
+
+    // ----------------------------------------------------------------------
+    // View 1: Issues List, Filters, Search, Sorting, Pagination & Bulk Bar
+    // ----------------------------------------------------------------------
+    let issuesListLoadSeq = 0;
+    async function loadIssuesList() {
+      const seq = ++issuesListLoadSeq;
+      const params = new URLSearchParams();
+      params.set('tab', appState.tab);
+      params.set('page', String(appState.page));
+      params.set('page_size', String(appState.pageSize));
+      params.set('sort', appState.sort);
+      params.set('order', appState.order);
+
+      const q = $('global-search-input').value.trim();
+      if (q) params.set('q', q);
+
+      const fMap = [
+        ['category', $('filter-category').value],
+        ['state', $('filter-state').value],
+        ['priority', $('filter-priority').value],
+        ['severity', $('filter-severity').value],
+        ['assignee', $('filter-assignee').value.trim()],
+        ['tag', $('filter-tag').value],
+        ['sprint', $('filter-sprint').value],
+        ['milestone', $('filter-milestone').value],
+      ];
+      fMap.forEach(([k, val]) => { if (val) params.set(k, val); });
+      if ($('filter-overdue').checked) params.set('overdue', 'true');
+
       try {
-        await loadWorkspaceMeta();
-        if (state.view === 'board') await renderBoardView();
-        else if (state.view === 'list') await renderListView();
-        else if (state.view === 'ready') await renderReadyView();
-        else if (state.view === 'sprints') await renderSprintsView();
-        else if (state.view === 'epics') await renderEpicsView();
-        else if (state.view === 'graph') await renderGraphView();
-        else if (state.view === 'stats') await renderStatsView();
+        const res = await api(`/api/v1/issues?${params.toString()}`);
+        if (seq !== issuesListLoadSeq) return;
+        renderIssuesTable(res);
       } catch (err) {
         toast(err.message, true);
       }
     }
 
-    // 1. Kanban Board View
-    async function renderBoardView() {
-      const params = new URLSearchParams();
-      if (state.iql) params.set('iql', state.iql);
-      if (state.boardSprint) params.set('sprint_id', state.boardSprint);
-      if (state.boardAssignee) params.set('assignee', state.boardAssignee);
-      const data = await api(`/api/v1/board?${params.toString()}`);
-      state.board = data;
-      $('cnt-board').textContent = data.total_issues;
-      $('cnt-list').textContent = data.total_issues;
-
-      // Filter pills
-      const pills = [];
-      pills.push(`<button class="pill ${!state.boardSprint ? 'active' : ''}" data-sp="">All Sprints</button>`);
-      const hasActive = state.sprints.some((s) => s.state === 'active');
-      if (hasActive) {
-        pills.push(`<button class="pill ${state.boardSprint === 'active' ? 'active' : ''}" data-sp="active">Active Sprint</button>`);
-      }
-      state.sprints.filter((s) => s.state !== 'completed').forEach((s) => {
-        pills.push(`<button class="pill ${state.boardSprint === s.id ? 'active' : ''}" data-sp="${esc(s.id)}">${esc(s.name)}</button>`);
-      });
-      $('board-filter-pills').innerHTML = pills.join('');
-      $('board-filter-pills').querySelectorAll('.pill').forEach((p) => {
-        p.addEventListener('click', () => {
-          state.boardSprint = p.dataset.sp;
-          renderBoardView();
-        });
-      });
-
-      const colsEl = $('board-columns');
-      colsEl.innerHTML = data.columns.map((col) => {
-        const wipWarn = col.wip_limit && col.count > col.wip_limit ? 'style="color:var(--danger);font-weight:700;"' : '';
+    function renderIssuesTable(res) {
+      const issues = res.issues || [];
+      const tbody = $('issues-tbody');
+      $('issues-empty-state').style.display = issues.length === 0 ? 'block' : 'none';
+      tbody.innerHTML = issues.map((iss) => {
+        const checked = appState.selectedKeys.has(iss.key) ? 'checked' : '';
+        const badges = [];
+        if (iss.is_blocked) badges.push('<span class="badge badge-blocked">blocked</span>');
+        if (iss.is_overdue) badges.push('<span class="badge badge-overdue">overdue</span>');
+        (iss.tags || []).forEach((tg) => badges.push(`<span class="badge">${esc(tg)}</span>`));
         return `
-          <div class="board-col" data-status="${esc(col.status)}">
-            <div class="board-col-header">
-              <div class="col-title-wrap">
-                <span class="status-dot dot-${esc(col.status)}"></span>
-                <span>${esc(col.status.replace('_', ' '))}</span>
-                <span class="nav-count" ${wipWarn}>${col.count}${col.wip_limit ? '/' + col.wip_limit : ''}</span>
-              </div>
-              <div style="display:flex;align-items:center;gap:6px;">
-                ${col.points ? `<span style="font-size:11px;color:var(--text-muted);">${col.points}pt</span>` : ''}
-                <button class="btn btn-sm btn-ghost col-quick-add" data-status="${esc(col.status)}" title="Create issue in ${esc(col.status)}" style="padding:1px 6px;">+</button>
-              </div>
-            </div>
-            <div class="board-cards" data-status="${esc(col.status)}">
-              ${col.issues.map((iss) => `
-                <article class="issue-card" draggable="true" data-key="${esc(iss.key)}">
-                  <div class="card-top">
-                    <span class="mono">${esc(iss.key)}</span>
-                    <span class="prio-badge prio-${esc(iss.priority)}">${esc(iss.priority)}</span>
-                  </div>
-                  <div class="card-title">${esc(iss.title)}</div>
-                  <div class="card-meta">
-                    <div class="tag-row">
-                      <span class="tag">${esc(iss.type)}</span>
-                      ${iss.is_blocked ? `<span class="tag tag-blocked">Blocked</span>` : ''}
-                      ${iss.claimed_by ? `<span class="tag tag-claimed">@${esc(iss.claimed_by)}</span>` : ''}
-                      ${(iss.labels || []).slice(0, 2).map((lb) => `<span class="tag">${esc(lb)}</span>`).join('')}
-                    </div>
-                    <span style="font-size:11px;color:var(--text-secondary);">${[iss.assignee ? esc(iss.assignee) : '', iss.story_points != null ? `${iss.story_points}p` : ''].filter(Boolean).join(' · ')}</span>
-                  </div>
-                </article>
-              `).join('')}
-            </div>
-          </div>
+          <tr class="issue-row" data-key="${esc(iss.key)}">
+            <td><input type="checkbox" class="issue-row-check" data-key="${esc(iss.key)}" ${checked} /></td>
+            <td class="mono"><a href="#/issues/${encodeURIComponent(iss.key)}" class="issue-open-link" data-key="${esc(iss.key)}">${esc(iss.key)}</a></td>
+            <td>
+              <a href="#/issues/${encodeURIComponent(iss.key)}" class="issue-open-link" data-key="${esc(iss.key)}" style="color:var(--text-main);font-weight:600;">${esc(iss.name)}</a>
+              ${badges.length ? `<div style="display:inline-flex;gap:4px;margin-left:6px;">${badges.join('')}</div>` : ''}
+            </td>
+            <td><span class="badge">${esc(iss.category)}</span></td>
+            <td><span class="badge ${iss.state === 'done' ? 'badge-done' : ''}">${esc(iss.state)}</span></td>
+            <td class="prio-${esc(iss.priority)}">${esc(iss.priority)}</td>
+            <td>${esc(iss.severity)}</td>
+            <td>${esc(iss.assignee || '—')}</td>
+            <td class="mono">${iss.story_points !== null && iss.story_points !== undefined ? esc(iss.story_points) : '—'}</td>
+            <td class="mono">${esc(iss.due_date || '—')}</td>
+            <td class="mono" style="font-size:11px;color:var(--text-muted)">${esc((iss.updated_at || '').slice(0, 10))}</td>
+          </tr>
         `;
       }).join('');
 
-      colsEl.querySelectorAll('.col-quick-add').forEach((btn) => {
-        btn.addEventListener('click', () => openCreateModal({ status: btn.dataset.status }));
-      });
-      colsEl.querySelectorAll('.issue-card').forEach((card) => {
-        card.addEventListener('click', () => openIssueDrawer(card.dataset.key));
-        card.addEventListener('dragstart', (e) => {
-          e.dataTransfer.setData('text/plain', card.dataset.key);
-        });
-      });
-      colsEl.querySelectorAll('.board-col').forEach((colEl) => {
-        colEl.addEventListener('dragover', (e) => {
+      tbody.querySelectorAll('.issue-open-link').forEach((a) => {
+        a.addEventListener('click', (e) => {
           e.preventDefault();
-          colEl.classList.add('drag-over');
-        });
-        colEl.addEventListener('dragleave', () => colEl.classList.remove('drag-over'));
-        colEl.addEventListener('drop', async (e) => {
-          e.preventDefault();
-          colEl.classList.remove('drag-over');
-          const key = e.dataTransfer.getData('text/plain');
-          const targetStatus = colEl.dataset.status;
-          if (!key || !targetStatus) return;
-          try {
-            await api(`/api/v1/issues/${key}/transition`, {
-              method: 'POST',
-              body: { status: targetStatus }
-            });
-            await renderBoardView();
-          } catch (err) {
-            toast(err.message, true);
-          }
+          openIssueDetail(a.dataset.key, { fullPage: false });
         });
       });
-    }
 
-    // 2. Linear List & Bulk Triage View
-    async function renderListView(ftsQuery = '') {
-      const params = new URLSearchParams();
-      if (state.iql) params.set('iql', state.iql);
-      if (ftsQuery) params.set('q', ftsQuery);
-      params.set('limit', '500');
-      const res = await api(`/api/v1/issues?${params.toString()}`);
-      state.issues = res.issues || [];
-      $('cnt-list').textContent = res.total;
-      $('list-summary-count').textContent = `${res.total} issue${res.total === 1 ? '' : 's'}${state.iql ? ` matching iQL` : ''}`;
+      tbody.querySelectorAll('.issue-row-check').forEach((cb) => {
+        cb.addEventListener('change', () => {
+          if (cb.checked) appState.selectedKeys.add(cb.dataset.key);
+          else appState.selectedKeys.delete(cb.dataset.key);
+          updateBulkBar();
+        });
+      });
 
-      const tbody = $('list-tbody');
-      if (!state.issues.length) {
-        tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--text-muted);padding:26px;">No matching issues. Press <b>c</b> to create one.</td></tr>`;
-      } else {
-        tbody.innerHTML = state.issues.map((iss) => `
-          <tr data-key="${esc(iss.key)}">
-            <td class="td-chk"><input type="checkbox" class="row-chk" data-key="${esc(iss.key)}" ${state.selectedKeys.has(iss.key) ? 'checked' : ''} /></td>
-            <td class="mono" style="font-weight:600;">${esc(iss.key)}</td>
-            <td><span class="prio-badge prio-${esc(iss.priority)}">${esc(iss.priority)}</span></td>
-            <td>
-              <span style="font-weight:550;">${esc(iss.title)}</span>
-              ${iss.is_blocked ? `<span class="tag tag-blocked" style="margin-left:6px;">Blocked</span>` : ''}
-              ${(iss.labels || []).map((l) => `<span class="tag" style="margin-left:4px;">${esc(l)}</span>`).join('')}
-            </td>
-            <td><span class="status-dot dot-${esc(iss.status)}" style="margin-right:5px;"></span>${esc(iss.status)}</td>
-            <td><span class="tag">${esc(iss.type)}</span></td>
-            <td style="color:var(--text-secondary);">${esc(iss.assignee || '—')}</td>
-            <td class="mono">${iss.story_points != null ? iss.story_points : '—'}</td>
-          </tr>
-        `).join('');
+      $('page-summary').textContent = `${issues.length} of ${res.total} (Page ${res.page}/${res.total_pages})`;
+      $('btn-page-first').disabled = !res.has_prev;
+      $('btn-page-prev').disabled = !res.has_prev;
+      $('btn-page-next').disabled = !res.has_next;
+      $('btn-page-last').disabled = !res.has_next;
+      $('btn-page-last').dataset.totalPages = String(res.total_pages);
+
+      const pBox = $('pagination-pages');
+      const pagesHtml = [];
+      const maxP = Math.min(res.total_pages, 7);
+      for (let p = 1; p <= maxP; p++) {
+        pagesHtml.push(`<button class="btn btn-sm page-num-btn ${p === res.page ? 'btn-primary' : ''}" data-page="${p}">${p}</button>`);
       }
-
-      tbody.querySelectorAll('tr[data-key]').forEach((tr) => {
-        tr.addEventListener('click', (e) => {
-          if (e.target.classList.contains('row-chk') || e.target.closest('.td-chk')) return;
-          openIssueDrawer(tr.dataset.key);
-        });
+      pBox.innerHTML = pagesHtml.join('');
+      pBox.querySelectorAll('.page-num-btn').forEach((b) => {
+        b.addEventListener('click', () => { appState.page = Number(b.dataset.page); loadIssuesList(); });
       });
-      tbody.querySelectorAll('.row-chk').forEach((chk) => {
-        chk.addEventListener('change', () => {
-          if (chk.checked) state.selectedKeys.add(chk.dataset.key);
-          else state.selectedKeys.delete(chk.dataset.key);
-          syncBulkBar();
-        });
-      });
-      syncBulkBar();
+      updateBulkBar();
     }
 
-    $('list-select-all').addEventListener('change', (e) => {
-      if (e.target.checked) state.issues.forEach((i) => state.selectedKeys.add(i.key));
-      else state.selectedKeys.clear();
-      renderListView($('list-fts-input').value.trim());
-    });
-    $('btn-list-fts').addEventListener('click', () => renderListView($('list-fts-input').value.trim()));
-    $('list-fts-input').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') renderListView($('list-fts-input').value.trim());
-    });
-
-    function syncBulkBar() {
-      const n = state.selectedKeys.size;
-      $('bulk-selected-count').textContent = `${n} selected`;
-      $('bulk-action-bar').classList.toggle('visible', n > 0 && state.view === 'list');
+    function updateBulkBar() {
+      const cnt = appState.selectedKeys.size;
+      $('bulk-selected-count').textContent = String(cnt);
+      $('bulk-action-bar').classList.toggle('open', cnt > 0);
     }
 
-    async function runBulk(action, fields = {}) {
-      const keys = Array.from(state.selectedKeys);
+    $('check-all-issues').addEventListener('change', (e) => {
+      const checked = e.target.checked;
+      document.querySelectorAll('.issue-row-check').forEach((cb) => {
+        cb.checked = checked;
+        if (checked) appState.selectedKeys.add(cb.dataset.key);
+        else appState.selectedKeys.delete(cb.dataset.key);
+      });
+      updateBulkBar();
+    });
+
+    $('issues-preset-tabs').querySelectorAll('.tab-chip').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        appState.tab = btn.dataset.tab;
+        appState.page = 1;
+        $('issues-preset-tabs').querySelectorAll('.tab-chip').forEach((b) => b.classList.toggle('active', b === btn));
+        loadIssuesList();
+      });
+    });
+
+    ['filter-category','filter-state','filter-priority','filter-severity','filter-tag','filter-sprint','filter-milestone','filter-overdue'].forEach((id) => {
+      $(id).addEventListener('change', () => { appState.page = 1; loadIssuesList(); });
+    });
+    $('filter-assignee').addEventListener('change', () => { appState.page = 1; loadIssuesList(); });
+
+    function clearAllListFilters() {
+      $('global-search-input').value = '';
+      ['filter-category','filter-state','filter-priority','filter-severity','filter-assignee','filter-tag','filter-sprint','filter-milestone'].forEach((id) => { $(id).value = ''; });
+      $('filter-overdue').checked = false;
+      appState.tab = 'all';
+      appState.page = 1;
+      $('issues-preset-tabs').querySelectorAll('.tab-chip').forEach((b) => b.classList.toggle('active', b.dataset.tab === 'all'));
+      loadIssuesList();
+    }
+    $('btn-clear-filters').addEventListener('click', clearAllListFilters);
+    $('btn-empty-clear-filters').addEventListener('click', clearAllListFilters);
+
+    $('btn-run-search').addEventListener('click', async () => {
+      const q = $('global-search-input').value.trim();
+      appState.page = 1;
+      if (appState.currentView !== 'issues') await switchView('issues');
+      if (q) {
+        try {
+          const res = await api(`/api/v1/search?q=${encodeURIComponent(q)}&page=1&page_size=${appState.pageSize}&sort=${appState.sort}&order=${appState.order}`);
+          renderIssuesTable(res);
+        } catch (err) { toast(err.message, true); }
+      } else {
+        await loadIssuesList();
+      }
+    });
+    $('global-search-input').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') $('btn-run-search').click();
+    });
+
+    document.querySelectorAll('table.issues-table th[data-sort]').forEach((th) => {
+      th.addEventListener('click', () => {
+        const sf = th.dataset.sort;
+        if (appState.sort === sf) appState.order = appState.order === 'asc' ? 'desc' : 'asc';
+        else { appState.sort = sf; appState.order = 'asc'; }
+        loadIssuesList();
+      });
+    });
+
+    $('page-size-select').addEventListener('change', (e) => {
+      appState.pageSize = Number(e.target.value);
+      appState.page = 1;
+      loadIssuesList();
+    });
+    $('btn-page-first').addEventListener('click', () => { appState.page = 1; loadIssuesList(); });
+    $('btn-page-prev').addEventListener('click', () => { if (appState.page > 1) { appState.page--; loadIssuesList(); } });
+    $('btn-page-next').addEventListener('click', () => { appState.page++; loadIssuesList(); });
+    $('btn-page-last').addEventListener('click', (e) => {
+      appState.page = Number(e.currentTarget.dataset.totalPages || 1);
+      loadIssuesList();
+    });
+
+    $('btn-bulk-apply').addEventListener('click', async () => {
+      const keys = Array.from(appState.selectedKeys);
+      if (!keys.length) return;
+      const updates = {};
+      if ($('bulk-state').value) updates.state = $('bulk-state').value;
+      if ($('bulk-priority').value) updates.priority = $('bulk-priority').value;
+      if ($('bulk-assignee').value.trim()) updates.assignee = $('bulk-assignee').value.trim();
+      if ($('bulk-tag').value.trim()) updates.add_tags = [$('bulk-tag').value.trim()];
+      if ($('bulk-sprint').value) {
+        if ($('bulk-sprint').value === 'none') updates.clear_sprint = true;
+        else updates.sprint = $('bulk-sprint').value;
+      }
+      if (!Object.keys(updates).length) return toast('Select at least one bulk field update', true);
+      try {
+        await api('/api/v1/bulk/update', { method: 'POST', body: { issues: keys, updates } });
+        appState.selectedKeys.clear();
+        $('check-all-issues').checked = false;
+        $('bulk-state').value = ''; $('bulk-priority').value = ''; $('bulk-assignee').value = ''; $('bulk-tag').value = ''; $('bulk-sprint').value = '';
+        toast(`Updated ${keys.length} issues`);
+        await refreshMetadataAndCurrentView();
+      } catch (err) { toast(err.message, true); }
+    });
+
+    $('btn-bulk-archive').addEventListener('click', async () => {
+      const keys = Array.from(appState.selectedKeys);
       if (!keys.length) return;
       try {
-        await api('/api/v1/issues/bulk', { method: 'POST', body: { keys, action, fields } });
-        state.selectedKeys.clear();
-        $('list-select-all').checked = false;
-        toast(`Bulk ${action} applied to ${keys.length} issue(s)`);
-        await renderListView();
-      } catch (err) {
-        toast(err.message, true);
-      }
-    }
-    $('btn-bulk-transition').addEventListener('click', () => {
-      const st = $('bulk-status-select').value;
-      if (st) runBulk('transition', { status: st, force: true });
-    });
-    $('btn-bulk-priority').addEventListener('click', () => {
-      const p = $('bulk-priority-select').value;
-      if (p) runBulk('update', { priority: p });
-    });
-    $('btn-bulk-assign').addEventListener('click', () => {
-      runBulk('update', { assignee: $('bulk-assignee-input').value.trim() || null });
-    });
-    $('btn-bulk-label').addEventListener('click', () => {
-      const lb = $('bulk-label-input').value.trim();
-      if (lb) runBulk('label_add', { label: lb });
-    });
-    $('btn-bulk-sprint').addEventListener('click', () => {
-      const sp = $('bulk-sprint-select').value;
-      if (sp) runBulk('sprint', { sprint_id: sp === 'backlog' ? null : sp });
-    });
-    $('btn-bulk-delete').addEventListener('click', () => {
-      if (confirm(`Delete ${state.selectedKeys.size} selected issue(s)?`)) runBulk('delete');
+        await api('/api/v1/bulk/update', { method: 'POST', body: { issues: keys, updates: { archive: true } } });
+        appState.selectedKeys.clear();
+        toast(`Archived ${keys.length} issues`);
+        await loadIssuesList();
+      } catch (err) { toast(err.message, true); }
     });
 
-    // 3. Ready Queue View
-    async function renderReadyView() {
-      const [readyRes, claimedRes] = await Promise.all([
-        api('/api/v1/issues/ready?limit=100'),
-        api('/api/v1/issues?iql=' + encodeURIComponent('status = in_progress ORDER BY updated DESC')),
-      ]);
-      const readyList = readyRes.issues || [];
-      const activeList = claimedRes.issues || [];
-      $('cnt-ready').textContent = readyRes.total;
+    $('btn-bulk-delete').addEventListener('click', async () => {
+      const keys = Array.from(appState.selectedKeys);
+      if (!keys.length) return;
+      try {
+        await api('/api/v1/bulk/delete', { method: 'POST', body: { issues: keys } });
+        appState.selectedKeys.clear();
+        $('check-all-issues').checked = false;
+        toast(`Deleted ${keys.length} issues`);
+        await refreshMetadataAndCurrentView();
+      } catch (err) { toast(err.message, true); }
+    });
 
-      const rBox = $('ready-queue-cards');
-      rBox.innerHTML = readyList.length ? readyList.map((iss) => `
-        <div class="panel-card" style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
-          <div style="cursor:pointer;flex:1;" data-open="${esc(iss.key)}">
-            <div style="display:flex;gap:6px;align-items:center;margin-bottom:3px;">
-              <span class="mono" style="font-weight:700;">${esc(iss.key)}</span>
-              <span class="prio-badge prio-${esc(iss.priority)}">${esc(iss.priority)}</span>
-              <span class="tag">${esc(iss.type)}</span>
+    // ----------------------------------------------------------------------
+    // View 2: Kanban Board (5 Swimlanes + Real Card Drag-and-Drop)
+    // ----------------------------------------------------------------------
+    let boardLoadSeq = 0;
+    async function loadKanbanBoard() {
+      const seq = ++boardLoadSeq;
+      const params = new URLSearchParams();
+      params.set('swimlane', $('board-swimlane-select').value || 'none');
+      if ($('board-filter-category').value) params.set('category', $('board-filter-category').value);
+      if ($('board-filter-priority').value) params.set('priority', $('board-filter-priority').value);
+      if ($('board-filter-assignee').value.trim()) params.set('assignee', $('board-filter-assignee').value.trim());
+      if ($('board-filter-sprint').value) params.set('sprint', $('board-filter-sprint').value);
+      if ($('board-filter-q').value.trim()) params.set('q', $('board-filter-q').value.trim());
+
+      try {
+        const data = await api(`/api/v1/board?${params.toString()}`);
+        if (seq !== boardLoadSeq) return;
+        const container = $('board-lanes-container');
+        container.innerHTML = (data.lanes || []).map((lane) => `
+          <div class="swimlane-block" data-lane="${esc(lane.key)}">
+            ${data.swimlane !== 'none' ? `<div class="swimlane-header"><span>${esc(lane.label)}</span><span class="badge">${lane.count}</span></div>` : ''}
+            <div class="kanban-row">
+              ${lane.columns.map((col) => {
+                const wipBadge = col.wip_limit ? `${col.count}/${col.wip_limit}` : `${col.count}`;
+                return `
+                  <div class="kanban-column" data-state="${esc(col.state)}">
+                    <div class="kanban-col-head ${col.wip_exceeded ? 'wip-exceeded' : ''}">
+                      <span>${esc(col.state)}</span>
+                      <span class="badge ${col.wip_exceeded ? 'badge-overdue' : ''}">${wipBadge}</span>
+                    </div>
+                    <div class="kanban-cards" data-drop-state="${esc(col.state)}">
+                      ${col.issues.map((iss) => `
+                        <div class="kanban-card" draggable="true" data-key="${esc(iss.key)}">
+                          <div style="display:flex;justify-content:space-between;align-items:center;">
+                            <span class="mono" style="font-size:11px;color:var(--text-muted)">${esc(iss.key)}</span>
+                            <span class="prio-${esc(iss.priority)}" style="font-size:11px">${esc(iss.priority)}</span>
+                          </div>
+                          <div style="font-weight:600;">${esc(iss.name)}</div>
+                          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted);">
+                            <span>${esc(iss.category)}</span>
+                            <span>${esc(iss.assignee || 'unassigned')}</span>
+                          </div>
+                        </div>
+                      `).join('')}
+                    </div>
+                  </div>
+                `;
+              }).join('')}
             </div>
-            <div style="font-weight:550;">${esc(iss.title)}</div>
           </div>
-          <button class="btn btn-sm btn-primary btn-claim-row" data-key="${esc(iss.key)}">Claim</button>
-        </div>
-      `).join('') : `<div class="panel-card" style="color:var(--text-muted);">Queue empty — all open tasks are either claimed or blocked.</div>`;
+        `).join('');
 
-      const cBox = $('claimed-active-cards');
-      cBox.innerHTML = activeList.length ? activeList.map((iss) => `
-        <div class="panel-card" style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
-          <div style="cursor:pointer;flex:1;" data-open="${esc(iss.key)}">
-            <div style="display:flex;gap:6px;align-items:center;margin-bottom:3px;">
-              <span class="mono" style="font-weight:700;">${esc(iss.key)}</span>
-              <span class="tag tag-claimed">${esc(iss.claimed_by || iss.assignee || 'in_progress')}</span>
-            </div>
-            <div style="font-weight:550;">${esc(iss.title)}</div>
-          </div>
-          <div style="display:flex;gap:6px;">
-            <button class="btn btn-sm btn-rel-row" data-key="${esc(iss.key)}">Release</button>
-            <button class="btn btn-sm btn-primary btn-done-row" data-key="${esc(iss.key)}">Done</button>
-          </div>
-        </div>
-      `).join('') : `<div class="panel-card" style="color:var(--text-muted);">No issues currently in progress.</div>`;
+        let draggedIssueKey = null;
+        let pointerDrag = null;
+        let moveInFlight = false;
 
-      document.querySelectorAll('#view-ready [data-open]').forEach((el) => {
-        el.addEventListener('click', () => openIssueDrawer(el.dataset.open));
-      });
-      rBox.querySelectorAll('.btn-claim-row').forEach((btn) => {
-        btn.addEventListener('click', async () => {
-          const agent = $('ready-agent-input').value.trim() || 'agent-1';
+        async function moveCardToState(key, targetState) {
+          if (!key || !targetState || moveInFlight) return;
+          moveInFlight = true;
           try {
-            await api(`/api/v1/issues/${btn.dataset.key}/claim`, { method: 'POST', body: { agent } });
-            toast(`${btn.dataset.key} claimed by ${agent}`);
-            await renderReadyView();
+            await api(`/api/v1/issues/${encodeURIComponent(key)}`, { method: 'PATCH', body: { state: targetState } });
+            toast(`Moved ${key} -> ${targetState}`);
+            await loadKanbanBoard();
+          } catch (err) {
+            toast(err.message, true);
+          } finally {
+            moveInFlight = false;
+          }
+        }
+
+        container.querySelectorAll('.kanban-card').forEach((card) => {
+          card.addEventListener('dragstart', (e) => {
+            draggedIssueKey = card.dataset.key;
+            pointerDrag = null;
+            window.removeEventListener('mousemove', onWinMove);
+            window.removeEventListener('mouseup', onWinUp);
+            if (e.dataTransfer) {
+              e.dataTransfer.setData('text/plain', card.dataset.key);
+              e.dataTransfer.effectAllowed = 'move';
+            }
+          });
+          card.addEventListener('mousedown', (e) => {
+            if (e.button !== 0) return;
+            const srcCol = card.closest('.kanban-column');
+            pointerDrag = {
+              key: card.dataset.key,
+              fromState: srcCol ? srcCol.dataset.state : null,
+              startX: e.clientX,
+              startY: e.clientY,
+              moved: false,
+            };
+            window.addEventListener('mousemove', onWinMove);
+            window.addEventListener('mouseup', onWinUp);
+          });
+          card.addEventListener('click', () => {
+            if (pointerDrag && pointerDrag.moved) return;
+            openIssueDetail(card.dataset.key, { fullPage: false });
+          });
+        });
+
+        function onWinMove(e) {
+          if (!pointerDrag) return;
+          if (Math.hypot(e.clientX - pointerDrag.startX, e.clientY - pointerDrag.startY) > 8) {
+            pointerDrag.moved = true;
+          }
+        }
+        function onWinUp(e) {
+          window.removeEventListener('mousemove', onWinMove);
+          window.removeEventListener('mouseup', onWinUp);
+          if (!pointerDrag) return;
+          const pd = pointerDrag;
+          setTimeout(() => { pointerDrag = null; }, 50);
+          if (!pd.moved) return;
+          const el = document.elementFromPoint(e.clientX, e.clientY);
+          const colEl = el ? el.closest('.kanban-column') : null;
+          if (colEl && colEl.dataset.state && colEl.dataset.state !== pd.fromState) {
+            moveCardToState(pd.key, colEl.dataset.state);
+          }
+        }
+
+        container.querySelectorAll('.kanban-column').forEach((colEl) => {
+          colEl.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+            colEl.classList.add('drag-over');
+          });
+          colEl.addEventListener('dragleave', () => colEl.classList.remove('drag-over'));
+          colEl.addEventListener('drop', async (e) => {
+            e.preventDefault();
+            colEl.classList.remove('drag-over');
+            const key = (e.dataTransfer && e.dataTransfer.getData('text/plain')) || draggedIssueKey;
+            draggedIssueKey = null;
+            pointerDrag = null;
+            await moveCardToState(key, colEl.dataset.state);
+          });
+        });
+      } catch (err) { toast(err.message, true); }
+    }
+
+    ['board-swimlane-select','board-filter-category','board-filter-priority','board-filter-sprint'].forEach((id) => {
+      $(id).addEventListener('change', loadKanbanBoard);
+    });
+    $('btn-refresh-board').addEventListener('click', loadKanbanBoard);
+
+    // ----------------------------------------------------------------------
+    // Views 3..8: Sprints, Milestones, Saved Views, Analytics, Tags, Settings
+    // ----------------------------------------------------------------------
+    async function renderSprintsView() {
+      await loadReferenceData();
+      const details = await Promise.all(appState.sprints.map((s) => api(`/api/v1/sprints/${encodeURIComponent(s.id)}`)));
+      const box = $('sprints-list-container');
+      if (!details.length) {
+        box.innerHTML = '<div class="card-panel">No sprints created yet.</div>';
+        return;
+      }
+      box.innerHTML = details.map((sp) => `
+        <div class="card-panel sprint-card" data-sprint-id="${esc(sp.id)}">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+            <div>
+              <strong style="font-size:15px">${esc(sp.id)} — ${esc(sp.name)}</strong>
+              <span class="badge" style="margin-left:8px">${esc(sp.state)}</span>
+              <div style="color:var(--text-muted);font-size:12px;margin-top:3px;">Goal: ${esc(sp.goal || '—')} | ${esc(sp.start_date || '?')} &rarr; ${esc(sp.end_date || '?')} | ${sp.done_issues}/${sp.total_issues} done (${sp.progress_pct}%)</div>
+            </div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;">
+              ${sp.state === 'planned' ? `<button class="btn btn-sm btn-primary btn-sprint-start" data-id="${esc(sp.id)}">Start Sprint</button>` : ''}
+              ${sp.state !== 'completed' ? `<button class="btn btn-sm btn-primary btn-sprint-complete" data-id="${esc(sp.id)}" data-inc="${sp.incomplete_issues}">Complete Sprint</button>` : ''}
+              <button class="btn btn-sm btn-sprint-edit" data-id="${esc(sp.id)}" data-goal="${esc(sp.goal || '')}">Edit Goal</button>
+              <button class="btn btn-sm btn-danger btn-sprint-delete" data-id="${esc(sp.id)}">Delete</button>
+            </div>
+          </div>
+          <div style="display:flex;gap:6px;margin-top:10px;">
+            <input type="text" class="sprint-assign-input" data-id="${esc(sp.id)}" placeholder="Assign issue (ITR-1 or Exact Name)..." style="width:240px" />
+            <button class="btn btn-sm btn-sprint-assign" data-id="${esc(sp.id)}">Assign to Sprint</button>
+          </div>
+          <div style="margin-top:8px;display:flex;flex-direction:column;gap:4px;">
+            ${(sp.issues || []).map((iss) => `
+              <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 8px;background:var(--bg-card);border-radius:5px;">
+                <span><strong class="mono">${esc(iss.key)}</strong> ${esc(iss.name)} <span class="badge">${esc(iss.state)}</span></span>
+                <button class="btn btn-sm btn-ghost btn-sprint-remove-issue" data-sprint="${esc(sp.id)}" data-issue="${esc(iss.key)}">Remove</button>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      `).join('');
+
+      box.querySelectorAll('.btn-sprint-start').forEach((b) => {
+        b.addEventListener('click', async () => {
+          try {
+            await api(`/api/v1/sprints/${encodeURIComponent(b.dataset.id)}/start`, { method: 'POST', body: {} });
+            toast(`Started ${b.dataset.id}`);
+            await renderSprintsView();
           } catch (err) { toast(err.message, true); }
         });
       });
-      cBox.querySelectorAll('.btn-rel-row').forEach((btn) => {
-        btn.addEventListener('click', async () => {
-          await api(`/api/v1/issues/${btn.dataset.key}/release`, { method: 'POST', body: { status: 'todo' } });
-          await renderReadyView();
+      box.querySelectorAll('.btn-sprint-complete').forEach((b) => {
+        b.addEventListener('click', () => {
+          appState.pendingRolloverSprintId = b.dataset.id;
+          $('rollover-modal-info').textContent = `Completing ${b.dataset.id} (${b.dataset.inc} incomplete issues). Choose destination for incomplete issues:`;
+          const others = appState.sprints.filter((s) => s.id !== b.dataset.id && s.state !== 'completed').map((s) => ({ value: s.id, label: `${s.id} — ${s.name}` }));
+          populateSelect($('rollover-target-select'), others, 'Backlog (No Sprint)');
+          openModal('sprint-rollover');
         });
       });
-      cBox.querySelectorAll('.btn-done-row').forEach((btn) => {
-        btn.addEventListener('click', async () => {
-          await api(`/api/v1/issues/${btn.dataset.key}/transition`, { method: 'POST', body: { status: 'done' } });
-          await renderReadyView();
+      box.querySelectorAll('.btn-sprint-edit').forEach((b) => {
+        b.addEventListener('click', async () => {
+          const card = b.closest('.sprint-card');
+          const nextGoal = card.dataset.editedGoal || (b.dataset.goal + ' (updated)');
+          await api(`/api/v1/sprints/${encodeURIComponent(b.dataset.id)}`, { method: 'PATCH', body: { goal: nextGoal } });
+          toast('Updated sprint');
+          await renderSprintsView();
+        });
+      });
+      box.querySelectorAll('.btn-sprint-assign').forEach((b) => {
+        b.addEventListener('click', async () => {
+          const inp = box.querySelector(`.sprint-assign-input[data-id="${b.dataset.id}"]`);
+          const val = inp.value.trim();
+          if (!val) return;
+          try {
+            await api(`/api/v1/sprints/${encodeURIComponent(b.dataset.id)}/assign`, { method: 'POST', body: { issues: [val] } });
+            inp.value = '';
+            await renderSprintsView();
+          } catch (err) { toast(err.message, true); }
+        });
+      });
+      box.querySelectorAll('.btn-sprint-remove-issue').forEach((b) => {
+        b.addEventListener('click', async () => {
+          await api(`/api/v1/sprints/${encodeURIComponent(b.dataset.sprint)}/remove`, { method: 'POST', body: { issues: [b.dataset.issue] } });
+          await renderSprintsView();
+        });
+      });
+      box.querySelectorAll('.btn-sprint-delete').forEach((b) => {
+        b.addEventListener('click', async () => {
+          await api(`/api/v1/sprints/${encodeURIComponent(b.dataset.id)}`, { method: 'DELETE' });
+          toast(`Deleted ${b.dataset.id}`);
+          await renderSprintsView();
         });
       });
     }
 
-    // 4. Sprints & Backlog Planner
     $('btn-create-sprint').addEventListener('click', async () => {
-      const name = $('sprint-name-input').value.trim();
-      if (!name) return toast('Enter a sprint name', true);
-      await api('/api/v1/sprints', {
-        method: 'POST',
-        body: {
-          name,
-          goal: $('sprint-goal-input').value.trim(),
-          start_date: $('sprint-start-input').value || null,
-          end_date: $('sprint-end-input').value || null,
-        }
-      });
-      $('sprint-name-input').value = '';
-      $('sprint-goal-input').value = '';
-      toast(`Created sprint "${name}"`);
-      await renderSprintsView();
-    });
-
-    async function renderSprintsView() {
-      const details = await Promise.all(state.sprints.map((s) => api(`/api/v1/sprints/${s.id}`)));
-      const backlogRes = await api('/api/v1/issues?iql=' + encodeURIComponent('sprint IS EMPTY AND status NOT IN (done, canceled)'));
-      const box = $('sprints-container');
-
-      box.innerHTML = details.length ? details.map((d) => {
-        const s = d.sprint;
-        const m = d.metrics;
-        const otherSprints = state.sprints.filter((x) => x.id !== s.id && x.state !== 'completed');
-        return `
-          <div class="panel-card">
-            <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-              <div>
-                <span class="mono" style="font-weight:700;">${esc(s.id)}</span>
-                <strong style="font-size:14px;margin-left:6px;">${esc(s.name)}</strong>
-                <span class="tag" style="margin-left:6px;">${esc(s.state)}</span>
-                ${s.goal ? `<div style="font-size:12px;color:var(--text-secondary);margin-top:2px;">Goal: ${esc(s.goal)}</div>` : ''}
-              </div>
-              <div style="display:flex;gap:6px;align-items:center;">
-                <span style="font-size:12px;color:var(--text-secondary);">${m.done_issues}/${m.total_issues} done · ${m.done_points}/${m.total_points} pts (${m.progress_pct}%)</span>
-                ${s.state === 'planned' ? `<button class="btn btn-sm btn-primary sp-start" data-id="${esc(s.id)}">Start Sprint</button>` : ''}
-                ${s.state === 'active' ? `
-                  <select class="select sp-rollover" data-id="${esc(s.id)}" style="width:140px;">
-                    <option value="backlog">Rollover -> Backlog</option>
-                    ${otherSprints.map((o) => `<option value="${esc(o.id)}">Rollover -> ${esc(o.id)}</option>`).join('')}
-                  </select>
-                  <button class="btn btn-sm btn-primary sp-complete" data-id="${esc(s.id)}">Complete Sprint</button>
-                ` : ''}
-                <button class="btn btn-sm btn-danger sp-del" data-id="${esc(s.id)}">&#10005;</button>
-              </div>
-            </div>
-            <div class="progress-track"><div class="progress-fill" style="width:${m.progress_pct}%"></div></div>
-            <div style="margin-top:8px;display:flex;flex-direction:column;gap:4px;">
-              ${d.issues.map((i) => `
-                <div style="display:flex;justify-content:space-between;padding:4px 6px;background:var(--bg-surface-2);border-radius:4px;cursor:pointer;" data-open="${esc(i.key)}">
-                  <span><span class="mono">${esc(i.key)}</span> · ${esc(i.title)}</span>
-                  <span class="tag">${esc(i.status)}</span>
-                </div>
-              `).join('')}
-            </div>
-          </div>
-        `;
-      }).join('') : `<div class="panel-card" style="color:var(--text-muted);">No sprints created yet.</div>`;
-
-      box.querySelectorAll('.sp-start').forEach((b) => b.addEventListener('click', async () => {
-        await api(`/api/v1/sprints/${b.dataset.id}/start`, { method: 'POST', body: {} });
-        toast(`Started ${b.dataset.id}`);
-        await refreshCurrentView();
-      }));
-      box.querySelectorAll('.sp-complete').forEach((b) => b.addEventListener('click', async () => {
-        const sel = box.querySelector(`.sp-rollover[data-id="${b.dataset.id}"]`);
-        const res = await api(`/api/v1/sprints/${b.dataset.id}/complete`, {
-          method: 'POST',
-          body: { rollover_to: sel ? sel.value : 'backlog' }
-        });
-        toast(`Completed ${b.dataset.id} (${res.rolled_over_keys.length} rolled over)`);
-        await refreshCurrentView();
-      }));
-      box.querySelectorAll('.sp-del').forEach((b) => b.addEventListener('click', async () => {
-        await api(`/api/v1/sprints/${b.dataset.id}`, { method: 'DELETE' });
-        await refreshCurrentView();
-      }));
-      box.querySelectorAll('[data-open]').forEach((el) => el.addEventListener('click', () => openIssueDrawer(el.dataset.open)));
-
-      const blBox = $('backlog-planner-list');
-      const openSprints = state.sprints.filter((s) => s.state !== 'completed');
-      blBox.innerHTML = (backlogRes.issues || []).length ? backlogRes.issues.map((i) => `
-        <div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--border-subtle);">
-          <span style="cursor:pointer;" data-open="${esc(i.key)}"><span class="mono" style="font-weight:600;">${esc(i.key)}</span> ${esc(i.title)}</span>
-          <select class="select bl-assign-sp" data-key="${esc(i.key)}" style="width:160px;">
-            <option value="">Assign to sprint...</option>
-            ${openSprints.map((s) => `<option value="${esc(s.id)}">${esc(s.id)}: ${esc(s.name)}</option>`).join('')}
-          </select>
-        </div>
-      `).join('') : `<div style="color:var(--text-muted);font-size:12px;">No unscheduled backlog issues.</div>`;
-      blBox.querySelectorAll('[data-open]').forEach((el) => el.addEventListener('click', () => openIssueDrawer(el.dataset.open)));
-      blBox.querySelectorAll('.bl-assign-sp').forEach((sel) => sel.addEventListener('change', async () => {
-        if (!sel.value) return;
-        await api(`/api/v1/issues/${sel.dataset.key}`, { method: 'PATCH', body: { sprint_id: sel.value } });
-        await renderSprintsView();
-      }));
-    }
-
-    // 5. Epics & Milestones
-    $('btn-quick-epic').addEventListener('click', () => openCreateModal({ type: 'epic' }));
-    $('btn-create-milestone').addEventListener('click', async () => {
-      const name = $('ms-name-input').value.trim();
-      if (!name) return toast('Enter milestone name', true);
-      await api('/api/v1/milestones', {
-        method: 'POST',
-        body: { name, target_date: $('ms-date-input').value || null }
-      });
-      $('ms-name-input').value = '';
-      await refreshCurrentView();
-    });
-
-    async function renderEpicsView() {
-      const eBox = $('epics-list-container');
-      eBox.innerHTML = state.epics.length ? state.epics.map((ep) => `
-        <div class="panel-card">
-          <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;" data-open="${esc(ep.issue.key)}">
-            <div><span class="mono" style="font-weight:700;">${esc(ep.issue.key)}</span> <strong>${esc(ep.issue.title)}</strong></div>
-            <span style="font-size:12px;color:var(--text-secondary);">${ep.done_count}/${ep.child_count} issues · ${ep.progress_pct}%</span>
-          </div>
-          <div class="progress-track"><div class="progress-fill" style="width:${ep.progress_pct}%"></div></div>
-          <div class="tag-row" style="margin-top:6px;">
-            ${ep.children.map((ck) => `<span class="tag mono" style="cursor:pointer;" data-open="${esc(ck)}">${esc(ck)}</span>`).join('')}
-          </div>
-        </div>
-      `).join('') : `<div class="panel-card" style="color:var(--text-muted);">No epics yet. Click "+ New Epic" to create one.</div>`;
-
-      const mBox = $('milestones-list-container');
-      mBox.innerHTML = state.milestones.length ? state.milestones.map((m) => `
-        <div class="panel-card">
-          <div style="display:flex;justify-content:space-between;align-items:center;">
-            <div>
-              <span class="mono" style="font-weight:700;">${esc(m.id)}</span> <strong>${esc(m.name)}</strong>
-              ${m.target_date ? `<span style="font-size:11.5px;color:var(--text-muted);margin-left:6px;">Due ${esc(m.target_date)}</span>` : ''}
-            </div>
-            <div style="display:flex;gap:6px;align-items:center;">
-              <select class="select ms-status" data-id="${esc(m.id)}" style="width:115px;">
-                <option value="unreleased" ${m.status === 'unreleased' ? 'selected' : ''}>unreleased</option>
-                <option value="released" ${m.status === 'released' ? 'selected' : ''}>released</option>
-                <option value="archived" ${m.status === 'archived' ? 'selected' : ''}>archived</option>
-              </select>
-              <button class="btn btn-sm btn-danger ms-del" data-id="${esc(m.id)}">&#10005;</button>
-            </div>
-          </div>
-          <div class="progress-track"><div class="progress-fill" style="width:${m.progress_pct}%"></div></div>
-          <div style="font-size:11.5px;color:var(--text-secondary);">${m.done_issues}/${m.total_issues} issues complete</div>
-        </div>
-      `).join('') : `<div class="panel-card" style="color:var(--text-muted);">No milestones yet.</div>`;
-
-      eBox.querySelectorAll('[data-open]').forEach((el) => el.addEventListener('click', (e) => {
-        e.stopPropagation();
-        openIssueDrawer(el.dataset.open);
-      }));
-      mBox.querySelectorAll('.ms-status').forEach((sel) => sel.addEventListener('change', async () => {
-        await api(`/api/v1/milestones/${sel.dataset.id}`, { method: 'PATCH', body: { status: sel.value } });
-        await refreshCurrentView();
-      }));
-      mBox.querySelectorAll('.ms-del').forEach((b) => b.addEventListener('click', async () => {
-        await api(`/api/v1/milestones/${b.dataset.id}`, { method: 'DELETE' });
-        await refreshCurrentView();
-      }));
-    }
-
-    // 6. Dependency DAG View
-    $('btn-graph-add-link').addEventListener('click', async () => {
-      const src = $('graph-src-input').value.trim().toUpperCase();
-      const tgt = $('graph-tgt-input').value.trim().toUpperCase();
-      const link_type = $('graph-type-select').value;
-      if (!src || !tgt) return toast('Provide both source and target issue keys', true);
       try {
-        await api(`/api/v1/issues/${src}/links`, { method: 'POST', body: { target_key: tgt, link_type } });
-        toast(`Linked: ${src} ${link_type} ${tgt}`);
-        await renderGraphView();
+        await api('/api/v1/sprints', {
+          method: 'POST',
+          body: {
+            name: $('sprint-create-name').value.trim(),
+            goal: $('sprint-create-goal').value.trim(),
+            start_date: $('sprint-create-start').value || null,
+            end_date: $('sprint-create-end').value || null,
+          },
+        });
+        $('sprint-create-name').value = ''; $('sprint-create-goal').value = '';
+        toast('Sprint created');
+        await renderSprintsView();
+      } catch (err) { toast(err.message, true); }
+    });
+
+    $('btn-confirm-sprint-complete').addEventListener('click', async () => {
+      const sid = appState.pendingRolloverSprintId;
+      if (!sid) return;
+      try {
+        const rollover_to = $('rollover-target-select').value || null;
+        await api(`/api/v1/sprints/${encodeURIComponent(sid)}/complete`, { method: 'POST', body: { rollover_to } });
+        closeModal('sprint-rollover');
+        toast(`Completed ${sid}`);
+        await renderSprintsView();
+      } catch (err) { toast(err.message, true); }
+    });
+
+    async function renderMilestonesView() {
+      await loadReferenceData();
+      const details = await Promise.all(appState.milestones.map((m) => api(`/api/v1/milestones/${encodeURIComponent(m.id)}`)));
+      const box = $('milestones-list-container');
+      if (!details.length) {
+        box.innerHTML = '<div class="card-panel">No milestones yet.</div>';
+        return;
+      }
+      box.innerHTML = details.map((m) => `
+        <div class="card-panel" data-milestone-id="${esc(m.id)}">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <strong>${esc(m.id)} — ${esc(m.name)}</strong>
+            <span class="badge">${esc(m.state)}</span>
+          </div>
+          <p style="color:var(--text-muted);margin:6px 0;">${esc(m.description || 'No description')} | Due: ${esc(m.due_date || '—')}</p>
+          <div class="progress-track" style="margin:6px 0;"><div class="progress-fill" style="width:${m.progress_pct}%"></div></div>
+          <div style="font-size:12px;margin-bottom:8px;">${m.done_issues}/${m.total_issues} completed (${m.progress_pct}%)</div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;">
+            <button class="btn btn-sm btn-ms-edit" data-id="${esc(m.id)}" data-desc="${esc(m.description || '')}">Edit</button>
+            ${m.state === 'open'
+              ? `<button class="btn btn-sm btn-ms-close" data-id="${esc(m.id)}">Close</button>`
+              : `<button class="btn btn-sm btn-ms-reopen" data-id="${esc(m.id)}">Reopen</button>`}
+            <button class="btn btn-sm btn-danger btn-ms-delete" data-id="${esc(m.id)}">Delete</button>
+          </div>
+        </div>
+      `).join('');
+
+      box.querySelectorAll('.btn-ms-edit').forEach((b) => {
+        b.addEventListener('click', async () => {
+          await api(`/api/v1/milestones/${encodeURIComponent(b.dataset.id)}`, { method: 'PATCH', body: { description: (b.dataset.desc || 'Milestone') + ' (updated)' } });
+          await renderMilestonesView();
+        });
+      });
+      box.querySelectorAll('.btn-ms-close').forEach((b) => {
+        b.addEventListener('click', async () => {
+          await api(`/api/v1/milestones/${encodeURIComponent(b.dataset.id)}/close`, { method: 'POST', body: {} });
+          await renderMilestonesView();
+        });
+      });
+      box.querySelectorAll('.btn-ms-reopen').forEach((b) => {
+        b.addEventListener('click', async () => {
+          await api(`/api/v1/milestones/${encodeURIComponent(b.dataset.id)}/reopen`, { method: 'POST', body: {} });
+          await renderMilestonesView();
+        });
+      });
+      box.querySelectorAll('.btn-ms-delete').forEach((b) => {
+        b.addEventListener('click', async () => {
+          await api(`/api/v1/milestones/${encodeURIComponent(b.dataset.id)}`, { method: 'DELETE' });
+          await renderMilestonesView();
+        });
+      });
+    }
+
+    $('btn-create-milestone').addEventListener('click', async () => {
+      try {
+        await api('/api/v1/milestones', {
+          method: 'POST',
+          body: {
+            name: $('ms-create-name').value.trim(),
+            description: $('ms-create-desc').value.trim(),
+            due_date: $('ms-create-due').value || null,
+          },
+        });
+        $('ms-create-name').value = ''; $('ms-create-desc').value = '';
+        toast('Milestone created');
+        await renderMilestonesView();
+      } catch (err) { toast(err.message, true); }
+    });
+
+    async function executeSavedView(viewId) {
+      try {
+        const detail = await api(`/api/v1/views/${encodeURIComponent(viewId)}`);
+        const res = await api(`/api/v1/views/${encodeURIComponent(viewId)}/run`, { method: 'POST', body: { page: 1, page_size: appState.pageSize } });
+        appState.tab = detail.tab || 'all';
+        $('global-search-input').value = detail.query || '';
+        await switchView('issues');
+        renderIssuesTable(res);
+        toast(`Loaded view: ${detail.name}`);
+      } catch (err) { toast(err.message, true); }
+    }
+
+    async function renderSavedViewsView() {
+      await loadReferenceData();
+      const box = $('views-list-container');
+      if (!appState.views.length) {
+        box.innerHTML = '<div class="card-panel">No saved views yet.</div>';
+        return;
+      }
+      box.innerHTML = appState.views.map((v) => `
+        <div class="card-panel" data-saved-view="${esc(v.id)}">
+          <strong>${esc(v.name)}</strong> <span class="badge mono">${esc(v.id)}</span>
+          <div class="mono" style="margin:6px 0;font-size:12px;color:var(--accent);">${esc(v.query || '(all issues)')}</div>
+          <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">Tab: ${esc(v.tab)} | ${esc(v.description || '')}</div>
+          <div style="display:flex;gap:6px;">
+            <button class="btn btn-sm btn-primary btn-view-run" data-id="${esc(v.id)}">Run View</button>
+            <button class="btn btn-sm btn-view-edit" data-id="${esc(v.id)}" data-desc="${esc(v.description || '')}">Edit</button>
+            <button class="btn btn-sm btn-danger btn-view-delete" data-id="${esc(v.id)}">Delete</button>
+          </div>
+        </div>
+      `).join('');
+
+      box.querySelectorAll('.btn-view-run').forEach((b) => b.addEventListener('click', () => executeSavedView(b.dataset.id)));
+      box.querySelectorAll('.btn-view-edit').forEach((b) => {
+        b.addEventListener('click', async () => {
+          await api(`/api/v1/views/${encodeURIComponent(b.dataset.id)}`, { method: 'PATCH', body: { description: (b.dataset.desc || 'Saved view') + ' (updated)' } });
+          await renderSavedViewsView();
+        });
+      });
+      box.querySelectorAll('.btn-view-delete').forEach((b) => {
+        b.addEventListener('click', async () => {
+          await api(`/api/v1/views/${encodeURIComponent(b.dataset.id)}`, { method: 'DELETE' });
+          await renderSavedViewsView();
+        });
+      });
+    }
+
+    function openSaveViewModal() {
+      $('save-view-name').value = '';
+      $('save-view-query').value = $('global-search-input').value.trim();
+      $('save-view-tab').value = appState.tab || 'all';
+      $('save-view-desc').value = '';
+      openModal('save-view');
+    }
+    $('btn-save-current-view').addEventListener('click', openSaveViewModal);
+    $('btn-views-open-save-modal').addEventListener('click', openSaveViewModal);
+
+    $('btn-submit-save-view').addEventListener('click', async () => {
+      try {
+        await api('/api/v1/views', {
+          method: 'POST',
+          body: {
+            name: $('save-view-name').value.trim(),
+            query: $('save-view-query').value.trim(),
+            tab: $('save-view-tab').value || 'all',
+            sort: appState.sort,
+            order: appState.order,
+            description: $('save-view-desc').value.trim(),
+          },
+        });
+        closeModal('save-view');
+        toast('Saved view created');
+        await loadReferenceData();
+        if (appState.currentView === 'views') await renderSavedViewsView();
+      } catch (err) { toast(err.message, true); }
+    });
+
+    async function renderAnalyticsView() {
+      const [stats, statusInfo] = await Promise.all([api('/api/v1/stats'), api('/api/v1/status')]);
+      $('analytics-summary-cards').innerHTML = `
+        <div class="card-panel"><strong>Total Issues</strong><div style="font-size:26px;font-weight:700;" id="stat-total-issues">${stats.total_issues}</div><div style="color:var(--text-muted)">${esc(statusInfo.project_title)}</div></div>
+        <div class="card-panel"><strong>Active / Open</strong><div style="font-size:26px;font-weight:700;" id="stat-active-issues">${stats.active_issues}</div></div>
+        <div class="card-panel"><strong>Completed</strong><div style="font-size:26px;font-weight:700;color:var(--success)" id="stat-done-issues">${stats.done_issues} (${stats.completion_rate_pct}%)</div></div>
+        <div class="card-panel"><strong>Blocked / Overdue</strong><div style="font-size:26px;font-weight:700;color:var(--warning)">${stats.blocked_issues} / ${stats.overdue_issues}</div></div>
+        <div class="card-panel"><strong>Story Points</strong><div style="font-size:24px;font-weight:700;">${stats.completed_points} / ${stats.total_points}</div></div>
+        <div class="card-panel"><strong>Logged Time</strong><div style="font-size:24px;font-weight:700;">${stats.total_logged_minutes}m / ${stats.total_estimate_minutes}m</div></div>
+      `;
+      const renderDist = (title, obj) => {
+        const entries = Object.entries(obj || {});
+        const maxVal = Math.max(1, ...entries.map(([, v]) => v));
+        return `<div class="card-panel"><strong>${esc(title)}</strong><div style="margin-top:8px;display:flex;flex-direction:column;gap:5px;">
+          ${entries.map(([k, v]) => `
+            <div>
+              <div style="display:flex;justify-content:space-between;font-size:12px;"><span>${esc(k)}</span><span class="mono">${v}</span></div>
+              <div class="progress-track"><div class="progress-fill" style="width:${Math.round(v / maxVal * 100)}%"></div></div>
+            </div>
+          `).join('')}
+        </div></div>`;
+      };
+      $('analytics-distributions').innerHTML =
+        renderDist('By State', stats.by_state) +
+        renderDist('By Priority', stats.by_priority) +
+        renderDist('By Category', stats.by_category) +
+        renderDist('By Assignee', stats.by_assignee);
+    }
+
+    async function renderTagsView() {
+      await loadReferenceData();
+      const box = $('tags-list-container');
+      if (!appState.tags.length) {
+        box.innerHTML = '<div class="card-panel">No tags created yet.</div>';
+        return;
+      }
+      box.innerHTML = appState.tags.map((t) => `
+        <div class="card-panel" data-tag-card="${esc(t.name)}">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span class="badge" style="background:${esc(t.color)};color:#fff;border:none;">${esc(t.name)}</span>
+            <span class="mono" style="font-size:12px;">${t.issue_count || 0} issues</span>
+          </div>
+          <p style="color:var(--text-muted);margin:8px 0;">${esc(t.description || 'No description')}</p>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <input type="color" class="tag-edit-color" data-name="${esc(t.name)}" value="${esc(t.color || '#3b82f6')}" style="width:36px;height:28px;padding:1px;" />
+            <button class="btn btn-sm btn-tag-save" data-name="${esc(t.name)}">Save Color</button>
+            <button class="btn btn-sm btn-danger btn-tag-delete" data-name="${esc(t.name)}">Delete</button>
+          </div>
+        </div>
+      `).join('');
+
+      box.querySelectorAll('.btn-tag-save').forEach((b) => {
+        b.addEventListener('click', async () => {
+          const cInp = box.querySelector(`.tag-edit-color[data-name="${b.dataset.name}"]`);
+          await api(`/api/v1/tags/${encodeURIComponent(b.dataset.name)}`, { method: 'PATCH', body: { color: cInp.value } });
+          toast(`Updated tag ${b.dataset.name}`);
+          await renderTagsView();
+        });
+      });
+      box.querySelectorAll('.btn-tag-delete').forEach((b) => {
+        b.addEventListener('click', async () => {
+          await api(`/api/v1/tags/${encodeURIComponent(b.dataset.name)}`, { method: 'DELETE' });
+          toast(`Deleted tag ${b.dataset.name}`);
+          await renderTagsView();
+        });
+      });
+    }
+
+    $('btn-create-tag').addEventListener('click', async () => {
+      try {
+        await api('/api/v1/tags', {
+          method: 'POST',
+          body: {
+            name: $('tag-create-name').value.trim(),
+            color: $('tag-create-color').value,
+            description: $('tag-create-desc').value.trim(),
+          },
+        });
+        $('tag-create-name').value = ''; $('tag-create-desc').value = '';
+        toast('Tag created');
+        await renderTagsView();
+      } catch (err) { toast(err.message, true); }
+    });
+
+    function renderSettingsView() {
+      const c = appState.config || {};
+      $('cfg-project-title').value = c.project_title || '';
+      $('cfg-project-prefix').value = c.project_prefix || 'ITR';
+      $('cfg-default-category').value = c.default_category || 'task';
+      $('cfg-default-state').value = c.default_state || 'backlog';
+      $('cfg-default-priority').value = c.default_priority || 'medium';
+      $('cfg-default-severity').value = c.default_severity || 'sev3';
+      $('cfg-wip-in-progress').value = (c.wip_limits && c.wip_limits['in-progress']) ? c.wip_limits['in-progress'] : '';
+      $('cfg-default-assignee').value = c.default_assignee || '';
+    }
+
+    $('btn-save-settings').addEventListener('click', async () => {
+      try {
+        const wipVal = $('cfg-wip-in-progress').value.trim();
+        await api('/api/v1/config', {
+          method: 'PATCH',
+          body: {
+            project_title: $('cfg-project-title').value.trim(),
+            project_prefix: $('cfg-project-prefix').value.trim(),
+            default_category: $('cfg-default-category').value,
+            default_state: $('cfg-default-state').value,
+            default_priority: $('cfg-default-priority').value,
+            default_severity: $('cfg-default-severity').value,
+            default_assignee: $('cfg-default-assignee').value.trim() || null,
+            'wip_limits.in-progress': wipVal ? Number(wipVal) : 0,
+          },
+        });
+        toast('Workspace settings saved');
+        await loadReferenceData();
+      } catch (err) { toast(err.message, true); }
+    });
+"""
+
+SPA_HTML += r"""
+    // ----------------------------------------------------------------------
+    // Create Issue Modal (with inline embeds & drag-and-drop attachments)
+    // ----------------------------------------------------------------------
+    function openCreateModal() {
+      const c = appState.config || {};
+      $('create-name').value = '';
+      $('create-category').value = c.default_category || 'task';
+      $('create-state').value = c.default_state || 'backlog';
+      $('create-priority').value = c.default_priority || 'medium';
+      $('create-severity').value = c.default_severity || 'sev3';
+      $('create-assignee').value = c.default_assignee || '';
+      $('create-parent').value = '';
+      $('create-due').value = '';
+      $('create-sprint').value = '';
+      $('create-milestone').value = '';
+      $('create-points').value = '';
+      $('create-estimate').value = '';
+      $('create-tags').value = '';
+      $('create-components').value = '';
+      $('create-description').value = '';
+      $('create-ac').value = '';
+      $('create-custom-fields').value = '';
+      appState.createEmbedFiles = [];
+      appState.createAttachFiles = [];
+      $('create-embeds-queued').textContent = '';
+      $('create-attach-queued').textContent = '';
+      openModal('create-issue');
+      setTimeout(() => $('create-name').focus(), 20);
+    }
+
+    $('btn-open-create').addEventListener('click', openCreateModal);
+
+    $('create-embed-input').addEventListener('change', (e) => {
+      const files = Array.from(e.target.files || []);
+      files.forEach((f) => {
+        appState.createEmbedFiles.push(f);
+        const ta = $('create-description');
+        const tag = `![${f.name}](embed:${f.name})`;
+        ta.value = ta.value ? `${ta.value}\n${tag}` : tag;
+      });
+      $('create-embeds-queued').textContent = `${appState.createEmbedFiles.length} embed(s) queued`;
+      e.target.value = '';
+    });
+
+    function queueCreateAttachments(files) {
+      Array.from(files || []).forEach((f) => appState.createAttachFiles.push(f));
+      $('create-attach-queued').textContent = appState.createAttachFiles.map((f) => f.name).join(', ');
+    }
+    $('create-attach-input').addEventListener('change', (e) => {
+      queueCreateAttachments(e.target.files);
+      e.target.value = '';
+    });
+    $('create-attach-dropzone').addEventListener('dragover', (e) => { e.preventDefault(); $('create-attach-dropzone').classList.add('drag-over'); });
+    $('create-attach-dropzone').addEventListener('dragleave', () => $('create-attach-dropzone').classList.remove('drag-over'));
+    $('create-attach-dropzone').addEventListener('drop', (e) => {
+      e.preventDefault();
+      $('create-attach-dropzone').classList.remove('drag-over');
+      if (e.dataTransfer && e.dataTransfer.files) queueCreateAttachments(e.dataTransfer.files);
+    });
+
+    $('btn-submit-create-issue').addEventListener('click', async () => {
+      try {
+        const cfObj = {};
+        $('create-custom-fields').value.split('\n').map((s) => s.trim()).filter(Boolean).forEach((line) => {
+          const eq = line.indexOf('=');
+          if (eq > 0) cfObj[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+        });
+        const acArr = $('create-ac').value.split('\n').map((s) => s.trim()).filter(Boolean);
+        const payload = {
+          name: $('create-name').value,
+          category: $('create-category').value,
+          state: $('create-state').value,
+          priority: $('create-priority').value,
+          severity: $('create-severity').value,
+          description: $('create-description').value,
+          acceptance_criteria: acArr,
+          assignee: $('create-assignee').value.trim() || null,
+          parent: $('create-parent').value.trim() || null,
+          sprint: $('create-sprint').value || null,
+          milestone: $('create-milestone').value || null,
+          story_points: $('create-points').value !== '' ? Number($('create-points').value) : null,
+          estimate_minutes: $('create-estimate').value !== '' ? Number($('create-estimate').value) : null,
+          due_date: $('create-due').value || null,
+          tags: $('create-tags').value.split(',').map((s) => s.trim()).filter(Boolean),
+          components: $('create-components').value.split(',').map((s) => s.trim()).filter(Boolean),
+          custom_fields: cfObj,
+        };
+        const created = await api('/api/v1/issues', { method: 'POST', body: payload });
+        if (appState.createEmbedFiles.length) {
+          const fd = new FormData();
+          appState.createEmbedFiles.forEach((f) => fd.append('files', f, f.name));
+          await api(`/api/v1/issues/${encodeURIComponent(created.key)}/embeds`, { method: 'POST', body: fd });
+        }
+        if (appState.createAttachFiles.length) {
+          const fd = new FormData();
+          appState.createAttachFiles.forEach((f) => fd.append('files', f, f.name));
+          await api(`/api/v1/issues/${encodeURIComponent(created.key)}/attachments`, { method: 'POST', body: fd });
+        }
+        closeModal('create-issue');
+        toast(`Created ${created.key}: ${created.name}`);
+        await refreshMetadataAndCurrentView();
+        await openIssueDetail(created.key, { fullPage: false });
       } catch (err) {
         toast(err.message, true);
       }
     });
 
-    async function renderGraphView() {
-      const g = await api('/api/v1/graph/dependencies');
-      $('cnt-blocked').textContent = g.blocked_keys.length;
+    // ----------------------------------------------------------------------
+    // Issue Detail (Slide-Over Drawer & Full-Page #/issues/<ref> Permalink)
+    // ----------------------------------------------------------------------
+    let issueDetailLoadSeq = 0;
+    async function openIssueDetail(issueRef, opts) {
+      const seq = ++issueDetailLoadSeq;
+      const options = opts || {};
+      try {
+        const iss = await api(`/api/v1/issues/${encodeURIComponent(issueRef)}`);
+        if (seq !== issueDetailLoadSeq) return;
+        appState.activeIssue = iss;
+        window.__itrackTelemetry.modals.add('issue-detail');
 
-      // Topological layer layout for SVG DAG
-      const nodes = g.nodes || [];
-      const edges = g.edges || [];
-      const svgWrap = $('graph-svg-container');
-
-      if (!nodes.length) {
-        svgWrap.innerHTML = `<div style="color:var(--text-muted);padding:20px;">No issues in workspace yet.</div>`;
-      } else {
-        const rank = {};
-        nodes.forEach((n) => { rank[n.key] = 0; });
-        // First pass: strict DAG blocking edges
-        for (let iter = 0; iter < nodes.length; iter++) {
-          edges.forEach((e) => {
-            if (e.type === 'blocks' && rank[e.source] !== undefined && rank[e.target] !== undefined) {
-              if (rank[e.target] <= rank[e.source]) rank[e.target] = rank[e.source] + 1;
-            }
-          });
-        }
-        // Second pass: advance non-blocking edges (relates_to, duplicates, clones) when acyclic
-        const maxCap = Math.max(1, nodes.length - 1);
-        for (let iter = 0; iter < nodes.length; iter++) {
-          edges.forEach((e) => {
-            if (e.type !== 'blocks' && rank[e.source] !== undefined && rank[e.target] !== undefined) {
-              if (rank[e.target] <= rank[e.source] && rank[e.source] + 1 <= maxCap) {
-                const reverseExists = edges.some((r) => r.source === e.target && r.target === e.source);
-                if (!reverseExists || e.source < e.target) {
-                  rank[e.target] = rank[e.source] + 1;
-                }
-              }
-            }
-          });
-        }
-        const layers = {};
-        nodes.forEach((n) => {
-          const r = rank[n.key] || 0;
-          (layers[r] = layers[r] || []).push(n);
-        });
-        const layerKeys = Object.keys(layers).map(Number).sort((a, b) => a - b);
-        const pos = {};
-        const nodeW = 168, nodeH = 48, colGap = 230, rowGap = 68;
-        let maxRows = 1;
-        layerKeys.forEach((lk, colIdx) => {
-          const arr = layers[lk];
-          maxRows = Math.max(maxRows, arr.length);
-          arr.forEach((n, rowIdx) => {
-            pos[n.key] = { x: 24 + colIdx * colGap, y: 28 + rowIdx * rowGap };
-          });
-        });
-        const svgW = Math.max(600, 84 + layerKeys.length * colGap);
-        const svgH = Math.max(200, 56 + maxRows * rowGap);
-
-        const edgePaths = edges.map((e) => {
-          const p1 = pos[e.source], p2 = pos[e.target];
-          if (!p1 || !p2) return '';
-          const color = e.type === 'blocks' ? 'var(--danger)' : 'var(--accent)';
-          const dash = e.type === 'blocks' ? '' : 'stroke-dasharray="5,3"';
-          if (p2.x > p1.x) {
-            const x1 = p1.x + nodeW, y1 = p1.y + nodeH / 2;
-            const x2 = p2.x, y2 = p2.y + nodeH / 2;
-            const cx = (x1 + x2) / 2;
-            return `<path d="M${x1},${y1} C${cx},${y1} ${cx},${y2} ${x2},${y2}" fill="none" stroke="${color}" ${dash} stroke-width="1.8" marker-end="url(#arrow)" />`;
-          } else if (p2.x === p1.x) {
-            const x1 = p1.x + nodeW, y1 = p1.y + nodeH / 2;
-            const x2 = p2.x + nodeW, y2 = p2.y + nodeH / 2;
-            const arcX = x1 + 44;
-            return `<path d="M${x1},${y1} C${arcX},${y1} ${arcX},${y2} ${x2},${y2}" fill="none" stroke="${color}" ${dash} stroke-width="1.8" marker-end="url(#arrow)" />`;
-          } else {
-            const x1 = p1.x + nodeW / 2, y1 = p1.y;
-            const x2 = p2.x + nodeW / 2, y2 = p2.y;
-            const arcY = Math.max(4, Math.min(y1, y2) - 26);
-            return `<path d="M${x1},${y1} C${x1},${arcY} ${x2},${arcY} ${x2},${y2}" fill="none" stroke="${color}" ${dash} stroke-width="1.8" marker-end="url(#arrow)" />`;
+        const drawer = $('issue-drawer');
+        if (options.fullPage) {
+          appState.permalinkMode = true;
+          document.querySelectorAll('.view-pane').forEach((p) => p.classList.toggle('active', p.id === 'view-issue-permalink'));
+          drawer.style.inset = '52px 0 0 230px';
+          drawer.style.width = 'auto';
+          if (!options.skipHash) {
+            appState.suppressHashHandler = true;
+            location.hash = `#/issues/${encodeURIComponent(iss.key)}`;
+            setTimeout(() => { appState.suppressHashHandler = false; }, 0);
           }
-        }).join('');
+        } else {
+          appState.permalinkMode = false;
+          drawer.style.inset = '';
+          drawer.style.width = '';
+        }
+        drawer.classList.add('open');
 
-        const nodeRects = nodes.map((n) => {
-          const p = pos[n.key];
-          const stroke = n.status === 'done' ? 'var(--ok)' : (n.is_blocked ? 'var(--danger)' : 'var(--border-strong)');
+        renderIssueDetailDOM(iss);
+      } catch (err) {
+        toast(err.message, true);
+      }
+    }
+
+    function closeIssueDetail() {
+      $('issue-drawer').classList.remove('open');
+      $('issue-drawer').style.inset = '';
+      $('issue-drawer').style.width = '';
+      appState.activeIssue = null;
+      if (appState.permalinkMode) {
+        appState.permalinkMode = false;
+        switchView('issues', true);
+      }
+    }
+    $('btn-close-drawer').addEventListener('click', closeIssueDetail);
+    $('btn-permalink-back').addEventListener('click', () => switchView('issues', true));
+
+    $('btn-open-permalink').addEventListener('click', () => {
+      if (!appState.activeIssue) return;
+      location.hash = `#/issues/${encodeURIComponent(appState.activeIssue.key)}`;
+    });
+
+    function renderIssueDetailDOM(iss) {
+      $('detail-key-badge').textContent = iss.key;
+      $('detail-title-input').value = iss.name;
+      $('btn-archive-issue').style.display = iss.archived ? 'none' : 'inline-flex';
+      $('btn-unarchive-issue').style.display = iss.archived ? 'inline-flex' : 'none';
+
+      const banners = [];
+      if (iss.archived) banners.push('<span class="badge badge-overdue">ARCHIVED</span>');
+      if (iss.is_blocked) banners.push(`<span class="badge badge-blocked">BLOCKED${iss.unresolved_blockers.length ? ' by ' + esc(iss.unresolved_blockers.join(', ')) : ''}</span>`);
+      if (iss.is_overdue) banners.push('<span class="badge badge-overdue">OVERDUE</span>');
+      $('detail-status-banners').innerHTML = banners.join('');
+
+      // Metadata Sidebar
+      $('detail-category').value = iss.category;
+      $('detail-state').value = iss.state;
+      $('detail-priority').value = iss.priority;
+      $('detail-severity').value = iss.severity;
+      $('detail-resolution').value = iss.resolution || '';
+      $('detail-assignee').value = iss.assignee || '';
+      $('detail-reporter').value = iss.reporter || '';
+      $('detail-parent').value = iss.parent || '';
+      $('detail-sprint').value = iss.sprint || '';
+      $('detail-milestone').value = iss.milestone || '';
+      $('detail-points').value = iss.story_points !== null && iss.story_points !== undefined ? iss.story_points : '';
+      $('detail-estimate').value = iss.estimate_minutes !== null && iss.estimate_minutes !== undefined ? iss.estimate_minutes : '';
+      $('detail-due').value = iss.due_date || '';
+      $('detail-overdue-badge').innerHTML = iss.is_overdue ? '<span class="badge badge-overdue">Overdue</span>' : '';
+      $('detail-tags').value = (iss.tags || []).join(', ');
+      $('detail-components').value = (iss.components || []).join(', ');
+
+      // Custom Fields
+      const cfEntries = Object.entries(iss.custom_fields || {});
+      $('detail-cf-list').innerHTML = cfEntries.map(([k, v]) => `
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;background:var(--bg-input);padding:3px 6px;border-radius:4px;">
+          <span><strong class="mono">${esc(k)}</strong> = <span class="mono">${esc(v)}</span></span>
+          <button class="btn btn-sm btn-ghost btn-unset-cf" data-cf-key="${esc(k)}" style="padding:0 4px;">&#10005;</button>
+        </div>
+      `).join('');
+      $('detail-cf-list').querySelectorAll('.btn-unset-cf').forEach((b) => {
+        b.addEventListener('click', () => patchIssue({ unset_fields: [b.dataset.cfKey] }));
+      });
+
+      // Description & Description Embeds
+      $('detail-desc-editor').style.display = 'none';
+      $('detail-desc-rendered').style.display = 'block';
+      $('detail-desc-rendered').innerHTML = renderMarkdown(iss.description || '', iss);
+      $('detail-desc-textarea').value = iss.description || '';
+      $('detail-desc-embeds-bar').innerHTML = (iss.description_embeds || []).map((emb) => `
+        <span class="badge">
+          ${esc(emb.filename)} (${esc(emb.id)})
+          <button class="btn btn-sm btn-ghost btn-del-desc-embed" data-id="${esc(emb.id)}" title="Remove embed" style="padding:0 4px;">&#10005;</button>
+        </span>
+      `).join('');
+      $('detail-desc-embeds-bar').querySelectorAll('.btn-del-desc-embed').forEach((b) => {
+        b.addEventListener('click', async () => {
+          await api(`/api/v1/issues/${encodeURIComponent(iss.key)}/embeds/${encodeURIComponent(b.dataset.id)}`, { method: 'DELETE' });
+          toast(`Removed description embed ${b.dataset.id}`);
+          await openIssueDetail(iss.key, { fullPage: appState.permalinkMode, skipHash: true });
+        });
+      });
+
+      // Acceptance Criteria
+      $('detail-ac-summary').textContent = `${iss.ac_progress.checked}/${iss.ac_progress.total}`;
+      $('detail-ac-progress').style.width = `${iss.ac_progress.pct}%`;
+      $('detail-ac-list').innerHTML = (iss.acceptance_criteria || []).map((ac) => `
+        <div class="ac-row" data-ac-id="${esc(ac.id)}" style="display:flex;align-items:center;gap:6px;background:var(--bg-card);padding:5px 8px;border-radius:5px;">
+          <input type="checkbox" class="ac-check-toggle" data-id="${esc(ac.id)}" ${ac.checked ? 'checked' : ''} />
+          <span style="flex:1;${ac.checked ? 'text-decoration:line-through;color:var(--text-muted);' : ''}">${esc(ac.text)}</span>
+          <button class="btn btn-sm btn-ghost btn-edit-ac" data-id="${esc(ac.id)}" data-text="${esc(ac.text)}">Edit</button>
+          <button class="btn btn-sm btn-ghost btn-del-ac" data-id="${esc(ac.id)}">&#10005;</button>
+        </div>
+      `).join('');
+      $('detail-ac-list').querySelectorAll('.ac-check-toggle').forEach((cb) => {
+        cb.addEventListener('change', () => {
+          patchIssue(cb.checked ? { check_ac: [cb.dataset.id] } : { uncheck_ac: [cb.dataset.id] });
+        });
+      });
+      $('detail-ac-list').querySelectorAll('.btn-edit-ac').forEach((b) => {
+        b.addEventListener('click', () => {
+          const row = b.closest('.ac-row');
+          row.innerHTML = `
+            <input type="text" class="ac-inline-edit-input" value="${esc(b.dataset.text)}" style="flex:1" />
+            <button class="btn btn-sm btn-primary btn-save-ac-inline">Save</button>
+          `;
+          row.querySelector('.btn-save-ac-inline').addEventListener('click', () => {
+            const val = row.querySelector('.ac-inline-edit-input').value.trim();
+            if (val) patchIssue({ edit_ac: [{ target: b.dataset.id, text: val }] });
+          });
+        });
+      });
+      $('detail-ac-list').querySelectorAll('.btn-del-ac').forEach((b) => {
+        b.addEventListener('click', () => patchIssue({ remove_ac: [b.dataset.id] }));
+      });
+
+      // Subtasks
+      $('detail-subtask-summary').textContent = `${iss.subtask_progress.completed}/${iss.subtask_progress.total}`;
+      $('detail-subtask-progress').style.width = `${iss.subtask_progress.pct}%`;
+      $('detail-subtasks-list').innerHTML = (iss.subtasks || []).map((sub) => `
+        <div style="display:flex;align-items:center;gap:6px;background:var(--bg-card);padding:5px 8px;border-radius:5px;">
+          <input type="checkbox" class="subtask-toggle" data-key="${esc(sub.key)}" ${sub.completed ? 'checked' : ''} />
+          <a href="#/issues/${encodeURIComponent(sub.key)}" class="subtask-open mono" data-key="${esc(sub.key)}">${esc(sub.key)}</a>
+          <span style="flex:1;${sub.completed ? 'text-decoration:line-through;color:var(--text-muted);' : ''}">${esc(sub.name)}</span>
+          <span class="badge">${esc(sub.state)}</span>
+        </div>
+      `).join('');
+      $('detail-subtasks-list').querySelectorAll('.subtask-toggle').forEach((cb) => {
+        cb.addEventListener('change', async () => {
+          await api(`/api/v1/issues/${encodeURIComponent(cb.dataset.key)}`, { method: 'PATCH', body: { state: cb.checked ? 'done' : 'todo' } });
+          await openIssueDetail(iss.key, { fullPage: appState.permalinkMode, skipHash: true });
+          await renderActiveView();
+        });
+      });
+      $('detail-subtasks-list').querySelectorAll('.subtask-open').forEach((a) => {
+        a.addEventListener('click', (e) => { e.preventDefault(); openIssueDetail(a.dataset.key, { fullPage: appState.permalinkMode }); });
+      });
+
+      // Links
+      $('detail-links-list').innerHTML = (iss.links || []).map((lnk) => `
+        <div style="display:flex;justify-content:space-between;align-items:center;background:var(--bg-card);padding:5px 8px;border-radius:5px;">
+          <span>
+            <span class="badge">${esc(lnk.type)}</span>
+            <a href="#/issues/${encodeURIComponent(lnk.target_key)}" class="link-target-open mono" data-key="${esc(lnk.target_key)}">${esc(lnk.target_key)}</a>
+            — ${esc(lnk.target_name || '')}
+          </span>
+          <button class="btn btn-sm btn-ghost btn-remove-link" data-id="${esc(lnk.id)}">&#10005;</button>
+        </div>
+      `).join('') || '<div style="color:var(--text-muted);font-size:12px;">No linked issues.</div>';
+
+      $('detail-links-list').querySelectorAll('.link-target-open').forEach((a) => {
+        a.addEventListener('click', (e) => { e.preventDefault(); openIssueDetail(a.dataset.key, { fullPage: appState.permalinkMode }); });
+      });
+      $('detail-links-list').querySelectorAll('.btn-remove-link').forEach((b) => {
+        b.addEventListener('click', async () => {
+          await api(`/api/v1/issues/${encodeURIComponent(iss.key)}/links/${encodeURIComponent(b.dataset.id)}`, { method: 'DELETE' });
+          toast('Removed link');
+          await openIssueDetail(iss.key, { fullPage: appState.permalinkMode, skipHash: true });
+        });
+      });
+
+      // Whole-Issue Attachments
+      $('detail-attachments-list').innerHTML = (iss.attachments || []).map((att) => {
+        const dlUrl = `/api/v1/issues/${encodeURIComponent(iss.key)}/attachments/${encodeURIComponent(att.id)}/download`;
+        return `
+          <div class="issue-att-row" data-att-id="${esc(att.id)}" style="display:flex;justify-content:space-between;align-items:center;background:var(--bg-card);padding:6px 8px;border-radius:5px;">
+            <div>
+              <strong class="mono">${esc(att.id)}</strong> ${esc(att.filename)}
+              <span style="color:var(--text-muted);font-size:11px;">(${att.size_bytes} B, ${esc(att.mime_type)})</span>
+            </div>
+            <div style="display:flex;gap:5px;">
+              ${att.is_image
+                ? `<button class="btn btn-sm btn-att-lightbox" data-src="${dlUrl}" data-name="${esc(att.filename)}">Preview Image</button>`
+                : `<button class="btn btn-sm btn-att-preview" data-id="${esc(att.id)}" data-src="${dlUrl}">Preview</button>`}
+              <a class="btn btn-sm btn-att-download" href="${dlUrl}" download="${esc(att.filename)}">Download</a>
+              <button class="btn btn-sm btn-danger btn-att-delete" data-id="${esc(att.id)}">Delete</button>
+            </div>
+          </div>
+        `;
+      }).join('') || '<div style="color:var(--text-muted);font-size:12px;">No whole-issue attachments.</div>';
+
+      $('detail-attachments-list').querySelectorAll('.btn-att-lightbox').forEach((b) => {
+        b.addEventListener('click', () => openImageLightbox(b.dataset.src, b.dataset.name));
+      });
+      $('detail-attachments-list').querySelectorAll('.btn-att-preview').forEach((b) => {
+        b.addEventListener('click', () => openAttachmentPreviewModal(iss.key, b.dataset.id, b.dataset.src));
+      });
+      $('detail-attachments-list').querySelectorAll('.btn-att-delete').forEach((b) => {
+        b.addEventListener('click', async () => {
+          await api(`/api/v1/issues/${encodeURIComponent(iss.key)}/attachments/${encodeURIComponent(b.dataset.id)}`, { method: 'DELETE' });
+          toast(`Deleted attachment ${b.dataset.id}`);
+          await openIssueDetail(iss.key, { fullPage: appState.permalinkMode, skipHash: true });
+        });
+      });
+
+      // Worklogs
+      $('detail-time-summary').textContent = iss.time_progress.estimate_minutes
+        ? `${iss.time_progress.logged_minutes}m / ${iss.time_progress.estimate_minutes}m`
+        : `${iss.time_progress.logged_minutes}m`;
+      $('detail-time-progress').style.width = `${iss.time_progress.pct}%`;
+      $('detail-worklogs-list').innerHTML = (iss.worklogs || []).map((w) => `
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;background:var(--bg-input);padding:3px 6px;border-radius:4px;">
+          <span><strong>${esc(w.author)}</strong>: <span class="mono">${w.minutes}m</span> ${w.note ? '— ' + esc(w.note) : ''}</span>
+          <button class="btn btn-sm btn-ghost btn-del-worklog" data-id="${esc(w.id)}" style="padding:0 4px;">&#10005;</button>
+        </div>
+      `).join('');
+      $('detail-worklogs-list').querySelectorAll('.btn-del-worklog').forEach((b) => {
+        b.addEventListener('click', async () => {
+          await api(`/api/v1/issues/${encodeURIComponent(iss.key)}/worklogs/${encodeURIComponent(b.dataset.id)}`, { method: 'DELETE' });
+          await openIssueDetail(iss.key, { fullPage: appState.permalinkMode, skipHash: true });
+        });
+      });
+
+      // Comments
+      $('detail-comment-count').textContent = String(iss.comment_count || 0);
+      renderCommentsList(iss);
+    }
+
+    async function openAttachmentPreviewModal(issueKey, attId, dlUrl) {
+      try {
+        const info = await api(`/api/v1/issues/${encodeURIComponent(issueKey)}/attachments/${encodeURIComponent(attId)}`);
+        $('att-preview-title').textContent = `${info.id} — ${info.filename}`;
+        $('att-preview-meta').textContent = `MIME: ${info.mime_type} | Size: ${info.size_bytes} bytes | SHA-256: ${info.sha256}`;
+        $('att-preview-content').textContent = info.preview_text !== null && info.preview_text !== undefined
+          ? info.preview_text
+          : '(Binary file — click Download to inspect raw bytes.)';
+        $('att-preview-download').href = dlUrl;
+        openModal('attachment-preview');
+      } catch (err) { toast(err.message, true); }
+    }
+
+    function renderCommentsList(iss) {
+      const box = $('detail-comments-list');
+      box.innerHTML = (iss.comments || []).map((cmt) => {
+        const editedBadge = (cmt.edit_history && cmt.edit_history.length) ? '<span class="badge" title="Edited">edited</span>' : '';
+        const embedsHtml = (cmt.embeds || []).map((emb) => `
+          <span class="badge">
+            Embed: ${esc(emb.filename)} (${esc(emb.id)})
+            <button class="btn btn-sm btn-ghost btn-del-cmt-embed" data-cid="${esc(cmt.id)}" data-aid="${esc(emb.id)}" style="padding:0 4px;" title="Delete embedded image">&#10005;</button>
+          </span>
+        `).join('');
+
+        const attsHtml = (cmt.attachments || []).map((ca) => {
+          const dl = `/api/v1/issues/${encodeURIComponent(iss.key)}/attachments/${encodeURIComponent(ca.id)}/download`;
           return `
-            <g class="dag-node" data-key="${esc(n.key)}" style="cursor:pointer;">
-              <rect x="${p.x}" y="${p.y}" width="${nodeW}" height="${nodeH}" rx="7" fill="var(--bg-surface-2)" stroke="${stroke}" stroke-width="1.5" />
-              <text x="${p.x + 10}" y="${p.y + 19}" fill="var(--text-primary)" font-size="11.5" font-weight="700" font-family="monospace">${esc(n.key)} · ${esc(n.status)}</text>
-              <text x="${p.x + 10}" y="${p.y + 36}" fill="var(--text-secondary)" font-size="11">${esc(n.title.slice(0, 21))}</text>
-            </g>
+            <span class="badge">
+              File: <a href="${dl}" download="${esc(ca.filename)}">${esc(ca.filename)}</a> (${esc(ca.id)})
+              <button class="btn btn-sm btn-ghost btn-preview-cmt-att" data-aid="${esc(ca.id)}" data-dl="${dl}" style="padding:0 4px;">Preview</button>
+              <button class="btn btn-sm btn-ghost btn-del-cmt-att" data-cid="${esc(cmt.id)}" data-aid="${esc(ca.id)}" style="padding:0 4px;" title="Delete comment attachment">&#10005;</button>
+            </span>
           `;
         }).join('');
 
-        svgWrap.innerHTML = `
-          <svg width="${svgW}" height="${svgH}" viewBox="0 0 ${svgW} ${svgH}">
-            <defs>
-              <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-                <path d="M0,0 L8,4 L0,8 Z" fill="var(--text-secondary)" />
-              </marker>
-            </defs>
-            ${edgePaths}
-            ${nodeRects}
-          </svg>
-        `;
-        svgWrap.querySelectorAll('.dag-node').forEach((gn) => {
-          gn.addEventListener('click', () => openIssueDrawer(gn.dataset.key));
-        });
-      }
+        const linkedHtml = (cmt.linked_attachments || []).map((la) => {
+          if (la.deleted) {
+            return `<span class="deleted-att-badge" data-att-id="${esc(la.id)}">[Deleted attachment: ${esc(la.filename || la.id)}]</span>`;
+          }
+          const dl = `/api/v1/issues/${encodeURIComponent(iss.key)}/attachments/${encodeURIComponent(la.id)}/download`;
+          return `
+            <span class="badge">
+              Linked: <a href="${dl}" download="${esc(la.filename)}">${esc(la.filename)}</a> (${esc(la.id)})
+              <button class="btn btn-sm btn-ghost btn-unlink-cmt-att" data-cid="${esc(cmt.id)}" data-aid="${esc(la.id)}" style="padding:0 4px;" title="Unlink attachment">Unlink</button>
+            </span>
+          `;
+        }).join('');
 
-      $('graph-blocked-list').innerHTML = g.blocked_keys.length
-        ? g.blocked_keys.map((k) => `<span class="tag tag-blocked mono" style="cursor:pointer;margin:2px;" data-open="${esc(k)}">${esc(k)}</span>`).join('')
-        : `<span style="color:var(--text-muted);font-size:12px;">Zero blocked issues</span>`;
-      $('graph-ready-list').innerHTML = g.ready_keys.length
-        ? g.ready_keys.map((k) => `<span class="tag mono" style="cursor:pointer;margin:2px;" data-open="${esc(k)}">${esc(k)}</span>`).join('')
-        : `<span style="color:var(--text-muted);font-size:12px;">No ready issues</span>`;
-      document.querySelectorAll('#view-graph [data-open]').forEach((el) => {
-        el.addEventListener('click', () => openIssueDrawer(el.dataset.open));
+        return `
+          <div class="comment-card" data-comment-id="${esc(cmt.id)}" style="border:1px solid var(--border);border-radius:8px;padding:10px;background:var(--bg-card);">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+              <div>
+                <strong>${esc(cmt.author)}</strong>
+                <span class="mono" style="color:var(--text-muted);font-size:11px;margin-left:6px;">${esc(cmt.id)} · ${esc(cmt.created_at)}</span>
+                ${editedBadge}
+              </div>
+              <div style="display:flex;gap:5px;">
+                <button class="btn btn-sm btn-edit-comment" data-cid="${esc(cmt.id)}">Edit</button>
+                <button class="btn btn-sm btn-danger btn-delete-comment" data-cid="${esc(cmt.id)}">Delete</button>
+              </div>
+            </div>
+            <div class="md-body comment-rendered-body">${renderMarkdown(cmt.body || '', iss)}</div>
+            <div class="comment-edit-box" style="display:none;margin-top:6px;">
+              <textarea class="comment-edit-textarea" rows="3" style="width:100%;">${esc(cmt.body || '')}</textarea>
+              <div style="display:flex;gap:6px;margin-top:5px;">
+                <button class="btn btn-sm btn-primary btn-save-comment-edit" data-cid="${esc(cmt.id)}">Save Edit</button>
+                <button class="btn btn-sm btn-cancel-comment-edit">Cancel</button>
+              </div>
+            </div>
+            ${(embedsHtml || attsHtml || linkedHtml)
+              ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;padding-top:6px;border-top:1px solid var(--border);">${embedsHtml}${attsHtml}${linkedHtml}</div>`
+              : ''}
+          </div>
+        `;
+      }).join('') || '<div style="color:var(--text-muted)">No comments yet.</div>';
+
+      box.querySelectorAll('.btn-del-cmt-embed').forEach((b) => {
+        b.addEventListener('click', async () => {
+          const fd = new FormData();
+          fd.append('remove_embeds', JSON.stringify([b.dataset.aid]));
+          await api(`/api/v1/issues/${encodeURIComponent(iss.key)}/comments/${encodeURIComponent(b.dataset.cid)}`, { method: 'PATCH', body: fd });
+          toast(`Deleted embed ${b.dataset.aid}`);
+          await openIssueDetail(iss.key, { fullPage: appState.permalinkMode, skipHash: true });
+        });
+      });
+
+      box.querySelectorAll('.btn-del-cmt-att').forEach((b) => {
+        b.addEventListener('click', async () => {
+          const fd = new FormData();
+          fd.append('remove_attachments', JSON.stringify([b.dataset.aid]));
+          await api(`/api/v1/issues/${encodeURIComponent(iss.key)}/comments/${encodeURIComponent(b.dataset.cid)}`, { method: 'PATCH', body: fd });
+          toast(`Deleted comment attachment ${b.dataset.aid}`);
+          await openIssueDetail(iss.key, { fullPage: appState.permalinkMode, skipHash: true });
+        });
+      });
+
+      box.querySelectorAll('.btn-preview-cmt-att').forEach((b) => {
+        b.addEventListener('click', () => openAttachmentPreviewModal(iss.key, b.dataset.aid, b.dataset.dl));
+      });
+
+      box.querySelectorAll('.btn-unlink-cmt-att').forEach((b) => {
+        b.addEventListener('click', async () => {
+          const fd = new FormData();
+          fd.append('unlink_attachments', JSON.stringify([b.dataset.aid]));
+          await api(`/api/v1/issues/${encodeURIComponent(iss.key)}/comments/${encodeURIComponent(b.dataset.cid)}`, { method: 'PATCH', body: fd });
+          toast(`Unlinked ${b.dataset.aid}`);
+          await openIssueDetail(iss.key, { fullPage: appState.permalinkMode, skipHash: true });
+        });
+      });
+
+      box.querySelectorAll('.btn-edit-comment').forEach((b) => {
+        b.addEventListener('click', () => {
+          const card = b.closest('.comment-card');
+          card.querySelector('.comment-edit-box').style.display = 'block';
+        });
+      });
+      box.querySelectorAll('.btn-cancel-comment-edit').forEach((b) => {
+        b.addEventListener('click', () => { b.closest('.comment-edit-box').style.display = 'none'; });
+      });
+      box.querySelectorAll('.btn-save-comment-edit').forEach((b) => {
+        b.addEventListener('click', async () => {
+          const card = b.closest('.comment-card');
+          const newBody = card.querySelector('.comment-edit-textarea').value;
+          const fd = new FormData();
+          fd.append('body', newBody);
+          await api(`/api/v1/issues/${encodeURIComponent(iss.key)}/comments/${encodeURIComponent(b.dataset.cid)}`, { method: 'PATCH', body: fd });
+          toast(`Updated ${b.dataset.cid}`);
+          await openIssueDetail(iss.key, { fullPage: appState.permalinkMode, skipHash: true });
+        });
+      });
+
+      box.querySelectorAll('.btn-delete-comment').forEach((b) => {
+        b.addEventListener('click', async () => {
+          await api(`/api/v1/issues/${encodeURIComponent(iss.key)}/comments/${encodeURIComponent(b.dataset.cid)}`, { method: 'DELETE' });
+          toast(`Deleted ${b.dataset.cid}`);
+          await openIssueDetail(iss.key, { fullPage: appState.permalinkMode, skipHash: true });
+        });
       });
     }
 
-    // 7. Stats & Workspace Settings
-    async function renderStatsView() {
-      const st = await api('/api/v1/stats');
-      $('cnt-blocked').textContent = st.blocked_count;
-      $('stats-kpi-grid').innerHTML = `
-        <div class="kpi-box"><div class="kpi-label">Total Issues</div><div class="kpi-val">${st.total_issues}</div></div>
-        <div class="kpi-box"><div class="kpi-label">Open / Active</div><div class="kpi-val">${st.open_count}</div></div>
-        <div class="kpi-box"><div class="kpi-label">Ready Queue</div><div class="kpi-val" style="color:var(--ok);">${st.ready_count}</div></div>
-        <div class="kpi-box"><div class="kpi-label">Blocked</div><div class="kpi-val" style="color:var(--danger);">${st.blocked_count}</div></div>
-        <div class="kpi-box"><div class="kpi-label">Points Done</div><div class="kpi-val">${st.completed_points} / ${st.total_points}</div></div>
-      `;
-
-      const renderBars = (obj) => {
-        const entries = Object.entries(obj || {});
-        const total = Math.max(1, entries.reduce((a, [, v]) => a + v, 0));
-        return entries.map(([k, v]) => `
-          <div class="bar-row">
-            <span style="color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis;">${esc(k)}</span>
-            <div class="progress-track" style="margin:0;"><div class="progress-fill" style="width:${Math.round(v / total * 100)}%;background:var(--accent);"></div></div>
-            <span class="mono" style="text-align:right;">${v}</span>
-          </div>
-        `).join('') || `<div style="color:var(--text-muted);font-size:12px;">No data</div>`;
-      };
-
-      $('stats-bars-left').innerHTML = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">BY STATUS</div>` + renderBars(st.by_status)
-        + `<div style="font-size:11px;color:var(--text-muted);margin:12px 0 4px;">BY PRIORITY</div>` + renderBars(st.by_priority);
-      $('stats-bars-right').innerHTML = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">BY TYPE</div>` + renderBars(st.by_type)
-        + `<div style="font-size:11px;color:var(--text-muted);margin:12px 0 4px;">BY ASSIGNEE</div>` + renderBars(st.by_assignee);
-
-      $('cfg-project-key').value = state.config.project_key || 'ITK';
-      $('cfg-project-name').value = state.config.project_name || '';
-
-      $('settings-labels-list').innerHTML = state.labels.map((l) => `
-        <span class="tag" style="border-left:3px solid ${esc(l.color || '#3b82f6')};">${esc(l.name)} <b style="cursor:pointer;margin-left:4px;" data-del-lb="${esc(l.name)}">&times;</b></span>
-      `).join('');
-      $('settings-labels-list').querySelectorAll('[data-del-lb]').forEach((x) => x.addEventListener('click', async () => {
-        await api(`/api/v1/labels/${encodeURIComponent(x.dataset.delLb)}`, { method: 'DELETE' });
-        await refreshCurrentView();
-      }));
-
-      $('settings-comps-list').innerHTML = state.components.map((c) => `
-        <span class="tag">${esc(c.name)}${c.lead ? ` (${esc(c.lead)})` : ''} <b style="cursor:pointer;margin-left:4px;" data-del-cp="${esc(c.name)}">&times;</b></span>
-      `).join('');
-      $('settings-comps-list').querySelectorAll('[data-del-cp]').forEach((x) => x.addEventListener('click', async () => {
-        await api(`/api/v1/components/${encodeURIComponent(x.dataset.delCp)}`, { method: 'DELETE' });
-        await refreshCurrentView();
-      }));
-
-      $('settings-users-list').innerHTML = state.users.map((u) => `
-        <span class="tag">${u.is_agent ? '&#9889; ' : ''}${esc(u.username)} <b style="cursor:pointer;margin-left:4px;" data-del-u="${esc(u.username)}">&times;</b></span>
-      `).join('');
-      $('settings-users-list').querySelectorAll('[data-del-u]').forEach((x) => x.addEventListener('click', async () => {
-        await api(`/api/v1/users/${encodeURIComponent(x.dataset.delU)}`, { method: 'DELETE' });
-        await refreshCurrentView();
-      }));
+    // ----------------------------------------------------------------------
+    // Issue Detail Field Handlers, Clear Controls & Lifecycle Buttons
+    // ----------------------------------------------------------------------
+    async function patchIssue(fields) {
+      if (!appState.activeIssue) return;
+      try {
+        await api(`/api/v1/issues/${encodeURIComponent(appState.activeIssue.key)}`, { method: 'PATCH', body: fields });
+        await openIssueDetail(appState.activeIssue.key, { fullPage: appState.permalinkMode, skipHash: true });
+        await renderActiveView();
+      } catch (err) { toast(err.message, true); }
     }
 
-    $('btn-add-label').addEventListener('click', async () => {
-      const name = $('new-label-name').value.trim();
-      if (!name) return;
-      await api('/api/v1/labels', { method: 'POST', body: { name, color: $('new-label-color').value } });
-      $('new-label-name').value = '';
-      await refreshCurrentView();
-    });
-    $('btn-add-comp').addEventListener('click', async () => {
-      const name = $('new-comp-name').value.trim();
-      if (!name) return;
-      await api('/api/v1/components', { method: 'POST', body: { name, lead: $('new-comp-lead').value.trim() || null } });
-      $('new-comp-name').value = '';
-      $('new-comp-lead').value = '';
-      await refreshCurrentView();
-    });
-    $('btn-add-user').addEventListener('click', async () => {
-      const username = $('new-user-name').value.trim();
-      if (!username) return;
-      await api('/api/v1/users', { method: 'POST', body: { username, is_agent: $('new-user-agent').checked } });
-      $('new-user-name').value = '';
-      await refreshCurrentView();
-    });
-    $('btn-save-config').addEventListener('click', async () => {
+    async function submitTitleRename() {
+      if (!appState.activeIssue) return;
+      const newName = $('detail-title-input').value.trim();
+      if (!newName || newName === appState.activeIssue.name) return;
       try {
-        await api('/api/v1/config', {
-          method: 'PATCH',
-          body: { project_key: $('cfg-project-key').value.trim(), project_name: $('cfg-project-name').value.trim() }
+        await api(`/api/v1/issues/${encodeURIComponent(appState.activeIssue.key)}/rename`, {
+          method: 'POST',
+          body: { new_name: newName },
         });
-        toast('Workspace configuration saved');
-        await refreshCurrentView();
+        toast(`Renamed folder -> "${newName}"`);
+        await openIssueDetail(appState.activeIssue.key, { fullPage: appState.permalinkMode, skipHash: true });
+        await renderActiveView();
+      } catch (err) {
+        toast(err.message, true);
+        $('detail-title-input').value = appState.activeIssue.name;
+      }
+    }
+    $('btn-save-title').addEventListener('click', submitTitleRename);
+    $('detail-title-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submitTitleRename(); } });
+
+    $('detail-category').addEventListener('change', () => patchIssue({ category: $('detail-category').value }));
+    $('detail-state').addEventListener('change', () => patchIssue({ state: $('detail-state').value }));
+    $('detail-priority').addEventListener('change', () => patchIssue({ priority: $('detail-priority').value }));
+    $('detail-severity').addEventListener('change', () => patchIssue({ severity: $('detail-severity').value }));
+    $('detail-resolution').addEventListener('change', () => patchIssue({ resolution: $('detail-resolution').value || null }));
+    $('detail-assignee').addEventListener('change', () => patchIssue({ assignee: $('detail-assignee').value.trim() || null }));
+    $('detail-reporter').addEventListener('change', () => patchIssue({ reporter: $('detail-reporter').value.trim() || null }));
+    $('detail-parent').addEventListener('change', () => patchIssue({ parent: $('detail-parent').value.trim() || null }));
+    $('detail-sprint').addEventListener('change', () => patchIssue({ sprint: $('detail-sprint').value || null }));
+    $('detail-milestone').addEventListener('change', () => patchIssue({ milestone: $('detail-milestone').value || null }));
+    $('detail-points').addEventListener('change', () => patchIssue({ story_points: $('detail-points').value !== '' ? Number($('detail-points').value) : null }));
+    $('detail-estimate').addEventListener('change', () => patchIssue({ estimate_minutes: $('detail-estimate').value !== '' ? Number($('detail-estimate').value) : null }));
+    $('detail-due').addEventListener('change', () => patchIssue({ due_date: $('detail-due').value || null }));
+    $('detail-tags').addEventListener('change', () => patchIssue({ tags: $('detail-tags').value.split(',').map((s) => s.trim()).filter(Boolean) }));
+    $('detail-components').addEventListener('change', () => patchIssue({ components: $('detail-components').value.split(',').map((s) => s.trim()).filter(Boolean) }));
+
+    // Explicit Clear Buttons
+    $('btn-clear-resolution').addEventListener('click', () => patchIssue({ clear_resolution: true }));
+    $('btn-clear-assignee').addEventListener('click', () => patchIssue({ clear_assignee: true }));
+    $('btn-clear-reporter').addEventListener('click', () => patchIssue({ clear_reporter: true }));
+    $('btn-clear-parent').addEventListener('click', () => patchIssue({ clear_parent: true }));
+    $('btn-clear-sprint').addEventListener('click', () => patchIssue({ clear_sprint: true }));
+    $('btn-clear-milestone').addEventListener('click', () => patchIssue({ clear_milestone: true }));
+    $('btn-clear-points').addEventListener('click', () => patchIssue({ clear_points: true }));
+    $('btn-clear-estimate').addEventListener('click', () => patchIssue({ clear_estimate: true }));
+    $('btn-clear-due').addEventListener('click', () => patchIssue({ clear_due: true }));
+    $('btn-clear-tags').addEventListener('click', () => patchIssue({ clear_tags: true }));
+    $('btn-clear-components').addEventListener('click', () => patchIssue({ clear_components: true }));
+    $('btn-clear-cf').addEventListener('click', () => patchIssue({ clear_fields: true }));
+    $('btn-clear-ac').addEventListener('click', () => patchIssue({ clear_ac: true }));
+    $('btn-clear-desc').addEventListener('click', () => patchIssue({ clear_desc: true }));
+
+    $('btn-add-cf').addEventListener('click', () => {
+      const k = $('detail-cf-key').value.trim();
+      const v = $('detail-cf-val').value.trim();
+      if (!k) return;
+      $('detail-cf-key').value = ''; $('detail-cf-val').value = '';
+      patchIssue({ set_fields: { [k]: v } });
+    });
+
+    $('btn-edit-desc').addEventListener('click', () => {
+      $('detail-desc-rendered').style.display = 'none';
+      $('detail-desc-editor').style.display = 'block';
+    });
+    $('btn-cancel-desc').addEventListener('click', () => {
+      $('detail-desc-editor').style.display = 'none';
+      $('detail-desc-rendered').style.display = 'block';
+    });
+    $('btn-save-desc').addEventListener('click', () => patchIssue({ description: $('detail-desc-textarea').value }));
+
+    $('detail-desc-embed-input').addEventListener('change', async (e) => {
+      if (!appState.activeIssue || !e.target.files || !e.target.files.length) return;
+      const fd = new FormData();
+      Array.from(e.target.files).forEach((f) => fd.append('files', f, f.name));
+      e.target.value = '';
+      try {
+        await api(`/api/v1/issues/${encodeURIComponent(appState.activeIssue.key)}/embeds`, { method: 'POST', body: fd });
+        toast('Embedded image into description');
+        await openIssueDetail(appState.activeIssue.key, { fullPage: appState.permalinkMode, skipHash: true });
       } catch (err) { toast(err.message, true); }
     });
-    $('btn-reindex').addEventListener('click', async () => {
-      const res = await api('/api/v1/reindex', { method: 'POST' });
-      toast(`Reindexed ${res.indexed_issues} issues from JSON in ${res.duration_ms}ms`);
-    });
-    $('btn-export-json').addEventListener('click', async () => {
-      const bundle = await api('/api/v1/export');
-      const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = `itrack-export-${Date.now()}.json`;
-      a.click();
+
+    $('btn-add-ac').addEventListener('click', () => {
+      const txt = $('detail-ac-input').value.trim();
+      if (!txt) return;
+      $('detail-ac-input').value = '';
+      patchIssue({ add_ac: [txt] });
     });
 
-    // Create Issue Modal
-    function openCreateModal(prefill = {}) {
-      $('form-create-issue').reset();
-      populateSelectOptions();
-      if (prefill.status) $('ci-status').value = prefill.status;
-      if (prefill.type) $('ci-type').value = prefill.type;
-      $('create-issue-modal').classList.add('open');
-      setTimeout(() => $('ci-title').focus(), 30);
-    }
-    function closeCreateModal() {
-      $('create-issue-modal').classList.remove('open');
-    }
-    $('btn-new-issue').addEventListener('click', () => openCreateModal());
-    $('btn-close-create-modal').addEventListener('click', closeCreateModal);
-    $('btn-cancel-create').addEventListener('click', closeCreateModal);
-
-    $('form-create-issue').addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const labels = $('ci-labels').value.split(',').map((s) => s.trim()).filter(Boolean);
-      const components = $('ci-components').value.split(',').map((s) => s.trim()).filter(Boolean);
-      const pts = $('ci-points').value;
+    $('btn-add-subtask').addEventListener('click', async () => {
+      if (!appState.activeIssue) return;
+      const name = $('detail-subtask-input').value.trim();
+      if (!name) return;
       try {
-        const created = await api('/api/v1/issues', {
+        await api('/api/v1/issues', {
+          method: 'POST',
+          body: { name, category: 'subtask', parent: appState.activeIssue.key, state: 'todo' },
+        });
+        $('detail-subtask-input').value = '';
+        await openIssueDetail(appState.activeIssue.key, { fullPage: appState.permalinkMode, skipHash: true });
+        await renderActiveView();
+      } catch (err) { toast(err.message, true); }
+    });
+
+    // Clone, Context Pack, Archive, Unarchive, Delete Confirm Modal
+    $('btn-clone-issue').addEventListener('click', async () => {
+      if (!appState.activeIssue) return;
+      try {
+        const cloned = await api(`/api/v1/issues/${encodeURIComponent(appState.activeIssue.key)}/clone`, { method: 'POST', body: {} });
+        toast(`Cloned -> ${cloned.key}`);
+        await renderActiveView();
+        await openIssueDetail(cloned.key, { fullPage: appState.permalinkMode });
+      } catch (err) { toast(err.message, true); }
+    });
+
+    $('btn-copy-context').addEventListener('click', async () => {
+      if (!appState.activeIssue) return;
+      try {
+        const ctx = await api(`/api/v1/issues/${encodeURIComponent(appState.activeIssue.key)}/context`);
+        window.__lastAgentContextPack = ctx.markdown;
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          try { await navigator.clipboard.writeText(ctx.markdown); } catch (_) {}
+        }
+        toast('Copied Agent Context Pack');
+      } catch (err) { toast(err.message, true); }
+    });
+
+    $('btn-archive-issue').addEventListener('click', async () => {
+      if (!appState.activeIssue) return;
+      await api(`/api/v1/issues/${encodeURIComponent(appState.activeIssue.key)}/archive`, { method: 'POST', body: {} });
+      toast(`Archived ${appState.activeIssue.key}`);
+      await openIssueDetail(appState.activeIssue.key, { fullPage: appState.permalinkMode, skipHash: true });
+      await renderActiveView();
+    });
+
+    $('btn-unarchive-issue').addEventListener('click', async () => {
+      if (!appState.activeIssue) return;
+      await api(`/api/v1/issues/${encodeURIComponent(appState.activeIssue.key)}/unarchive`, { method: 'POST', body: {} });
+      toast(`Unarchived ${appState.activeIssue.key}`);
+      await openIssueDetail(appState.activeIssue.key, { fullPage: appState.permalinkMode, skipHash: true });
+      await renderActiveView();
+    });
+
+    $('btn-delete-issue').addEventListener('click', () => {
+      if (!appState.activeIssue) return;
+      $('delete-confirm-message').textContent = `Permanently delete ${appState.activeIssue.key} ("${appState.activeIssue.name}") and its entire folder?`;
+      openModal('delete-confirm');
+    });
+
+    $('btn-confirm-delete').addEventListener('click', async () => {
+      if (!appState.activeIssue) return;
+      const k = appState.activeIssue.key;
+      try {
+        await api(`/api/v1/issues/${encodeURIComponent(k)}`, { method: 'DELETE' });
+        closeModal('delete-confirm');
+        closeIssueDetail();
+        toast(`Deleted ${k}`);
+        await refreshMetadataAndCurrentView();
+      } catch (err) { toast(err.message, true); }
+    });
+
+    // Whole-Issue Attachment Upload (Picker + Drag-and-Drop)
+    async function uploadIssueAttachments(fileList) {
+      if (!appState.activeIssue || !fileList || !fileList.length) return;
+      const fd = new FormData();
+      Array.from(fileList).forEach((f) => fd.append('files', f, f.name));
+      try {
+        await api(`/api/v1/issues/${encodeURIComponent(appState.activeIssue.key)}/attachments`, { method: 'POST', body: fd });
+        toast(`Uploaded ${fileList.length} attachment(s)`);
+        await openIssueDetail(appState.activeIssue.key, { fullPage: appState.permalinkMode, skipHash: true });
+      } catch (err) { toast(err.message, true); }
+    }
+    $('detail-attach-input').addEventListener('change', (e) => {
+      uploadIssueAttachments(e.target.files);
+      e.target.value = '';
+    });
+    $('detail-attach-dropzone').addEventListener('dragover', (e) => { e.preventDefault(); $('detail-attach-dropzone').classList.add('drag-over'); });
+    $('detail-attach-dropzone').addEventListener('dragleave', () => $('detail-attach-dropzone').classList.remove('drag-over'));
+    $('detail-attach-dropzone').addEventListener('drop', (e) => {
+      e.preventDefault();
+      $('detail-attach-dropzone').classList.remove('drag-over');
+      if (e.dataTransfer && e.dataTransfer.files) uploadIssueAttachments(e.dataTransfer.files);
+    });
+
+    // Links Modal & Tree Hierarchy
+    function formatTreeLines(nodes, indent) {
+      let out = '';
+      (nodes || []).forEach((n) => {
+        const blk = n.is_blocked ? ' [BLOCKED]' : '';
+        const lnks = (n.links || []).map((l) => `${l.type}->${l.target_key}`).join(', ');
+        out += `${indent}${n.key} "${n.name}" (${n.state}, ${n.priority})${blk}${lnks ? ' {' + lnks + '}' : ''}\n`;
+        out += formatTreeLines(n.children, indent + '  └─ ');
+      });
+      return out;
+    }
+
+    async function openLinkAndTreeModal(rootKey) {
+      $('link-form-row').style.display = rootKey ? 'flex' : 'none';
+      const url = rootKey ? `/api/v1/tree?root=${encodeURIComponent(rootKey)}` : '/api/v1/tree';
+      const treeData = await api(url);
+      $('modal-tree-hierarchy').textContent = formatTreeLines(treeData.trees, '') || '(No issues in hierarchy)';
+      openModal('link-issue');
+    }
+
+    $('btn-open-link-modal').addEventListener('click', () => {
+      if (appState.activeIssue) openLinkAndTreeModal(appState.activeIssue.key);
+    });
+    $('btn-view-tree').addEventListener('click', () => {
+      if (appState.activeIssue) openLinkAndTreeModal(appState.activeIssue.key);
+    });
+    $('btn-open-global-tree').addEventListener('click', () => openLinkAndTreeModal(null));
+
+    $('btn-submit-link').addEventListener('click', async () => {
+      if (!appState.activeIssue) return;
+      const tgt = $('link-modal-target').value.trim();
+      if (!tgt) return;
+      try {
+        await api(`/api/v1/issues/${encodeURIComponent(appState.activeIssue.key)}/links`, {
+          method: 'POST',
+          body: { type: $('link-modal-type').value, target: tgt },
+        });
+        $('link-modal-target').value = '';
+        toast('Link added');
+        await openLinkAndTreeModal(appState.activeIssue.key);
+        await openIssueDetail(appState.activeIssue.key, { fullPage: appState.permalinkMode, skipHash: true });
+        await renderActiveView();
+      } catch (err) { toast(err.message, true); }
+    });
+
+    // Worklog Modal
+    $('btn-open-worklog-modal').addEventListener('click', () => {
+      $('worklog-modal-duration').value = '';
+      $('worklog-modal-note').value = '';
+      openModal('log-work');
+    });
+    $('btn-submit-worklog').addEventListener('click', async () => {
+      if (!appState.activeIssue) return;
+      try {
+        await api(`/api/v1/issues/${encodeURIComponent(appState.activeIssue.key)}/worklogs`, {
           method: 'POST',
           body: {
-            title: $('ci-title').value.trim(),
-            description: $('ci-desc').value,
-            type: $('ci-type').value,
-            priority: $('ci-priority').value,
-            status: $('ci-status').value,
-            assignee: $('ci-assignee').value.trim() || null,
-            labels,
-            components,
-            story_points: pts !== '' ? Number(pts) : null,
-            epic_id: $('ci-epic').value || null,
-            sprint_id: $('ci-sprint').value || null,
-            due_date: $('ci-due').value || null,
-          }
+            duration: $('worklog-modal-duration').value.trim(),
+            note: $('worklog-modal-note').value.trim(),
+          },
         });
-        closeCreateModal();
-        toast(`Created ${created.key}`);
-        await refreshCurrentView();
-      } catch (err) {
-        toast(err.message, true);
-      }
-    });
-
-    // Slide-over Issue Detail Drawer
-    async function openIssueDrawer(key) {
-      try {
-        const [iss, subRes] = await Promise.all([
-          api(`/api/v1/issues/${key}`),
-          api(`/api/v1/issues/${key}/subtasks`),
-        ]);
-        state.activeIssue = iss;
-        populateSelectOptions();
-
-        $('dr-key').textContent = iss.key;
-        $('dr-title').value = iss.title || '';
-        $('dr-desc').value = iss.description || '';
-        $('dr-status').value = iss.status;
-        $('dr-priority').value = iss.priority;
-        $('dr-type').value = iss.type;
-        $('dr-assignee').value = iss.assignee || '';
-        $('dr-points').value = iss.story_points != null ? iss.story_points : '';
-        $('dr-sprint').value = iss.sprint_id || '';
-        $('dr-epic').value = iss.epic_id || '';
-        $('dr-milestone').value = iss.milestone_id || '';
-        $('dr-due').value = iss.due_date || '';
-        $('dr-labels').value = (iss.labels || []).join(', ');
-        $('dr-components').value = (iss.components || []).join(', ');
-
-        $('dr-blocked-badge').style.display = iss.is_blocked ? 'inline-block' : 'none';
-        $('dr-blocked-badge').textContent = iss.unresolved_blockers.length
-          ? `BLOCKED BY ${iss.unresolved_blockers.join(', ')}`
-          : 'BLOCKED';
-
-        if (iss.claimed_by) {
-          $('dr-claimed-badge').style.display = 'inline-block';
-          $('dr-claimed-badge').textContent = `Claimed: ${iss.claimed_by}`;
-          $('dr-btn-claim').style.display = 'none';
-          $('dr-btn-release').style.display = 'inline-flex';
-        } else {
-          $('dr-claimed-badge').style.display = 'none';
-          $('dr-btn-claim').style.display = 'inline-flex';
-          $('dr-btn-release').style.display = 'none';
-        }
-
-        $('dr-timestamps').innerHTML = `Created: ${esc(iss.created_at)}<br/>Updated: ${esc(iss.updated_at)}`;
-
-        // Subtasks
-        $('dr-subtasks-count').textContent = `${subRes.completed_count}/${subRes.total_count}`;
-        $('dr-subtasks-list').innerHTML = (subRes.subtasks || []).map((st) => `
-          <div style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border-subtle);">
-            <label style="display:flex;align-items:center;gap:7px;cursor:pointer;">
-              <input type="checkbox" class="sub-toggle" data-key="${esc(st.key)}" ${st.status === 'done' ? 'checked' : ''} />
-              <span class="mono">${esc(st.key)}</span>
-              <span style="${st.status === 'done' ? 'text-decoration:line-through;color:var(--text-muted);' : ''}">${esc(st.title)}</span>
-            </label>
-            <button class="btn btn-sm btn-ghost" data-jump="${esc(st.key)}">Open</button>
-          </div>
-        `).join('');
-        $('dr-subtasks-list').querySelectorAll('.sub-toggle').forEach((chk) => {
-          chk.addEventListener('change', async () => {
-            await api(`/api/v1/issues/${chk.dataset.key}/transition`, {
-              method: 'POST',
-              body: { status: chk.checked ? 'done' : 'todo', force: true }
-            });
-            await openIssueDrawer(iss.key);
-            await refreshCurrentView();
-          });
-        });
-        $('dr-subtasks-list').querySelectorAll('[data-jump]').forEach((b) => {
-          b.addEventListener('click', () => openIssueDrawer(b.dataset.jump));
-        });
-
-        // Links
-        $('dr-links-list').innerHTML = (iss.all_links || []).map((l) => `
-          <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--border-subtle);">
-            <span><span class="tag">${esc(l.link_type)}</span> <a href="#" class="mono link-jump" data-key="${esc(l.target_key)}" style="color:var(--accent);">${esc(l.target_key)}</a></span>
-            <button class="btn btn-sm btn-ghost link-del" data-id="${esc(l.id)}">&#10005;</button>
-          </div>
-        `).join('') || `<div style="font-size:12px;color:var(--text-muted);">No linked issues.</div>`;
-        $('dr-links-list').querySelectorAll('.link-jump').forEach((a) => {
-          a.addEventListener('click', (e) => { e.preventDefault(); openIssueDrawer(a.dataset.key); });
-        });
-        $('dr-links-list').querySelectorAll('.link-del').forEach((b) => {
-          b.addEventListener('click', async () => {
-            await api(`/api/v1/issues/${iss.key}/links/${b.dataset.id}`, { method: 'DELETE' });
-            await openIssueDrawer(iss.key);
-            await refreshCurrentView();
-          });
-        });
-
-        // Attachments
-        $('dr-attachments-list').innerHTML = (iss.attachments || []).map((a) => `
-          <div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--border-subtle);">
-            <div>
-              <a href="/api/v1/issues/${encodeURIComponent(iss.key)}/attachments/${encodeURIComponent(a.id)}/download" style="color:var(--accent);font-weight:550;">${esc(a.filename)}</a>
-              <span class="mono" style="font-size:11px;color:var(--text-muted);margin-left:6px;">${a.size_bytes}B · sha256:${esc((a.sha256 || '').slice(0, 10))}</span>
-            </div>
-            <button class="btn btn-sm btn-ghost att-del" data-id="${esc(a.id)}">&#10005;</button>
-          </div>
-        `).join('') || `<div style="font-size:12px;color:var(--text-muted);">No attachments uploaded.</div>`;
-        $('dr-attachments-list').querySelectorAll('.att-del').forEach((b) => {
-          b.addEventListener('click', async () => {
-            await api(`/api/v1/issues/${iss.key}/attachments/${b.dataset.id}`, { method: 'DELETE' });
-            await openIssueDrawer(iss.key);
-          });
-        });
-
-        // Comments
-        $('dr-comments-list').innerHTML = (iss.comments || []).map((c) => `
-          <div class="comment-item">
-            <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted);margin-bottom:4px;">
-              <span><strong>${esc(c.author)}</strong> · ${esc(c.created_at)}</span>
-              <span>
-                <button class="btn btn-sm btn-ghost cmt-edit" data-id="${esc(c.id)}" style="padding:0 4px;">Edit</button>
-                <button class="btn btn-sm btn-ghost cmt-del" data-id="${esc(c.id)}" style="padding:0 4px;">&#10005;</button>
-              </span>
-            </div>
-            <div style="white-space:pre-wrap;">${esc(c.body)}</div>
-          </div>
-        `).join('');
-        $('dr-comments-list').querySelectorAll('.cmt-edit').forEach((b) => {
-          b.addEventListener('click', async () => {
-            const c = iss.comments.find((x) => x.id === b.dataset.id);
-            const next = prompt('Edit comment:', c ? c.body : '');
-            if (next && next.trim()) {
-              await api(`/api/v1/issues/${iss.key}/comments/${b.dataset.id}`, { method: 'PATCH', body: { body: next } });
-              await openIssueDrawer(iss.key);
-            }
-          });
-        });
-        $('dr-comments-list').querySelectorAll('.cmt-del').forEach((b) => {
-          b.addEventListener('click', async () => {
-            await api(`/api/v1/issues/${iss.key}/comments/${b.dataset.id}`, { method: 'DELETE' });
-            await openIssueDrawer(iss.key);
-          });
-        });
-
-        // Worklogs
-        $('dr-worklog-total').textContent = `${iss.total_worklog_minutes || 0}m`;
-        $('dr-worklogs-list').innerHTML = (iss.worklogs || []).map((w) => `
-          <div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0;border-bottom:1px solid var(--border-subtle);">
-            <span><strong>${esc(w.author)}</strong> logged <span class="mono">${w.minutes}m</span>${w.note ? ` — ${esc(w.note)}` : ''}</span>
-            <button class="btn btn-sm btn-ghost wl-del" data-id="${esc(w.id)}" style="padding:0 4px;">&#10005;</button>
-          </div>
-        `).join('');
-        $('dr-worklogs-list').querySelectorAll('.wl-del').forEach((b) => {
-          b.addEventListener('click', async () => {
-            await api(`/api/v1/issues/${iss.key}/worklogs/${b.dataset.id}`, { method: 'DELETE' });
-            await openIssueDrawer(iss.key);
-          });
-        });
-
-        // History
-        $('dr-history-list').innerHTML = (iss.history || []).slice().reverse().map((h) => `
-          <div style="padding:4px 0;border-bottom:1px solid var(--border-subtle);">
-            <span class="mono">${esc(h.timestamp)}</span> · <strong>${esc(h.actor)}</strong> · ${esc(h.action)}
-          </div>
-        `).join('');
-
-        $('issue-drawer-backdrop').classList.add('open');
-      } catch (err) {
-        toast(err.message, true);
-      }
-    }
-
-    function closeIssueDrawer() {
-      $('issue-drawer-backdrop').classList.remove('open');
-      state.activeIssue = null;
-    }
-    $('dr-btn-close').addEventListener('click', closeIssueDrawer);
-    $('issue-drawer-backdrop').addEventListener('click', (e) => {
-      if (e.target === $('issue-drawer-backdrop')) closeIssueDrawer();
-    });
-
-    async function patchActiveIssue(fields) {
-      if (!state.activeIssue) return;
-      try {
-        await api(`/api/v1/issues/${state.activeIssue.key}`, { method: 'PATCH', body: fields });
-        await openIssueDrawer(state.activeIssue.key);
-        await refreshCurrentView();
-      } catch (err) { toast(err.message, true); }
-    }
-
-    $('dr-btn-save-text').addEventListener('click', () => {
-      patchActiveIssue({ title: $('dr-title').value.trim(), description: $('dr-desc').value });
-      toast('Saved issue content');
-    });
-    $('dr-status').addEventListener('change', async () => {
-      if (!state.activeIssue) return;
-      try {
-        await api(`/api/v1/issues/${state.activeIssue.key}/transition`, {
-          method: 'POST',
-          body: { status: $('dr-status').value }
-        });
-        await openIssueDrawer(state.activeIssue.key);
-        await refreshCurrentView();
-      } catch (err) {
-        toast(err.message, true);
-        $('dr-status').value = state.activeIssue.status;
-      }
-    });
-    $('dr-priority').addEventListener('change', () => patchActiveIssue({ priority: $('dr-priority').value }));
-    $('dr-type').addEventListener('change', () => patchActiveIssue({ type: $('dr-type').value }));
-    $('dr-assignee').addEventListener('change', () => patchActiveIssue({ assignee: $('dr-assignee').value.trim() || null }));
-    $('dr-points').addEventListener('change', () => patchActiveIssue({ story_points: $('dr-points').value !== '' ? Number($('dr-points').value) : null }));
-    $('dr-sprint').addEventListener('change', () => patchActiveIssue({ sprint_id: $('dr-sprint').value || null }));
-    $('dr-epic').addEventListener('change', () => patchActiveIssue({ epic_id: $('dr-epic').value || null }));
-    $('dr-milestone').addEventListener('change', () => patchActiveIssue({ milestone_id: $('dr-milestone').value || null }));
-    $('dr-due').addEventListener('change', () => patchActiveIssue({ due_date: $('dr-due').value || null }));
-    $('dr-labels').addEventListener('change', () => patchActiveIssue({ labels: $('dr-labels').value.split(',').map((s) => s.trim()).filter(Boolean) }));
-    $('dr-components').addEventListener('change', () => patchActiveIssue({ components: $('dr-components').value.split(',').map((s) => s.trim()).filter(Boolean) }));
-
-    $('dr-btn-claim').addEventListener('click', async () => {
-      if (!state.activeIssue) return;
-      const agent = $('ready-agent-input').value.trim() || prompt('Claim as user/agent:', 'agent-1');
-      if (!agent) return;
-      try {
-        await api(`/api/v1/issues/${state.activeIssue.key}/claim`, { method: 'POST', body: { agent } });
-        toast(`Claimed by ${agent}`);
-        await openIssueDrawer(state.activeIssue.key);
-        await refreshCurrentView();
-      } catch (err) { toast(err.message, true); }
-    });
-    $('dr-btn-release').addEventListener('click', async () => {
-      if (!state.activeIssue) return;
-      await api(`/api/v1/issues/${state.activeIssue.key}/release`, { method: 'POST', body: { status: 'todo' } });
-      await openIssueDrawer(state.activeIssue.key);
-      await refreshCurrentView();
-    });
-    $('dr-btn-clone').addEventListener('click', async () => {
-      if (!state.activeIssue) return;
-      const cloned = await api(`/api/v1/issues/${state.activeIssue.key}/clone`, { method: 'POST', body: { include_subtasks: true } });
-      toast(`Cloned -> ${cloned.key}`);
-      await openIssueDrawer(cloned.key);
-      await refreshCurrentView();
-    });
-    $('dr-btn-delete').addEventListener('click', async () => {
-      if (!state.activeIssue) return;
-      const k = state.activeIssue.key;
-      if (!confirm(`Delete ${k}?`)) return;
-      await api(`/api/v1/issues/${k}`, { method: 'DELETE' });
-      closeIssueDrawer();
-      toast(`Deleted ${k}`);
-      await refreshCurrentView();
-    });
-
-    $('dr-btn-add-subtask').addEventListener('click', async () => {
-      if (!state.activeIssue) return;
-      const title = $('dr-subtask-title').value.trim();
-      if (!title) return;
-      await api(`/api/v1/issues/${state.activeIssue.key}/subtasks`, { method: 'POST', body: { title } });
-      $('dr-subtask-title').value = '';
-      await openIssueDrawer(state.activeIssue.key);
-      await refreshCurrentView();
-    });
-
-    $('dr-btn-add-link').addEventListener('click', async () => {
-      if (!state.activeIssue) return;
-      const target_key = $('dr-link-target').value.trim().toUpperCase();
-      if (!target_key) return;
-      try {
-        await api(`/api/v1/issues/${state.activeIssue.key}/links`, {
-          method: 'POST',
-          body: { target_key, link_type: $('dr-link-type').value }
-        });
-        $('dr-link-target').value = '';
-        await openIssueDrawer(state.activeIssue.key);
-        await refreshCurrentView();
+        closeModal('log-work');
+        toast('Logged work');
+        await openIssueDetail(appState.activeIssue.key, { fullPage: appState.permalinkMode, skipHash: true });
       } catch (err) { toast(err.message, true); }
     });
 
-    $('dr-btn-upload-att').addEventListener('click', async () => {
-      if (!state.activeIssue) return;
-      const fileInput = $('attachment-file-input');
-      if (!fileInput.files || !fileInput.files.length) return toast('Choose a file first', true);
-      const fd = new FormData();
-      fd.append('file', fileInput.files[0]);
-      fd.append('uploaded_by', 'web-ui');
-      try {
-        await api(`/api/v1/issues/${state.activeIssue.key}/attachments`, { method: 'POST', body: fd });
-        fileInput.value = '';
-        toast('Attachment uploaded');
-        await openIssueDrawer(state.activeIssue.key);
-      } catch (err) { toast(err.message, true); }
+    // Comments vs History Tabs
+    $('tab-btn-comments').addEventListener('click', () => {
+      $('tab-btn-comments').classList.add('btn-primary');
+      $('tab-btn-history').classList.remove('btn-primary');
+      $('detail-comments-pane').style.display = 'block';
+      $('detail-history-pane').style.display = 'none';
     });
-
-    $('btn-add-comment').addEventListener('click', async () => {
-      if (!state.activeIssue) return;
-      const body = $('comment-body-input').value.trim();
-      if (!body) return;
-      await api(`/api/v1/issues/${state.activeIssue.key}/comments`, { method: 'POST', body: { body } });
-      $('comment-body-input').value = '';
-      await openIssueDrawer(state.activeIssue.key);
-    });
-
-    $('dr-btn-add-worklog').addEventListener('click', async () => {
-      if (!state.activeIssue) return;
-      const duration = $('worklog-duration-input').value.trim();
-      if (!duration) return;
-      try {
-        await api(`/api/v1/issues/${state.activeIssue.key}/worklogs`, {
-          method: 'POST',
-          body: { duration, note: $('worklog-note-input').value.trim() }
-        });
-        $('worklog-duration-input').value = '';
-        $('worklog-note-input').value = '';
-        await openIssueDrawer(state.activeIssue.key);
-      } catch (err) { toast(err.message, true); }
-    });
-
-    // Command Palette (Ctrl/Cmd+K) & Keyboard Shortcuts
-    function openCmdPalette() {
-      $('cmd-palette-modal').classList.add('open');
-      $('cmd-palette-input').value = '';
-      renderCmdResults('');
-      setTimeout(() => $('cmd-palette-input').focus(), 20);
-    }
-    function closeCmdPalette() {
-      $('cmd-palette-modal').classList.remove('open');
-    }
-    $('btn-cmd-palette').addEventListener('click', openCmdPalette);
-    $('cmd-palette-modal').addEventListener('click', (e) => {
-      if (e.target === $('cmd-palette-modal')) closeCmdPalette();
-    });
-
-    async function renderCmdResults(q) {
-      const cmds = [
-        { label: '+ Create New Issue', run: () => openCreateModal() },
-        { label: 'Go to Kanban Board', run: () => switchView('board') },
-        { label: 'Go to Issue List & Bulk Triage', run: () => switchView('list') },
-        { label: 'Go to Ready Queue (Agent Claims)', run: () => switchView('ready') },
-        { label: 'Go to Sprints & Backlog', run: () => switchView('sprints') },
-        { label: 'Go to Epics & Milestones', run: () => switchView('epics') },
-        { label: 'Go to Dependency DAG', run: () => switchView('graph') },
-        { label: 'Go to Analytics & Settings', run: () => switchView('stats') },
-        { label: 'Toggle Dark / Light Theme', run: () => $('btn-theme-toggle').click() },
-        { label: 'Rebuild SQLite/FTS5 Index from Disk JSON', run: () => $('btn-reindex').click() },
-      ];
-      let filtered = cmds.filter((c) => !q || c.label.toLowerCase().includes(q.toLowerCase()));
-      if (q && q.length >= 2) {
-        try {
-          const sr = await api(`/api/v1/search?q=${encodeURIComponent(q)}&limit=6`);
-          (sr.issues || []).forEach((iss) => {
-            filtered.unshift({
-              label: `${iss.key} — ${iss.title} [${iss.status}]`,
-              run: () => openIssueDrawer(iss.key),
-            });
-          });
-        } catch (_) {}
-      }
-      const box = $('cmd-palette-results');
-      box.innerHTML = filtered.map((item, idx) => `
-        <button class="nav-btn" data-idx="${idx}">${esc(item.label)}</button>
+    $('tab-btn-history').addEventListener('click', async () => {
+      if (!appState.activeIssue) return;
+      $('tab-btn-history').classList.add('btn-primary');
+      $('tab-btn-comments').classList.remove('btn-primary');
+      $('detail-comments-pane').style.display = 'none';
+      $('detail-history-pane').style.display = 'block';
+      const hRes = await api(`/api/v1/issues/${encodeURIComponent(appState.activeIssue.key)}/history`);
+      $('detail-history-list').innerHTML = (hRes.history || []).slice().reverse().map((h) => `
+        <div style="background:var(--bg-card);padding:8px;border-radius:6px;border:1px solid var(--border);">
+          <div><span class="mono" style="font-size:11px;color:var(--text-muted)">${esc(h.timestamp)}</span> · <strong>${esc(h.actor)}</strong> · <span class="badge">${esc(h.action)}</span></div>
+          <div style="margin-top:4px;font-size:12px;" class="mono">
+            ${(h.diffs || []).map((d) => `${esc(d.field)}: ${esc(JSON.stringify(d.old))} &rarr; ${esc(JSON.stringify(d.new))}`).join('<br/>')}
+          </div>
+        </div>
       `).join('');
-      box.querySelectorAll('.nav-btn').forEach((b) => {
-        b.addEventListener('click', () => {
-          closeCmdPalette();
-          filtered[Number(b.dataset.idx)].run();
-        });
+    });
+
+    // ----------------------------------------------------------------------
+    // Rich Comment Composer: Write/Preview, File Input, Drag-Drop, Paste & Link Picker
+    // ----------------------------------------------------------------------
+    function renderComposerStagedBar() {
+      const chips = [];
+      appState.cmtEmbedFiles.forEach((f, idx) => {
+        chips.push(`<span class="badge">Embed: ${esc(f.name)} <button type="button" class="btn btn-sm btn-ghost rm-staged-emb" data-idx="${idx}" style="padding:0 3px;">&#10005;</button></span>`);
       });
+      appState.cmtAttachFiles.forEach((f, idx) => {
+        chips.push(`<span class="badge">Attach: ${esc(f.name)} <button type="button" class="btn btn-sm btn-ghost rm-staged-att" data-idx="${idx}" style="padding:0 3px;">&#10005;</button></span>`);
+      });
+      appState.cmtLinkedIds.forEach((id, idx) => {
+        chips.push(`<span class="badge">Linked: ${esc(id)} <button type="button" class="btn btn-sm btn-ghost rm-staged-lnk" data-idx="${idx}" style="padding:0 3px;">&#10005;</button></span>`);
+      });
+      const bar = $('cmt-staged-bar');
+      bar.innerHTML = chips.join('');
+      bar.querySelectorAll('.rm-staged-emb').forEach((b) => b.addEventListener('click', () => { appState.cmtEmbedFiles.splice(Number(b.dataset.idx), 1); renderComposerStagedBar(); }));
+      bar.querySelectorAll('.rm-staged-att').forEach((b) => b.addEventListener('click', () => { appState.cmtAttachFiles.splice(Number(b.dataset.idx), 1); renderComposerStagedBar(); }));
+      bar.querySelectorAll('.rm-staged-lnk').forEach((b) => b.addEventListener('click', () => { appState.cmtLinkedIds.splice(Number(b.dataset.idx), 1); renderComposerStagedBar(); }));
     }
-    $('cmd-palette-input').addEventListener('input', (e) => renderCmdResults(e.target.value.trim()));
+
+    function stageComposerEmbedFile(file) {
+      let fname = file.name && file.name !== 'image.png'
+        ? file.name
+        : `pasted-image-${appState.cmtEmbedFiles.length + 1}.png`;
+      const namedFile = new File([file], fname, { type: file.type || 'image/png' });
+      appState.cmtEmbedFiles.push(namedFile);
+      const ta = $('cmt-body-input');
+      const mdTag = `![${fname}](embed:${fname})`;
+      ta.value = ta.value ? `${ta.value}\n${mdTag}` : mdTag;
+      renderComposerStagedBar();
+    }
+
+    $('cmt-tab-write').addEventListener('click', () => {
+      $('cmt-tab-write').classList.add('btn-primary');
+      $('cmt-tab-preview').classList.remove('btn-primary');
+      $('cmt-body-input').style.display = 'block';
+      $('cmt-preview-box').style.display = 'none';
+    });
+
+    $('cmt-tab-preview').addEventListener('click', () => {
+      $('cmt-tab-preview').classList.add('btn-primary');
+      $('cmt-tab-write').classList.remove('btn-primary');
+      $('cmt-body-input').style.display = 'none';
+      const stagedEmbedUrls = {};
+      appState.cmtEmbedFiles.forEach((f) => {
+        try { stagedEmbedUrls[f.name] = URL.createObjectURL(f); } catch (_) {}
+      });
+      const previewCtx = Object.assign({}, appState.activeIssue || {}, { stagedEmbedUrls });
+      $('cmt-preview-box').innerHTML = renderMarkdown($('cmt-body-input').value, previewCtx);
+      $('cmt-preview-box').style.display = 'block';
+    });
+
+    // Embed Method 1: File input
+    $('cmt-embed-input').addEventListener('change', (e) => {
+      Array.from(e.target.files || []).forEach(stageComposerEmbedFile);
+      e.target.value = '';
+    });
+
+    // Comment Attachment File input
+    $('cmt-attach-input').addEventListener('change', (e) => {
+      Array.from(e.target.files || []).forEach((f) => appState.cmtAttachFiles.push(f));
+      renderComposerStagedBar();
+      e.target.value = '';
+    });
+
+    // Embed Method 2: Drag-and-drop onto composer
+    $('cmt-composer-dropzone').addEventListener('dragover', (e) => { e.preventDefault(); $('cmt-composer-dropzone').classList.add('drag-over'); });
+    $('cmt-composer-dropzone').addEventListener('dragleave', () => $('cmt-composer-dropzone').classList.remove('drag-over'));
+    $('cmt-composer-dropzone').addEventListener('drop', (e) => {
+      e.preventDefault();
+      $('cmt-composer-dropzone').classList.remove('drag-over');
+      const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
+      files.forEach((f) => {
+        if ((f.type && f.type.startsWith('image/')) || /\.(png|jpe?g|gif|webp|svg)$/i.test(f.name)) {
+          stageComposerEmbedFile(f);
+        } else {
+          appState.cmtAttachFiles.push(f);
+        }
+      });
+      renderComposerStagedBar();
+    });
+
+    // Embed Method 3: Clipboard Paste (Ctrl+V with image/png blob)
+    $('cmt-body-input').addEventListener('paste', (e) => {
+      const cd = e.clipboardData;
+      if (!cd) return;
+      const pastedImages = [];
+      if (cd.items && cd.items.length) {
+        for (let i = 0; i < cd.items.length; i++) {
+          const item = cd.items[i];
+          if (item.type && item.type.startsWith('image/')) {
+            const blob = item.getAsFile();
+            if (blob) pastedImages.push(blob);
+          }
+        }
+      }
+      if (!pastedImages.length && cd.files && cd.files.length) {
+        for (let i = 0; i < cd.files.length; i++) {
+          const f = cd.files[i];
+          if (f.type && f.type.startsWith('image/')) pastedImages.push(f);
+        }
+      }
+      if (pastedImages.length) {
+        e.preventDefault();
+        pastedImages.forEach(stageComposerEmbedFile);
+        toast(`Pasted ${pastedImages.length} inline image(s)`);
+      }
+    });
+
+    // Link Existing Issue Attachment Picker Modal
+    $('btn-cmt-link-att').addEventListener('click', () => {
+      if (!appState.activeIssue) return;
+      const atts = appState.activeIssue.attachments || [];
+      $('link-att-picker-list').innerHTML = atts.length
+        ? atts.map((a) => `
+          <label style="display:flex;align-items:center;gap:8px;padding:6px;background:var(--bg-card);border-radius:6px;cursor:pointer;">
+            <input type="checkbox" class="link-att-check" value="${esc(a.id)}" ${appState.cmtLinkedIds.includes(a.id) ? 'checked' : ''} />
+            <strong class="mono">${esc(a.id)}</strong> ${esc(a.filename)} <span style="color:var(--text-muted);font-size:11px;">(${a.size_bytes} B)</span>
+          </label>
+        `).join('')
+        : '<div style="color:var(--text-muted)">No whole-issue attachments available on this issue yet.</div>';
+      openModal('link-attachment');
+    });
+
+    $('btn-confirm-link-att').addEventListener('click', () => {
+      const selected = [];
+      $('link-att-picker-list').querySelectorAll('.link-att-check:checked').forEach((cb) => selected.push(cb.value));
+      appState.cmtLinkedIds = selected;
+      renderComposerStagedBar();
+      closeModal('link-attachment');
+    });
+
+    $('btn-submit-comment').addEventListener('click', async () => {
+      if (!appState.activeIssue) return;
+      const fd = new FormData();
+      fd.append('body', $('cmt-body-input').value);
+      appState.cmtEmbedFiles.forEach((f) => fd.append('embeds', f, f.name));
+      appState.cmtAttachFiles.forEach((f) => fd.append('attachments', f, f.name));
+      if (appState.cmtLinkedIds.length) {
+        fd.append('linked_attachment_ids', JSON.stringify(appState.cmtLinkedIds));
+      }
+      try {
+        await api(`/api/v1/issues/${encodeURIComponent(appState.activeIssue.key)}/comments`, { method: 'POST', body: fd });
+        $('cmt-body-input').value = '';
+        appState.cmtEmbedFiles = [];
+        appState.cmtAttachFiles = [];
+        appState.cmtLinkedIds = [];
+        renderComposerStagedBar();
+        $('cmt-tab-write').click();
+        toast('Comment posted');
+        await openIssueDetail(appState.activeIssue.key, { fullPage: appState.permalinkMode, skipHash: true });
+      } catch (err) { toast(err.message, true); }
+    });
+
+    // ----------------------------------------------------------------------
+    // Hash Routing (Permalinks + Back/Forward History) & Keyboard Shortcuts
+    // ----------------------------------------------------------------------
+    async function handleHashRoute() {
+      if (appState.suppressHashHandler) return;
+      const h = location.hash || '';
+      if (h.startsWith('#/issues/')) {
+        const ref = decodeURIComponent(h.slice('#/issues/'.length));
+        if (ref) {
+          await openIssueDetail(ref, { fullPage: true, skipHash: true });
+          return;
+        }
+      }
+      if (h.startsWith('#/views/')) {
+        const vName = h.slice('#/views/'.length);
+        if (['issues','board','sprints','milestones','views','analytics','tags','settings'].includes(vName)) {
+          await switchView(vName, false);
+          return;
+        }
+      }
+      await switchView('issues', false);
+    }
+
+    window.addEventListener('hashchange', handleHashRoute);
 
     document.addEventListener('keydown', (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
-        e.preventDefault();
-        openCmdPalette();
-        return;
-      }
       if (e.key === 'Escape') {
-        closeCreateModal();
-        closeCmdPalette();
-        closeIssueDrawer();
+        const openModals = Array.from(document.querySelectorAll('.modal-backdrop.open'));
+        if (openModals.length) {
+          openModals[openModals.length - 1].classList.remove('open');
+          return;
+        }
+        if ($('issue-drawer').classList.contains('open') && !appState.permalinkMode) {
+          closeIssueDetail();
+        }
         return;
       }
       const tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : '';
       if (tag === 'input' || tag === 'textarea' || tag === 'select' || (e.target && e.target.isContentEditable)) {
         return;
       }
-      if (e.key === 'c') { e.preventDefault(); openCreateModal(); }
-      else if (e.key === '/') { e.preventDefault(); $('global-iql-input').focus(); }
-      else if (e.key === 'b') { e.preventDefault(); switchView('board'); }
-      else if (e.key === 'l') { e.preventDefault(); switchView('list'); }
-      else if (e.key === 'r') { e.preventDefault(); switchView('ready'); }
+      if (e.key === 'c' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        openCreateModal();
+      } else if (e.key === '/') {
+        e.preventDefault();
+        $('global-search-input').focus();
+      }
     });
 
+    // Boot SPA
     initTheme();
-    refreshCurrentView();
+    loadReferenceData().then(() => handleHashRoute()).catch((err) => toast(err.message, true));
+  })();
   </script>
 </body>
 </html>
@@ -6970,18 +8667,18 @@ SPA_HTML = r"""<!DOCTYPE html>
 
 
 # ============================================================================
-# Server CLI Entrypoint & Pre-Bound Socket Runner
+# Section 7: Server CLI Entrypoint, Pre-Flight Exit Codes & Pre-Bound Socket
 # ============================================================================
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="itrack-server.py",
-        description="itrack Local-First File-Locked Issue Daemon, iQL Engine & Embedded Offline SPA",
+        description="iTrack Local-First Folder-Per-Issue Daemon, Self-Healing FTS5 Index & Offline SPA",
     )
     parser.add_argument(
         "--root",
         default=None,
-        help="Git repository root directory (defaults to ITRACK_ROOT env var or current working directory).",
+        help="Git repository root directory (defaults to ITRACK_ROOT env var or cwd).",
     )
     parser.add_argument(
         "--host",
@@ -6993,6 +8690,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="TCP bind port (default: 0 for race-free ephemeral port allocation).",
+    )
+    parser.add_argument(
+        "--init",
+        action="store_true",
+        help="Initialize itrack-issues/ workspace on disk if not already initialized.",
+    )
+    parser.add_argument(
+        "--prefix",
+        default="ITR",
+        help="Project key prefix when --init is used (default: ITR).",
+    )
+    parser.add_argument(
+        "--title",
+        default="iTrack Workspace",
+        help="Project title when --init is used (default: iTrack Workspace).",
     )
     parser.add_argument(
         "--log-level",
@@ -7007,9 +8719,19 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
-    repo_root = resolve_repo_root(args.root)
-    # Law 2: Enforce Git-root check BEFORE creating any directories, files, or sockets!
-    enforce_law2_git_root(repo_root)
+    raw_root = resolve_raw_root_arg(args.root)
+    repo_root = check_and_resolve_git_root(raw_root)
+
+    if args.init:
+        init_workspace_on_disk(repo_root, prefix=args.prefix, title=args.title)
+    elif not (repo_root / "itrack-issues" / "config.json").exists():
+        print(
+            f"Error [Workspace Not Initialized]: '{repo_root / 'itrack-issues' / 'config.json'}' not found. "
+            f"Run 'itrack init' first.",
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(3)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

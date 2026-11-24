@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-"""itrack CLI, Agent Manual & Auto-Daemon Client.
-
-Zero-setup, Git-rooted issue tracker CLI with Rich TUI, 100% --json parity,
-Law 2 Git-root enforcement, Law 3 Zero-Arg Agent Manual, and transparent
-per-repository FastAPI daemon auto-spawning.
-"""
+"""itrack.py — 100% Surface Git-Rooted CLI, Self-Teaching Manual & Auto-Daemon Client."""
 
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import fcntl
 import getpass
 import json
@@ -18,6 +14,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import webbrowser
@@ -27,111 +24,166 @@ from typing import Any, NoReturn
 import httpx
 from rich import box
 from rich.console import Console
-from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
 from rich.tree import Tree
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
+
+CATEGORIES: list[str] = [
+    "epic", "story", "task", "subtask", "bug", "feature", "improvement",
+    "refactor", "spike", "incident", "security", "chore", "docs",
+]
+
+STATES: list[str] = [
+    "triage", "backlog", "todo", "ready", "in-progress", "in-review",
+    "in-qa", "on-hold", "blocked", "done", "cancelled", "archived",
+]
+
+PRIORITIES: list[str] = ["critical", "high", "medium", "low", "trivial"]
+SEVERITIES: list[str] = ["sev1", "sev2", "sev3", "sev4", "sev5"]
+RESOLUTIONS: list[str] = [
+    "fixed", "wont-fix", "duplicate", "cannot-reproduce", "by-design", "obsolete",
+]
+LINK_TYPES: list[str] = [
+    "blocks", "blocked-by", "relates-to", "duplicates", "parent-of", "clones",
+]
+PRESET_TABS: list[str] = [
+    "active", "open", "in-progress", "blocked", "completed", "cancelled", "archived", "all",
+]
+SWIMLANES: list[str] = ["none", "category", "priority", "assignee", "sprint"]
+IQL_OPERATORS: list[str] = [
+    "=", "!=", ">", ">=", "<", "<=", "~", "!~",
+    "IN", "NOT IN", "IS EMPTY", "IS NOT EMPTY",
+    "AND", "OR", "NOT", "ORDER BY",
+]
+
+EXIT_CODE_DOCS: dict[int, str] = {
+    0: "Success (including zero-arg manual, --help, --version)",
+    1: "Validation / Usage / Invalid value error (HTTP 400, 422, or argparse error)",
+    2: "Git-root pre-flight failure (.git missing or inside Git subdirectory)",
+    3: "Workspace not initialized (itrack-issues/config.json missing; HTTP 503)",
+    4: "Resource not found (issue, comment, attachment, link, tag, sprint, milestone, view, worklog; HTTP 404)",
+    5: "Conflict / Referential / Collision error (rename collision, cycle, self-link, duplicate link; HTTP 409)",
+}
+
+STATE_STYLES: dict[str, str] = {
+    "triage": "magenta",
+    "backlog": "dim white",
+    "todo": "cyan",
+    "ready": "bright_cyan",
+    "in-progress": "bold yellow",
+    "in-review": "bold magenta",
+    "in-qa": "bold blue",
+    "on-hold": "yellow",
+    "blocked": "bold white on red",
+    "done": "bold green",
+    "cancelled": "strike dim",
+    "archived": "dim",
+}
+
+PRIORITY_STYLES: dict[str, str] = {
+    "critical": "bold red",
+    "high": "bold yellow",
+    "medium": "cyan",
+    "low": "blue",
+    "trivial": "dim",
+}
+
+SEVERITY_STYLES: dict[str, str] = {
+    "sev1": "bold red",
+    "sev2": "red",
+    "sev3": "yellow",
+    "sev4": "cyan",
+    "sev5": "dim",
+}
 
 stdout_console = Console(highlight=False)
 stderr_console = Console(stderr=True, highlight=False)
 
-STATUS_STYLES: dict[str, str] = {
-    "backlog": "dim white",
-    "todo": "cyan",
-    "in_progress": "bold yellow",
-    "in_review": "bold magenta",
-    "blocked": "bold white on red",
-    "done": "bold green",
-    "canceled": "strike dim",
-}
-
-PRIORITY_STYLES: dict[str, str] = {
-    "none": "dim",
-    "low": "blue",
-    "medium": "cyan",
-    "high": "bold yellow",
-    "urgent": "bold red",
-    "critical": "bold red",
-}
-
-TYPE_ICONS: dict[str, str] = {
-    "epic": "⚡",
-    "story": "📘",
-    "task": "☑️",
-    "bug": "🐞",
-    "subtask": "↳",
-    "spike": "🔬",
-}
-
-# Known CLI options across subcommands that consume the next argument token.
-# Tracking these ensures `extract_global_flags` never strips `--root` or `--json`
-# when passed as a literal value to another option (e.g., `-m "--json"`).
-OPTIONS_TAKING_VALUE: set[str] = {
-    "-d", "--description", "--desc",
-    "-t", "--type",
-    "-s", "--status",
-    "-p", "--priority",
-    "-a", "--assignee",
-    "-r", "--reporter",
-    "-l", "--label", "--labels",
-    "-c", "--component", "--components",
-    "--epic", "--parent", "--sprint", "--milestone",
-    "--points", "--due", "--actor", "--title",
-    "--add-label", "--remove-label", "--resolution",
-    "--environment", "--sort",
-    "-q", "--query", "--iql",
-    "--limit", "--offset",
-    "-m", "--message", "--note", "--comment",
-    "--agent", "--keys", "--action",
-    "--author", "--by",
-    "-o", "--output",
-    "--state", "--goal", "--start", "--end", "--rollover",
-    "--target", "--color", "--lead",
-    "--name", "--email", "--role", "--avatar-color",
-    "--layout", "--icon",
-    "--key", "--default-type", "--default-priority", "--wip-limits",
-    "--file", "--mode", "--port", "-n", "--lines", "--title-prefix",
-}
+KEY_RE = re.compile(r"^[A-Za-z]{2,10}-\d+$")
 
 
 class CLIError(Exception):
-    """Structured CLI or API error."""
+    """Structured CLI error carrying explicit exit code."""
 
-    def __init__(self, message: str, error_code: str = "cli_error", status_code: int = 1) -> None:
+    def __init__(self, message: str, error_code: str = "cli_error", exit_code: int = 1) -> None:
         super().__init__(message)
         self.message = message
         self.error_code = error_code
-        self.status_code = status_code
+        self.exit_code = exit_code
 
 
-def norm_key(key: str) -> str:
-    """Normalize issue/sprint/milestone/view keys to uppercase (e.g. itk-1 -> ITK-1)."""
-    val = key.strip()
-    return val.upper() if val else val
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def norm_opt_key(key: str | None) -> str | None:
-    if key is None:
+def http_status_to_exit_code(status_code: int) -> int:
+    if status_code in (400, 422):
+        return 1
+    if status_code == 404:
+        return 4
+    if status_code == 409:
+        return 5
+    if status_code == 503:
+        return 3
+    return 1
+
+
+def normalize_ref_str(ref: str) -> str:
+    """Preserve exact spaces & case for issue/entity names; uppercase ID keys like itr-1 -> ITR-1."""
+    s = ref.strip()
+    if KEY_RE.fullmatch(s):
+        return s.upper()
+    return ref
+
+
+def encode_ref(ref: str) -> str:
+    """URL-encode an issue key or exact issue name (including spaces, slashes, Unicode)."""
+    return urllib.parse.quote(normalize_ref_str(ref), safe="")
+
+
+def normalize_hyphen_enum(val: str | None) -> str | None:
+    if val is None:
         return None
-    val = key.strip()
-    if not val or val.lower() in ("none", "null", "unassigned", "backlog"):
-        return None
-    return val.upper()
+    cleaned = re.sub(r"[\s_]+", "-", val.strip().lower())
+    if cleaned == "canceled":
+        return "cancelled"
+    return cleaned
 
 
-def split_csv(raw: str | None) -> list[str] | None:
-    if raw is None:
-        return None
-    items = [part.strip() for part in raw.split(",") if part.strip()]
-    return items
+def flatten_csv_tokens(items: list[str] | None) -> list[str]:
+    if not items:
+        return []
+    out: list[str] = []
+    for raw in items:
+        for part in raw.split(","):
+            p = part.strip()
+            if p and p not in out:
+                out.append(p)
+    return out
+
+
+def parse_issue_refs(items: list[str] | None, repo_root: Path) -> list[str]:
+    """Parse --issues tokens supporting both space-separated names and comma-separated keys."""
+    if not items:
+        return []
+    issues_dir = repo_root / "itrack-issues" / "issues"
+    out: list[str] = []
+    for raw in items:
+        if "," in raw and not (issues_dir / raw).exists():
+            parts = [p.strip() for p in raw.split(",") if p.strip()]
+            out.extend(normalize_ref_str(p) for p in parts)
+        else:
+            val = normalize_ref_str(raw)
+            if val.strip():
+                out.append(val)
+    return out
 
 
 def default_actor(repo_root: Path | None = None) -> str:
     env_user = os.environ.get("ITRACK_USER") or os.environ.get("ITRACK_AGENT")
-    if env_user:
+    if env_user and env_user.strip():
         return env_user.strip()
     try:
         proc = subprocess.run(
@@ -152,61 +204,170 @@ def default_actor(repo_root: Path | None = None) -> str:
         return "user"
 
 
-def extract_global_flags(argv: list[str]) -> tuple[bool, str | None, list[str]]:
-    """Extract `--json` and `--root <path>` / `--root=<path>` from any position in argv."""
+def emit_json(data: Any) -> None:
+    sys.stdout.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def handle_cli_error(err: CLIError, json_mode: bool) -> NoReturn:
+    if json_mode:
+        emit_json({
+            "error": err.error_code,
+            "message": err.message,
+            "exit_code": err.exit_code,
+        })
+    else:
+        sys.stderr.write(f"Error: {err.message}\n")
+        sys.stderr.flush()
+    sys.exit(err.exit_code)
+
+
+def require_yes(yes_flag: bool, resource_desc: str) -> None:
+    if not yes_flag:
+        raise CLIError(
+            f"Refusing to delete {resource_desc} without confirmation flag '--yes'.",
+            error_code="confirmation_required",
+            exit_code=1,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Telemetry Hook (ITRACK_SURFACE_LOG) & Parser-Aware Global Flag Extraction
+# ---------------------------------------------------------------------------
+
+
+def _canonical_flag_name(action: argparse.Action) -> str:
+    for opt in action.option_strings:
+        if opt.startswith("--"):
+            return opt
+    return action.option_strings[0]
+
+
+def _get_subparsers_map(parser: argparse.ArgumentParser) -> dict[str, argparse.ArgumentParser]:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return dict(action.choices)
+    return {}
+
+
+def extract_global_flags_and_surface(
+    argv: list[str],
+    root_parser: argparse.ArgumentParser,
+) -> tuple[bool, str | None, list[str], str, list[str]]:
+    """Extract --json and --root from ANY position while tracking canonical command & flags."""
     json_mode = False
     root_arg: str | None = None
     remaining: list[str] = []
+    cmd_parts: list[str] = []
+    used_flags: set[str] = set()
+
+    cur_parser = root_parser
+    can_match_subcmd = True
     i = 0
     n = len(argv)
-    expect_value = False
-    primary_cmd: str | None = None
 
     while i < n:
         tok = argv[i]
         if tok == "--":
             remaining.extend(argv[i:])
             break
-        if expect_value:
-            remaining.append(tok)
-            expect_value = False
-            i += 1
-            continue
         if tok == "--json":
             json_mode = True
+            used_flags.add("--json")
             i += 1
             continue
         if tok == "--root":
+            used_flags.add("--root")
             if i + 1 >= n:
-                raise CLIError("Option '--root' requires a path argument.", "invalid_arguments", 400)
+                raise CLIError("Option '--root' requires a path argument.", "invalid_arguments", 1)
             root_arg = argv[i + 1]
             i += 2
             continue
         if tok.startswith("--root="):
-            root_arg = tok.split("=", 1)[1]
-            if not root_arg:
-                raise CLIError("Option '--root' requires a non-empty path.", "invalid_arguments", 400)
+            used_flags.add("--root")
+            val = tok.split("=", 1)[1]
+            if not val:
+                raise CLIError("Option '--root' requires a non-empty path.", "invalid_arguments", 1)
+            root_arg = val
             i += 1
             continue
 
-        if primary_cmd is None and not tok.startswith("-"):
-            primary_cmd = tok
+        sub_map = _get_subparsers_map(cur_parser) if can_match_subcmd else {}
+        if not tok.startswith("-") and tok in sub_map:
+            cmd_parts.append(tok)
+            cur_parser = sub_map[tok]
+            remaining.append(tok)
+            i += 1
+            continue
 
+        if tok.startswith("-") and tok != "-":
+            opt_key = tok.split("=", 1)[0] if "=" in tok else tok
+            action = cur_parser._option_string_actions.get(opt_key)
+            if action is None:
+                action = root_parser._option_string_actions.get(opt_key)
+            if action is not None:
+                used_flags.add(_canonical_flag_name(action))
+                remaining.append(tok)
+                i += 1
+                if "=" not in tok:
+                    if action.nargs is None:
+                        # Consume 1 value token (even if it starts with '-' unless it is --json/--root?)
+                        if i < n and argv[i] != "--":
+                            remaining.append(argv[i])
+                            i += 1
+                    elif isinstance(action.nargs, int) and action.nargs > 0:
+                        for _ in range(action.nargs):
+                            if i < n and argv[i] != "--":
+                                remaining.append(argv[i])
+                                i += 1
+                    elif action.nargs in ("+", "*"):
+                        while i < n and not argv[i].startswith("-"):
+                            remaining.append(argv[i])
+                            i += 1
+                    elif action.nargs == "?" and i < n and not argv[i].startswith("-"):
+                        remaining.append(argv[i])
+                        i += 1
+                continue
+            # Unrecognized flag: still record if --* and let argparse raise exit 1
+            if opt_key.startswith("--"):
+                used_flags.add(opt_key)
+            remaining.append(tok)
+            i += 1
+            continue
+
+        # Positional value argument
+        can_match_subcmd = False
         remaining.append(tok)
-        if tok in OPTIONS_TAKING_VALUE:
-            if tok == "--iql" and primary_cmd == "search":
-                expect_value = False
-            elif tok == "--agent" and primary_cmd == "user":
-                expect_value = False
-            else:
-                expect_value = True
         i += 1
 
-    return json_mode, root_arg, remaining
+    return json_mode, root_arg, remaining, " ".join(cmd_parts), sorted(used_flags)
+
+
+def record_cli_surface(command_path: str, flags: list[str]) -> None:
+    log_file = os.environ.get("ITRACK_SURFACE_LOG")
+    if not log_file:
+        return
+    try:
+        p = Path(log_file)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        entry = json.dumps({"kind": "cli_exec", "command": command_path, "flags": flags}) + "\n"
+        with open(p, "a", encoding="utf-8") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                fh.write(entry)
+                fh.flush()
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Law 2 Git-Root Pre-Flight (Exit 2) & Workspace Init Pre-Flight (Exit 3)
+# ---------------------------------------------------------------------------
 
 
 def detect_git_toplevel_hint(target_path: Path) -> str | None:
-    """If inside a subdirectory of a Git repository, detect parent git root for hint only."""
     probe_dir = target_path if target_path.is_dir() else target_path.parent
     if not probe_dir.exists():
         return None
@@ -220,7 +381,7 @@ def detect_git_toplevel_hint(target_path: Path) -> str | None:
         )
         if proc.returncode == 0 and proc.stdout.strip():
             toplevel = Path(proc.stdout.strip()).resolve()
-            if toplevel != target_path:
+            if toplevel != target_path.resolve():
                 return str(toplevel)
     except Exception:
         pass
@@ -228,257 +389,58 @@ def detect_git_toplevel_hint(target_path: Path) -> str | None:
 
 
 def resolve_and_check_git_root(root_arg: str | None, json_mode: bool) -> Path:
-    """Law 2: Enforce that repo_root is a valid Git repository root (.git exists)."""
+    """Law 2: Verify target directory is a Git repository root (.git dir or worktree file)."""
     if root_arg is not None:
-        raw_root = Path(root_arg).expanduser()
+        raw_root = Path(os.path.abspath(os.path.expanduser(root_arg)))
     elif os.environ.get("ITRACK_ROOT"):
-        raw_root = Path(os.environ["ITRACK_ROOT"]).expanduser()
+        raw_root = Path(os.path.abspath(os.path.expanduser(os.environ["ITRACK_ROOT"])))
     else:
         raw_root = Path.cwd()
 
-    repo_root = raw_root.resolve()
-    if (repo_root / ".git").exists():
-        return repo_root
+    if raw_root.exists() and raw_root.is_dir():
+        resolved_root = raw_root.resolve()
+        if (raw_root / ".git").exists() or (resolved_root / ".git").exists():
+            return resolved_root if (resolved_root / ".git").exists() else raw_root
+    else:
+        resolved_root = raw_root
 
-    toplevel_hint = detect_git_toplevel_hint(repo_root)
+    toplevel_hint = detect_git_toplevel_hint(raw_root)
     base_msg = (
-        f"Error [Law 2 - Git-Root Check]: '{repo_root}' is not a Git repository root "
+        f"Error [Law 2 - Git-Root Check]: '{raw_root}' is not a Git repository root "
         f"(.git not found). Run from the root of a Git repository."
     )
-    if toplevel_hint:
-        full_msg = f"{base_msg} Hint: cd {toplevel_hint}"
-    else:
-        full_msg = base_msg
+    full_msg = f"{base_msg} Hint: cd {toplevel_hint}" if toplevel_hint else base_msg
 
     if json_mode:
         payload: dict[str, Any] = {
             "error": "not_git_root",
+            "exit_code": 2,
             "message": full_msg,
-            "path": str(repo_root),
+            "path": str(raw_root),
         }
         if toplevel_hint:
             payload["hint_git_root"] = toplevel_hint
-        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
-        sys.stdout.flush()
+        emit_json(payload)
     else:
         sys.stderr.write(full_msg + "\n")
         sys.stderr.flush()
     sys.exit(2)
 
 
-def build_manual_payload(repo_root: Path) -> dict[str, Any]:
-    """Structured Law 3 Agent & Operator Manual payload."""
-    return {
-        "name": "itrack",
-        "version": VERSION,
-        "repo_root": str(repo_root),
-        "summary": (
-            "Git-rooted local-first Jira/Linear-grade issue tracker with atomic file-locked "
-            "JSON storage, SQLite FTS5 + iQL query engine, multi-agent coordination, Rich TUI, "
-            "and embedded offline Web SPA."
-        ),
-        "laws": {
-            "law_1_repo_footprint": "Self-contained 2-script architecture (itrack.py + itrack-server.py + requirements.txt).",
-            "law_2_git_root": "Commands execute strictly against a Git repository root containing .git (exit code 2 otherwise).",
-            "law_3_zero_arg_manual": "Running `itrack` with zero arguments (or `manual` / `--manual`) prints this manual without spawning the daemon.",
-        },
-        "global_flags": {
-            "--json": "Position-independent flag. Emits pure structured JSON to stdout on all commands and errors.",
-            "--root <PATH>": "Position-independent flag. Target Git repository root (overrides ITRACK_ROOT and cwd).",
-        },
-        "storage": {
-            "directory": f"{repo_root}/itrack-issues/",
-            "source_of_truth": "Atomic, flock-synchronized per-issue JSON files in itrack-issues/issues/{KEY}.json (Git-friendly).",
-            "runtime_ephemeral": "itrack-issues/.runtime/ (gitignored: storage.lock, index.db SQLite+FTS5 cache, daemon.json, daemon.log).",
-        },
-        "daemon": {
-            "auto_spawn": "Any active CLI command transparently discovers or spawns `itrack-server.py` on an ephemeral 127.0.0.1 port.",
-            "commands": [
-                "itrack daemon status",
-                "itrack daemon start [--port PORT]",
-                "itrack daemon restart [--port PORT]",
-                "itrack daemon stop",
-                "itrack daemon logs [-n 50]",
-                "itrack ui [--port PORT] [--no-open]",
-            ],
-        },
-        "workflows": {
-            "autonomous_agent_loop": [
-                "1. Discover unblocked work: `itrack ready --json`",
-                "2. Atomically claim issue: `itrack claim ITK-1 --agent agent-alpha -m 'Starting implementation' --json`",
-                "3. Decompose if needed: `itrack issue subtask-add ITK-1 'Write unit tests' -p high --json`",
-                "4. Log progress & artifacts: `itrack comment add ITK-1 'Implemented parser'` / `itrack attach upload ITK-1 report.txt` / `itrack worklog add ITK-1 '45m' -m 'Implementation'`",
-                "5. Complete & verify: `itrack transition ITK-1 done --resolution fixed -m 'All tests green' --json` (or `itrack close ITK-1`)",
-                "6. Or release if blocked/handing off: `itrack release ITK-1 --agent agent-alpha -s blocked -m 'Waiting on API key'`",
-            ],
-            "default_statuses": ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "canceled"],
-            "priorities": ["none (0)", "low (1)", "medium (2)", "high (3)", "urgent (4)"],
-            "issue_types": ["epic", "story", "task", "bug", "subtask", "spike"],
-            "link_types": ["blocks", "blocked_by", "relates_to", "duplicates", "duplicated_by", "clones", "cloned_from"],
-        },
-        "iql_syntax": {
-            "grammar": "[expr] [ORDER BY field [ASC|DESC], ...] [LIMIT n] [OFFSET n]",
-            "operators": ["=", "!=", ">", ">=", "<", "<=", "~", "!~", "IN (...)", "NOT IN (...)", "IS EMPTY", "IS NOT EMPTY", "AND", "OR", "NOT", "( )"],
-            "fields": [
-                "key", "type", "status", "priority", "assignee", "reporter", "claimed_by",
-                "epic", "parent", "sprint", "milestone", "label", "component", "points",
-                "title", "description", "comment", "text", "blocked", "resolution",
-                "created", "updated", "due", "resolved",
-            ],
-            "special_values": ["@me", "today", "now", "-7d", "-24h", "+3d", "sprint = active"],
-            "examples": [
-                "status IN (todo, in_progress) AND priority >= high ORDER BY priority DESC",
-                "assignee = @me AND blocked = false",
-                "label = security AND text ~ 'oauth' LIMIT 20",
-                "sprint = active AND status != done",
-                "updated >= -7d AND assignee IS EMPTY",
-            ],
-        },
-        "iql_reference": "Use `itrack iql \"<EXPR>\"` to query or `itrack iql \"<EXPR>\" --validate` to parse/validate AST.",
-        "commands": {
-            "shortcuts": {
-                "init": "itrack init [--key ITK] [--name 'Project Name']",
-                "ui": "itrack ui [--port PORT] [--no-open]",
-                "create": "itrack create <TITLE> [-d DESC] [-t TYPE] [-p PRIORITY] [-a ASSIGNEE] [-l L1,L2] [-c C1,C2] [--epic KEY] [--sprint ID] [--points N]",
-                "list": "itrack list [--iql EXPR] [-s STATUS] [-p PRIORITY] [-t TYPE] [-a ASSIGNEE] [-l LABEL]",
-                "show": "itrack show <KEY>",
-                "ready": "itrack ready [-a ASSIGNEE] [--sprint ID] [--limit N]",
-                "claim": "itrack claim <KEY> --agent <AGENT> [-m NOTE] [--force]",
-                "release": "itrack release <KEY> [--agent <AGENT>] [-s STATUS] [-m NOTE]",
-                "move": "itrack move <KEY> <STATUS> [--resolution RES] [-m COMMENT] [--force]",
-                "close": "itrack close <KEY> [--resolution fixed] [-m COMMENT]",
-                "reopen": "itrack reopen <KEY> [-m COMMENT]",
-                "search": "itrack search <QUERY> [--iql]",
-                "iql": "itrack iql <IQL_EXPR> [--validate] [--limit N] [--offset N]",
-                "board": "itrack board [--sprint ID] [--epic KEY] [--assignee USER] [--iql EXPR]",
-                "graph": "itrack graph",
-                "stats": "itrack stats",
-                "reindex": "itrack reindex",
-                "export": "itrack export [-o backup.json]",
-                "import": "itrack import <backup.json> [--mode merge|replace]",
-            },
-            "groups": {
-                "issue": "create | list | show | update | delete | transition | assign | clone | claim | release | ready | subtasks | subtask-add | history | bulk | watch | unwatch",
-                "comment": "list <KEY> | add <KEY> <BODY> [--author USER] | edit <KEY> <ID> <BODY> | delete <KEY> <ID>",
-                "attach": "list <KEY> | upload <KEY> <FILE> [--by USER] [-d DESC] | download <KEY> <ATT_ID> [-o PATH] | delete <KEY> <ATT_ID>",
-                "link": "list <KEY> | add <KEY> <blocks|blocked_by|relates_to|duplicates|clones> <TARGET_KEY> | remove <KEY> <LINK_ID>",
-                "worklog": "list <KEY> | add <KEY> <DURATION_OR_MINUTES> [-m NOTE] [--author USER] | delete <KEY> <WL_ID>",
-                "sprint": "list [--state S] | create <NAME> [--goal G] [--start D] [--end D] | show <ID> | update <ID> | start <ID> | complete <ID> [--rollover ID] | delete <ID>",
-                "epic": "list | create <TITLE> [-d DESC] [-p PRIORITY] [-a ASSIGNEE]",
-                "milestone": "list | create <NAME> [-d DESC] [--target YYYY-MM-DD] | update <ID> | delete <ID>",
-                "label": "list | add <NAME> [--color HEX] [-d DESC] | delete <NAME>",
-                "component": "list | add <NAME> [--lead USER] [-d DESC] | delete <NAME>",
-                "user": "list | add <USERNAME> [--name DISPLAY] [--email E] [--role R] [--agent] | show <USERNAME> | update <USERNAME> | delete <USERNAME>",
-                "view": "list | create <NAME> --iql <EXPR> [--layout board|list] [-d DESC] | update <ID> | delete <ID>",
-                "config": "show | set [--key K] [--name N] [--default-type T] [--default-priority P]",
-                "workflow": "show | set --file <JSON_FILE_OR_INLINE>",
-                "daemon": "start [--port PORT] | stop | restart [--port PORT] | status | logs [-n LINES]",
-            },
-        },
-    }
-
-
-MANUAL_MARKDOWN_TEMPLATE = r"""\
-# itrack v{version} — Agent & Operator Manual
-
-**Repository Root**: `{repo_root}`  
-**Storage Path**: `{repo_root}/itrack-issues/` *(auto-initialized on first active command; daemon NOT spawned by manual)*
-
----
-
-## 1. Quickstart & Autonomous Agent Workflow
-
-Every command supports **position-independent `--json` and `--root <PATH>`** flags (e.g. `itrack --json ready` or `itrack ready --json`). Issue keys normalize automatically (`itk-1` -> `ITK-1`).
-
-```bash
-# 1. Initialize workspace (optional custom key/name) & inspect ready unblocked work
-itrack init --key ITK --name "Core Platform"
-itrack ready --json
-
-# 2. Atomically claim an issue (409 conflict if already claimed by another agent unless --force)
-itrack claim ITK-1 --agent coder-1 -m "Implementing OAuth2 PKCE" --json
-
-# 3. Break down subtasks, link blockers, attach artifacts, comment & log time
-itrack issue subtask-add ITK-1 "Add token refresh unit tests" -p high
-itrack link add ITK-1 blocks ITK-2
-itrack comment add ITK-1 "PKCE verifier passing local tests" --author coder-1
-itrack attach upload ITK-1 ./test-report.txt --by coder-1 -d "Pytest log"
-itrack worklog add ITK-1 "1h 15m" -m "Core auth flow"
-
-# 4. Complete or hand off
-itrack transition ITK-1 done --resolution fixed -m "Merged & verified"
-# Or release claim back to queue:
-itrack release ITK-1 --agent coder-1 -s in_review -m "Ready for review"
-```
-
----
-
-## 2. Command Reference
-
-### Top-Level Shortcuts
-| Command | Usage & Description |
-| :--- | :--- |
-| `init` | `itrack init [--key ITK] [--name "Name"]` — Initialize workspace & project config |
-| `ui` | `itrack ui [--port PORT] [--no-open]` — Launch offline Web SPA & print URL |
-| `create` | `itrack create <TITLE> [-d DESC] [-t task\|bug\|story\|epic\|spike] [-p low\|medium\|high\|urgent] [-a USER] [-l a,b] [-c x,y] [--epic KEY] [--parent KEY] [--sprint ID] [--milestone ID] [--points N] [--due YYYY-MM-DD]` |
-| `list` | `itrack list [--iql EXPR] [-q TEXT] [-s STATUS] [-p PRIORITY] [-t TYPE] [-a USER] [-l LABEL] [-c COMP] [--sprint ID] [--epic KEY] [--limit N]` |
-| `show` | `itrack show <KEY>` — Full Rich view (metadata, Markdown body, subtasks, links, comments, attachments) |
-| `ready` | `itrack ready [-a USER] [--sprint ID] [--limit N]` — Unblocked actionable issues (`todo`/`backlog`, no open blockers) |
-| `claim` / `release` | `itrack claim <KEY> --agent <ID> [-m NOTE] [--force]` / `itrack release <KEY> [--agent <ID>] [-s STATUS] [-m NOTE]` |
-| `move` / `close` / `reopen` | `itrack move <KEY> <STATUS> [-m MSG] [--resolution RES] [--force]` · `itrack close <KEY>` (`-> done`) · `itrack reopen <KEY>` (`-> todo`) |
-| `search` / `iql` | `itrack search <TEXT> [--iql]` · `itrack iql "<EXPR>" [--validate] [--limit N]` |
-| `board` / `graph` / `stats` | `itrack board [--sprint ID] [--epic KEY] [--assignee U] [--iql EXPR]` · `itrack graph` · `itrack stats` |
-| `export` / `import` / `reindex` | `itrack export [-o file.json]` · `itrack import <file.json> [--mode merge\|replace]` · `itrack reindex` |
-
-### Resource Subcommands
-- **`issue`**: `create`, `list`, `show`, `update <KEY> [--title --desc -t -s -p -a --add-label --remove-label -l -c --epic --parent --sprint --milestone --points --due --resolution]`, `delete <KEY>`, `transition <KEY> <STATUS>`, `assign <KEY> <USER|none>`, `clone <KEY> [--include-subtasks]`, `claim`, `release`, `ready`, `subtasks <KEY>`, `subtask-add <KEY> <TITLE>`, `history <KEY>`, `bulk --keys K1,K2 --action <update|transition|delete|label_add|label_remove|sprint>`, `watch <KEY> <USER>`, `unwatch <KEY> <USER>`
-- **`comment`**: `list <KEY>` · `add <KEY> <BODY> [--author U]` · `edit <KEY> <CMT_ID> <BODY>` · `delete <KEY> <CMT_ID>`
-- **`attach`** *(alias `attachment`)*: `list <KEY>` · `upload <KEY> <PATH> [--by U] [-d DESC]` · `download <KEY> <ATT_ID> [-o OUT]` · `delete <KEY> <ATT_ID>`
-- **`link`**: `list <KEY>` · `add <KEY> <blocks|blocked_by|relates_to|duplicates|clones> <TARGET_KEY>` · `remove <KEY> <LINK_ID>`
-- **`worklog`**: `list <KEY>` · `add <KEY> <"1h 30m"|90> [-m NOTE] [--author U]` · `delete <KEY> <WL_ID>`
-- **`sprint`**: `list [--state planned|active|completed]` · `create <NAME> [--goal G] [--start D] [--end D]` · `show <ID>` · `update <ID>` · `start <ID>` · `complete <ID> [--rollover ID|backlog]` · `delete <ID>`
-- **`epic`**: `list` · `create <TITLE> [-d DESC] [-p PRIORITY] [-a USER]`
-- **`milestone`**: `list` · `create <NAME> [-d DESC] [--target YYYY-MM-DD]` · `update <ID> [--status unreleased|released|archived]` · `delete <ID>`
-- **`label` / `component`**: `label list | add <NAME> [--color HEX] [-d DESC] | delete <NAME>` · `component list | add <NAME> [--lead U] [-d DESC] | delete <NAME>`
-- **`user` / `view`**: `user list | add <USER> [--name N] [--email E] [--role R] [--agent] | show <U> | update <U> | delete <U>` · `view list | create <NAME> --iql <EXPR> [--layout board|list] | update <ID> | delete <ID>`
-- **`config` / `workflow`**: `config show | set [--key K] [--name N] [--default-type T] [--default-priority P]` · `workflow show | set --file <JSON_OR_PATH>`
-- **`daemon`** *(alias `server`)*: `start [--port PORT]` · `stop` · `restart [--port PORT]` · `status` · `logs [-n 50]`
-
----
-
-## 3. iQL (itrack Query Language)
-
-- **Operators**: `=`, `!=`, `>`, `>=`, `<`, `<=`, `~` (FTS/contains), `!~`, `IN (...)`, `NOT IN (...)`, `IS EMPTY`, `IS NOT EMPTY`
-- **Combinators & Clauses**: `AND`, `OR`, `NOT`, `( ... )`, `ORDER BY <field> [ASC|DESC]`, `LIMIT <n>`, `OFFSET <n>`
-- **Fields**: `key`, `type`, `status`, `priority` *(ordinal: `urgent > high > medium > low > none`)*, `assignee`, `reporter`, `claimed_by`, `epic`, `parent`, `sprint` *(`sprint = active`)*, `milestone`, `label`, `component`, `points`, `title`, `description`, `comment`, `text` *(FTS5 across all text)*, `blocked`, `resolution`, `created`, `updated`, `due`, `resolved`
-- **Dynamic Literals**: `@me`, `today`, `now`, `-7d`, `-24h`, `-2w`, `+3d`
-- **Examples**:
-  - `itrack iql "priority >= high AND status != done ORDER BY priority DESC"`
-  - `itrack iql "text ~ 'authentication' AND label IN (auth, backend)"`
-  - `itrack list --iql "assignee = @me AND blocked = false"`
-
----
-
-## 4. Architecture, Storage & Daemon Lifecycle
-
-- **Git-Friendly Source of Truth**: `<repo>/itrack-issues/issues/ITK-*.json`, `sprints/SPR-*.json`, `milestones/MIL-*.json`, `config.json` — human-readable, deterministic `sort_keys=True` JSON protected by `fcntl.flock` + atomic rename.
-- **Rebuildable Hybrid Index**: `<repo>/itrack-issues/.runtime/index.db` (SQLite WAL + FTS5) is gitignored automatically via `itrack-issues/.gitignore`. Run `itrack reindex` anytime after `git pull`/`git merge`.
-- **Auto-Daemon**: Active CLI commands check `itrack-issues/.runtime/daemon.json` + `/api/v1/health` (`127.0.0.1`) and transparently auto-spawn `itrack-server.py` on an ephemeral port if needed.
-"""
-
-
-def render_agent_manual(repo_root: Path, json_mode: bool) -> None:
-    """Render Law 3 manual without starting or touching the daemon."""
-    if json_mode:
-        sys.stdout.write(json.dumps(build_manual_payload(repo_root), indent=2) + "\n")
-        sys.stdout.flush()
-        return
-    md_text = MANUAL_MARKDOWN_TEMPLATE.format(version=VERSION, repo_root=repo_root)
-    stdout_console.print(Markdown(md_text))
+def ensure_workspace_initialized(repo_root: Path) -> None:
+    """Exit 3 if itrack-issues/config.json is missing prior to `itrack init`."""
+    cfg_path = repo_root / "itrack-issues" / "config.json"
+    if not cfg_path.exists():
+        raise CLIError(
+            f"Workspace at '{repo_root}' is not initialized (itrack-issues/config.json missing). "
+            "Run 'python itrack.py init' first.",
+            error_code="not_initialized",
+            exit_code=3,
+        )
 
 
 # ---------------------------------------------------------------------------
-# Daemon Discovery, Auto-Spawner & HTTP Client
+# Daemon Discovery, Flock-Guarded Cold-Start Spawner & HTTP Client
 # ---------------------------------------------------------------------------
 
 
@@ -492,6 +454,20 @@ def get_daemon_json_path(repo_root: Path) -> Path:
 
 def get_daemon_log_path(repo_root: Path) -> Path:
     return get_runtime_dir(repo_root) / "daemon.log"
+
+
+def is_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
 
 
 def read_daemon_json(repo_root: Path) -> dict[str, Any] | None:
@@ -508,21 +484,22 @@ def read_daemon_json(repo_root: Path) -> dict[str, Any] | None:
 
 
 def probe_daemon(repo_root: Path) -> tuple[str, dict[str, Any]] | None:
-    """Check daemon.json and verify /api/v1/health matches repo_root."""
+    """Verify daemon.json PID liveness and /api/v1/health matching repo_root."""
     meta = read_daemon_json(repo_root)
     if not meta:
         return None
+    pid = int(meta.get("pid") or 0)
+    if pid > 0 and not is_pid_alive(pid):
+        return None
     base_url = str(meta["base_url"]).rstrip("/")
     try:
-        with httpx.Client(timeout=1.5, trust_env=False) as client:
+        with httpx.Client(timeout=2.0, trust_env=False) as client:
             resp = client.get(f"{base_url}/api/v1/health")
             if resp.status_code != 200:
                 return None
             data = resp.json()
             remote_root = data.get("repo_root")
-            if not remote_root:
-                return None
-            if Path(remote_root).resolve() != repo_root.resolve():
+            if not remote_root or Path(remote_root).resolve() != repo_root.resolve():
                 return None
             return base_url, data
     except Exception:
@@ -536,14 +513,28 @@ def locate_server_script() -> Path:
     return Path(__file__).resolve().parent / "itrack-server.py"
 
 
+def read_log_tail(repo_root: Path, lines: int = 30) -> str:
+    log_path = get_daemon_log_path(repo_root)
+    if not log_path.exists():
+        return ""
+    try:
+        all_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        return "\n".join(all_lines[-max(1, lines):])
+    except Exception:
+        return ""
+
+
 def spawn_daemon(repo_root: Path, requested_port: int = 0) -> tuple[str, dict[str, Any]]:
-    """Spawn `itrack-server.py` in background under exclusive flock and poll up to 8.0s until healthy."""
+    """Spawn `itrack-server.py` under exclusive flock on `.runtime/daemon-spawn.lock`."""
+    if requested_port < 0 or requested_port > 65535:
+        raise CLIError(f"Invalid port '{requested_port}': must be 0..65535.", "invalid_port", 1)
+
     server_script = locate_server_script()
     if not server_script.exists():
         raise CLIError(
-            f"Cannot find server script at '{server_script}'. Ensure 'itrack-server.py' sits alongside 'itrack.py'.",
+            f"Server script not found at '{server_script}'.",
             error_code="server_script_missing",
-            status_code=500,
+            exit_code=1,
         )
 
     rdir = get_runtime_dir(repo_root)
@@ -553,15 +544,15 @@ def spawn_daemon(repo_root: Path, requested_port: int = 0) -> tuple[str, dict[st
     with open(spawn_lock_path, "a+", encoding="utf-8") as lock_f:
         fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
         try:
-            # Double-check after acquiring lock: a peer CLI process may have just started the daemon!
             probed = probe_daemon(repo_root)
             if probed is not None:
-                cur_port = int(probed[1].get("port") or 0)
+                cur_port = int(probed[1].get("port") or urllib.parse.urlparse(probed[0]).port or 0)
                 if requested_port == 0 or cur_port == requested_port:
                     return probed
+                stop_daemon(repo_root)
 
+            # Recover stale daemon.json if present
             djson = get_daemon_json_path(repo_root)
-            # Remove stale daemon.json before spawning fresh instance
             if djson.exists():
                 try:
                     djson.unlink()
@@ -579,7 +570,6 @@ def spawn_daemon(repo_root: Path, requested_port: int = 0) -> tuple[str, dict[st
                 "--port",
                 str(requested_port),
             ]
-
             with open(log_path, "a", encoding="utf-8") as log_f:
                 proc = subprocess.Popen(
                     cmd,
@@ -591,25 +581,25 @@ def spawn_daemon(repo_root: Path, requested_port: int = 0) -> tuple[str, dict[st
                     cwd=str(repo_root),
                 )
 
-            deadline = time.monotonic() + 8.0
+            deadline = time.monotonic() + 12.0
             while time.monotonic() < deadline:
                 probed = probe_daemon(repo_root)
                 if probed is not None:
                     return probed
                 rc = proc.poll()
                 if rc is not None:
-                    tail = read_log_tail(repo_root, lines=20)
-                    detail = f"itrack-server.py exited prematurely with code {rc}."
+                    tail = read_log_tail(repo_root, 25)
+                    msg = f"itrack-server.py exited prematurely with code {rc}."
                     if tail:
-                        detail = f"{detail} Recent log:\n{tail}"
-                    raise CLIError(detail, error_code="daemon_spawn_failed", status_code=500)
-                time.sleep(0.05)
+                        msg = f"{msg}\n{tail}"
+                    raise CLIError(msg, error_code="daemon_spawn_failed", exit_code=1)
+                time.sleep(0.04)
 
-            tail = read_log_tail(repo_root, lines=20)
-            detail = "Timed out after 8.0s waiting for itrack-server.py to become healthy."
+            tail = read_log_tail(repo_root, 25)
+            msg = "Timed out waiting for itrack-server.py to become healthy."
             if tail:
-                detail = f"{detail} Recent log:\n{tail}"
-            raise CLIError(detail, error_code="daemon_timeout", status_code=504)
+                msg = f"{msg}\n{tail}"
+            raise CLIError(msg, error_code="daemon_timeout", exit_code=3)
         finally:
             try:
                 fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
@@ -618,53 +608,39 @@ def spawn_daemon(repo_root: Path, requested_port: int = 0) -> tuple[str, dict[st
 
 
 def ensure_daemon(repo_root: Path, requested_port: int = 0) -> tuple[str, dict[str, Any]]:
-    """Return `(base_url, health_data)` for active daemon, auto-spawning if needed."""
     probed = probe_daemon(repo_root)
     if probed is not None:
-        return probed
+        cur_port = int(probed[1].get("port") or urllib.parse.urlparse(probed[0]).port or 0)
+        if requested_port == 0 or cur_port == requested_port:
+            return probed
     return spawn_daemon(repo_root, requested_port=requested_port)
 
 
-def is_pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except Exception:
-        return False
-
-
 def stop_daemon(repo_root: Path) -> dict[str, Any]:
-    """Gracefully stop running daemon via POST /api/v1/shutdown + SIGTERM fallback."""
+    """Gracefully stop daemon via POST /api/v1/shutdown + SIGTERM fallback + stale cleanup."""
     meta = read_daemon_json(repo_root)
     probed = probe_daemon(repo_root)
     djson = get_daemon_json_path(repo_root)
 
     if probed is None and meta is None:
-        return {"status": "not_running", "stopped": False, "repo_root": str(repo_root)}
+        return {"status": "not_running", "stopped": False, "stale_cleaned": False, "repo_root": str(repo_root)}
 
     pid = int((probed[1].get("pid") if probed else (meta or {}).get("pid")) or 0)
     base_url = probed[0] if probed else str((meta or {}).get("base_url", "")).rstrip("/")
+    was_stale = probed is None and meta is not None
 
     if probed is not None and base_url:
         try:
-            with httpx.Client(timeout=2.5, trust_env=False) as client:
+            with httpx.Client(timeout=3.0, trust_env=False) as client:
                 client.post(f"{base_url}/api/v1/shutdown")
         except Exception:
             pass
 
-    deadline = time.monotonic() + 3.0
+    deadline = time.monotonic() + 3.5
     while time.monotonic() < deadline:
-        if pid and not is_pid_alive(pid) and probe_daemon(repo_root) is None:
+        if (not pid or not is_pid_alive(pid)) and probe_daemon(repo_root) is None:
             break
-        if not pid and probe_daemon(repo_root) is None:
-            break
-        time.sleep(0.05)
+        time.sleep(0.04)
 
     if pid and is_pid_alive(pid):
         try:
@@ -673,7 +649,7 @@ def stop_daemon(repo_root: Path) -> dict[str, Any]:
             pass
         term_deadline = time.monotonic() + 2.0
         while time.monotonic() < term_deadline and is_pid_alive(pid):
-            time.sleep(0.05)
+            time.sleep(0.04)
 
     if djson.exists():
         try:
@@ -682,26 +658,16 @@ def stop_daemon(repo_root: Path) -> dict[str, Any]:
             pass
 
     return {
-        "status": "stopped",
-        "stopped": True,
+        "status": "stopped" if not was_stale else "stale_cleaned",
+        "stopped": not was_stale,
+        "stale_cleaned": was_stale,
         "pid": pid or None,
         "repo_root": str(repo_root),
     }
 
 
-def read_log_tail(repo_root: Path, lines: int = 50) -> str:
-    log_path = get_daemon_log_path(repo_root)
-    if not log_path.exists():
-        return ""
-    try:
-        all_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        return "\n".join(all_lines[-max(1, lines):])
-    except Exception:
-        return ""
-
-
 class ITrackClient:
-    """Thin httpx wrapper enforcing `trust_env=False` and structured CLIError translation."""
+    """Proxy-safe httpx client translating HTTP error codes to strict CLI exit codes."""
 
     def __init__(self, base_url: str) -> None:
         self.base_url = base_url.rstrip("/")
@@ -721,25 +687,25 @@ class ITrackClient:
         try:
             payload = resp.json()
             if isinstance(payload, dict):
-                detail = payload.get("detail", payload)
+                detail = payload.get("detail") or payload.get("message") or payload
             else:
                 detail = payload
         except Exception:
             detail = resp.text.strip() or f"HTTP {resp.status_code}"
 
-        if isinstance(detail, (dict, list)):
-            msg = json.dumps(detail)
-        else:
-            msg = str(detail)
-
+        msg = json.dumps(detail) if isinstance(detail, (dict, list)) else str(detail)
         code_map = {
             400: "bad_request",
             404: "not_found",
             409: "conflict",
             422: "validation_error",
+            503: "not_initialized",
         }
-        err_code = code_map.get(resp.status_code, "api_error")
-        raise CLIError(msg, error_code=err_code, status_code=resp.status_code)
+        raise CLIError(
+            msg,
+            error_code=code_map.get(resp.status_code, "api_error"),
+            exit_code=http_status_to_exit_code(resp.status_code),
+        )
 
     def request(
         self,
@@ -748,6 +714,8 @@ class ITrackClient:
         *,
         params: dict[str, Any] | None = None,
         json_body: Any = None,
+        data: dict[str, Any] | None = None,
+        files: list[tuple[str, tuple[str, Any, str]]] | None = None,
     ) -> Any:
         clean_params = (
             {k: v for k, v in params.items() if v is not None}
@@ -755,520 +723,676 @@ class ITrackClient:
             else None
         )
         try:
-            resp = self._client.request(method, path, params=clean_params, json=json_body)
+            resp = self._client.request(
+                method,
+                path,
+                params=clean_params,
+                json=json_body,
+                data=data,
+                files=files,
+            )
         except httpx.HTTPError as exc:
             raise CLIError(
                 f"Failed communicating with itrack daemon ({self.base_url}): {exc}",
                 error_code="connection_error",
-                status_code=503,
+                exit_code=3,
             ) from exc
 
         if resp.status_code >= 400:
             self._raise_api_error(resp)
-        if not resp.content:
-            return {}
+        if resp.status_code == 204 or not resp.content:
+            return {"ok": True}
         return resp.json()
 
-    def upload_attachment(
-        self,
-        issue_key: str,
-        file_path: Path,
-        uploaded_by: str,
-        description: str = "",
-    ) -> dict[str, Any]:
-        if not file_path.exists() or not file_path.is_file():
-            raise CLIError(f"Attachment file not found: '{file_path}'", "file_not_found", 400)
-        mime_type, _ = mimetypes.guess_type(str(file_path))
-        content_type = mime_type or "application/octet-stream"
-        url_key = urllib.parse.quote(norm_key(issue_key), safe="")
+    def download_bytes(self, path: str) -> tuple[bytes, httpx.Headers]:
         try:
-            with open(file_path, "rb") as fh:
-                files = {"file": (file_path.name, fh, content_type)}
-                data = {"uploaded_by": uploaded_by, "description": description}
-                resp = self._client.post(f"/api/v1/issues/{url_key}/attachments", files=files, data=data)
+            resp = self._client.get(path)
         except httpx.HTTPError as exc:
-            raise CLIError(f"Upload failed: {exc}", "connection_error", 503) from exc
-
+            raise CLIError(f"Download failed: {exc}", "connection_error", 3) from exc
         if resp.status_code >= 400:
             self._raise_api_error(resp)
-        return resp.json()
-
-    def download_attachment(
-        self,
-        issue_key: str,
-        attachment_id: str,
-        output_path: Path | None,
-    ) -> dict[str, Any]:
-        url_key = urllib.parse.quote(norm_key(issue_key), safe="")
-        url_att = urllib.parse.quote(attachment_id.strip(), safe="")
-        try:
-            resp = self._client.get(f"/api/v1/issues/{url_key}/attachments/{url_att}/download")
-        except httpx.HTTPError as exc:
-            raise CLIError(f"Download failed: {exc}", "connection_error", 503) from exc
-
-        if resp.status_code >= 400:
-            self._raise_api_error(resp)
-
-        filename = attachment_id
-        cd = resp.headers.get("content-disposition", "")
-        match = re.search(r'filename="?([^";]+)"?', cd)
-        if match:
-            filename = Path(match.group(1)).name
-
-        dest = output_path if output_path is not None else (Path.cwd() / filename)
-        if dest.exists() and dest.is_dir():
-            dest = dest / filename
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(resp.content)
-        return {
-            "key": norm_key(issue_key),
-            "attachment_id": attachment_id,
-            "output_path": str(dest.resolve()),
-            "size_bytes": len(resp.content),
-        }
+        return resp.content, resp.headers
 
 
-def emit_json(data: Any) -> None:
-    sys.stdout.write(json.dumps(data, indent=2) + "\n")
-    sys.stdout.flush()
+def validate_upload_paths(paths: list[str] | None, label: str = "File") -> list[Path]:
+    if not paths:
+        return []
+    resolved: list[Path] = []
+    for raw in paths:
+        p = Path(raw).expanduser()
+        if not p.exists() or not p.is_file():
+            raise CLIError(f"{label} not found: '{raw}'", "file_not_found", 1)
+        resolved.append(p)
+    return resolved
 
 
-def handle_cli_error(err: CLIError, json_mode: bool) -> NoReturn:
-    if json_mode:
-        emit_json(
-            {
-                "error": err.error_code,
-                "detail": err.message,
-                "status_code": err.status_code,
-            }
-        )
-    else:
-        stderr_console.print(f"[bold red]Error ({err.error_code}):[/bold red] {err.message}")
-    sys.exit(1)
+def open_multipart_files(
+    field_specs: list[tuple[str, list[Path]]],
+) -> tuple[list[tuple[str, tuple[str, Any, str]]], list[Any]]:
+    multipart: list[tuple[str, tuple[str, Any, str]]] = []
+    handles: list[Any] = []
+    for field_name, paths in field_specs:
+        for p in paths:
+            mime, _ = mimetypes.guess_type(p.name)
+            fh = open(p, "rb")
+            handles.append(fh)
+            multipart.append((field_name, (p.name, fh, mime or "application/octet-stream")))
+    return multipart, handles
 
 
 # ---------------------------------------------------------------------------
-# Rich TUI Renderers
+# Rich TUI Renderers (Tables, Panels, Progress Bars & Deleted Attachment UI)
 # ---------------------------------------------------------------------------
 
 
-def fmt_status(status: str | None) -> str:
-    s = (status or "unknown").lower()
-    style = STATUS_STYLES.get(s, "white")
-    return f"[{style}]{s}[/{style}]"
+def fmt_state(state: str | None) -> str:
+    s = state or "-"
+    st = STATE_STYLES.get(s, "white")
+    return f"[{st}]{s}[/{st}]"
 
 
-def fmt_priority(priority: str | None) -> str:
-    p = (priority or "none").lower()
-    style = PRIORITY_STYLES.get(p, "white")
-    return f"[{style}]{p}[/{style}]"
+def fmt_priority(prio: str | None) -> str:
+    p = prio or "-"
+    st = PRIORITY_STYLES.get(p, "white")
+    return f"[{st}]{p}[/{st}]"
 
 
-def fmt_type(issue_type: str | None) -> str:
-    t = (issue_type or "task").lower()
-    icon = TYPE_ICONS.get(t, "•")
-    return f"{icon} {t}"
+def fmt_severity(sev: str | None) -> str:
+    s = sev or "-"
+    st = SEVERITY_STYLES.get(s, "white")
+    return f"[{st}]{s}[/{st}]"
 
 
-def fmt_minutes(total_minutes: int | float | None) -> str:
-    mins = int(total_minutes or 0)
-    if mins <= 0:
-        return "0m"
-    h, m = divmod(mins, 60)
-    if h and m:
-        return f"{h}h {m}m"
-    return f"{h}h" if h else f"{m}m"
+def make_bar(completed: int | float, total: int | float, width: int = 16) -> str:
+    if total <= 0:
+        return "[dim]" + ("░" * width) + "[/dim] 0%"
+    ratio = max(0.0, min(1.0, float(completed) / float(total)))
+    filled = int(round(ratio * width))
+    pct = (float(completed) / float(total)) * 100.0
+    color = "green" if pct <= 100.0 else "red"
+    bar = f"[{color}]{'█' * filled}[/{color}][dim]{'░' * (width - filled)}[/dim]"
+    return f"{bar} {pct:.0f}%"
 
 
-def render_issue_table(
-    issues: list[dict[str, Any]],
-    *,
-    title: str = "Issues",
-    total: int | None = None,
-    snippets: dict[str, str] | None = None,
-) -> None:
-    count_str = f"{len(issues)}" if total is None or total == len(issues) else f"{len(issues)} of {total}"
-    if not issues:
-        stdout_console.print(f"[dim]{title}: 0 issues matched.[/dim]")
-        return
+def render_time_bar(logged_minutes: int, estimate_minutes: int | None) -> str:
+    if estimate_minutes and estimate_minutes > 0:
+        return f"{make_bar(logged_minutes, estimate_minutes)} ({logged_minutes}m / {estimate_minutes}m)"
+    return f"{logged_minutes}m logged (no estimate)"
 
-    table = Table(title=f"{title} ({count_str})", box=box.ROUNDED, expand=False)
-    table.add_column("Key", style="bold cyan", no_wrap=True)
-    table.add_column("Type", no_wrap=True)
-    table.add_column("Status", no_wrap=True)
-    table.add_column("Priority", no_wrap=True)
-    table.add_column("Title", overflow="fold")
-    table.add_column("Assignee", style="green", no_wrap=True)
-    table.add_column("Labels", style="magenta")
-    table.add_column("Pts", justify="right", no_wrap=True)
 
-    for iss in issues:
-        key = iss.get("key", "")
-        blocked_badge = " [bold red][BLOCKED][/bold red]" if iss.get("is_blocked") else ""
-        claim_badge = f" [yellow](⚡{iss['claimed_by']})[/yellow]" if iss.get("claimed_by") else ""
-        title_line = f"{iss.get('title', '')}{blocked_badge}{claim_badge}"
-        if snippets and key in snippets and snippets[key]:
-            title_line += f"\n[dim]{snippets[key]}[/dim]"
-        pts = iss.get("story_points")
-        pts_str = f"{pts:g}" if isinstance(pts, (int, float)) else "-"
-        labels_str = ", ".join(iss.get("labels") or []) or "-"
-        assignee_str = iss.get("assignee") or "[dim]-[/dim]"
-        table.add_row(
-            key,
-            fmt_type(iss.get("type")),
-            fmt_status(iss.get("status")),
+def render_issues_table(data: dict[str, Any], title: str = "Issues") -> None:
+    items = data.get("issues") if "issues" in data else (data.get("items") or data.get("results") or [])
+    total = data.get("total", len(items))
+    page = data.get("page", 1)
+    total_pages = data.get("total_pages") or max(1, (int(total) + int(data.get("page_size", max(1, len(items) or 25))) - 1) // int(data.get("page_size", max(1, len(items) or 25))))
+
+    t = Table(
+        title=f"{title} ({len(items)} shown / {total} total — Page {page}/{total_pages})",
+        box=box.ROUNDED,
+    )
+    t.add_column("Key", style="bold cyan", no_wrap=True)
+    t.add_column("Category", style="magenta")
+    t.add_column("State", no_wrap=True)
+    t.add_column("Prio", no_wrap=True)
+    t.add_column("Sev", no_wrap=True)
+    t.add_column("Name", style="bold")
+    t.add_column("Assignee", style="green")
+    t.add_column("Due / Flags", style="yellow")
+
+    for iss in items:
+        flags: list[str] = []
+        if iss.get("due_date"):
+            flags.append(str(iss["due_date"]))
+        if iss.get("is_overdue"):
+            flags.append("[bold red]OVERDUE[/bold red]")
+        if iss.get("is_blocked"):
+            flags.append("[bold red]BLOCKED[/bold red]")
+        if iss.get("archived"):
+            flags.append("[dim]ARCHIVED[/dim]")
+        t.add_row(
+            str(iss.get("key", "")),
+            str(iss.get("category", "")),
+            fmt_state(iss.get("state")),
             fmt_priority(iss.get("priority")),
-            title_line,
-            assignee_str,
-            labels_str,
-            pts_str,
+            fmt_severity(iss.get("severity")),
+            str(iss.get("name", "")),
+            str(iss.get("assignee") or "-"),
+            " ".join(flags) if flags else "-",
         )
-    stdout_console.print(table)
+    stdout_console.print(t)
+
+
+def render_comment_panel(
+    cmt: dict[str, Any],
+    deleted_map: dict[str, Any] | None = None,
+    issue_att_map: dict[str, Any] | None = None,
+) -> Panel:
+    edits = cmt.get("edit_history") or []
+    edited_badge = f" [dim](edited {len(edits)}x)[/dim]" if edits else ""
+    header = (
+        f"[bold cyan]{cmt.get('id')}[/bold cyan] by [bold green]{cmt.get('author') or 'user'}[/bold green] "
+        f"at [dim]{cmt.get('created_at', '')}[/dim]{edited_badge}"
+    )
+    lines: list[str] = [cmt.get("body") or "[dim](empty comment)[/dim]"]
+
+    embeds = cmt.get("embeds") or []
+    if embeds:
+        emb_str = ", ".join(f"{e.get('id')} ({e.get('filename')})" for e in embeds)
+        lines.append(f"\n[magenta]Inline Embeds:[/magenta] {emb_str}")
+
+    atts = cmt.get("attachments") or []
+    if atts:
+        att_str = ", ".join(f"{a.get('id')} ({a.get('filename')}, {a.get('size_bytes', 0)}B)" for a in atts)
+        lines.append(f"[cyan]Comment Attachments:[/cyan] {att_str}")
+
+    resolved_links = cmt.get("linked_attachments")
+    linked_ids = cmt.get("linked_attachment_ids") or []
+    if resolved_links:
+        parts: list[str] = []
+        for la in resolved_links:
+            if la.get("deleted"):
+                parts.append(f"[strike red]\\[deleted attachment: {la.get('id')} ({la.get('filename') or 'removed'})][/strike red]")
+            else:
+                parts.append(f"{la.get('id')} ({la.get('filename')})")
+        lines.append("[yellow]Linked Issue Attachments:[/yellow] " + ", ".join(parts))
+    elif linked_ids:
+        parts = []
+        dmap = deleted_map or {}
+        amap = issue_att_map or {}
+        for aid in linked_ids:
+            if aid in dmap or (amap and aid not in amap):
+                dinfo = dmap.get(aid) or {}
+                parts.append(f"[strike red]\\[deleted attachment: {aid} ({dinfo.get('filename') or 'removed'})][/strike red]")
+            else:
+                ainfo = amap.get(aid) or {}
+                parts.append(f"{aid} ({ainfo.get('filename', aid)})")
+        lines.append("[yellow]Linked Issue Attachments:[/yellow] " + ", ".join(parts))
+
+    return Panel("\n".join(lines), title=header, border_style="blue")
 
 
 def render_issue_detail(issue: dict[str, Any]) -> None:
-    key = issue.get("key", "ISSUE")
-    title = issue.get("title", "")
-    blocked_flag = " [bold white on red] BLOCKED [/bold white on red]" if issue.get("is_blocked") else ""
-    header = (
-        f"[bold cyan]{key}[/bold cyan]  [bold]{title}[/bold]{blocked_flag}\n"
-        f"Type: {fmt_type(issue.get('type'))}   Status: {fmt_status(issue.get('status'))}   "
-        f"Priority: {fmt_priority(issue.get('priority'))}   Points: [bold]{issue.get('story_points') or '-'}[/bold]"
-    )
+    badges: list[str] = [
+        f"[bold magenta]{issue.get('category', 'task')}[/bold magenta]",
+        fmt_state(issue.get("state")),
+        f"prio:{fmt_priority(issue.get('priority'))}",
+        f"sev:{fmt_severity(issue.get('severity'))}",
+    ]
+    if issue.get("resolution"):
+        badges.append(f"[green]res:{issue['resolution']}[/green]")
+    if issue.get("archived"):
+        badges.append("[dim]ARCHIVED[/dim]")
+    if issue.get("is_overdue"):
+        badges.append("[bold white on red] OVERDUE [/bold white on red]")
+    if issue.get("is_blocked"):
+        blockers = ", ".join(issue.get("unresolved_blockers") or [])
+        badges.append(f"[bold white on red] BLOCKED{f' ({blockers})' if blockers else ''} [/bold white on red]")
 
-    meta = Table.grid(padding=(0, 3))
-    meta.add_column(style="bold dim")
-    meta.add_column()
-    meta.add_column(style="bold dim")
-    meta.add_column()
-    meta.add_row("Assignee:", issue.get("assignee") or "-", "Reporter:", issue.get("reporter") or "-")
-    meta.add_row("Claimed By:", issue.get("claimed_by") or "-", "Resolution:", issue.get("resolution") or "-")
-    meta.add_row("Epic / Parent:", f"{issue.get('epic_id') or '-'} / {issue.get('parent_id') or '-'}", "Sprint / Milestone:", f"{issue.get('sprint_id') or '-'} / {issue.get('milestone_id') or '-'}")
-    meta.add_row("Labels:", ", ".join(issue.get("labels") or []) or "-", "Components:", ", ".join(issue.get("components") or []) or "-")
-    meta.add_row("Due Date:", issue.get("due_date") or "-", "Worklogged:", fmt_minutes(issue.get("total_worklog_minutes")))
-    meta.add_row("Created:", issue.get("created_at") or "-", "Updated:", issue.get("updated_at") or "-")
-    if issue.get("unresolved_blockers"):
-        meta.add_row("Open Blockers:", f"[bold red]{', '.join(issue['unresolved_blockers'])}[/bold red]", "Subtasks:", ", ".join(issue.get("subtask_keys") or []) or "-")
-    elif issue.get("subtask_keys"):
-        meta.add_row("Subtasks:", ", ".join(issue["subtask_keys"]), "Watchers:", ", ".join(issue.get("watchers") or []) or "-")
+    logged = int(issue.get("logged_minutes") or 0)
+    est = issue.get("estimate_minutes")
+    tags_str = ", ".join(issue.get("tags") or []) or "-"
+    comps_str = ", ".join(issue.get("components") or []) or "-"
+    cfields = issue.get("custom_fields") or {}
+    cfields_str = ", ".join(f"{k}={v}" for k, v in cfields.items()) if cfields else "-"
 
-    stdout_console.print(Panel(meta, title=header, title_align="left", border_style="cyan"))
-
-    desc = (issue.get("description") or "").strip()
-    if desc:
-        stdout_console.print(Panel(Markdown(desc), title="Description", title_align="left", border_style="dim"))
-
-    all_links = issue.get("all_links") or issue.get("links") or []
-    if all_links:
-        lt = Table(title="Links", box=box.SIMPLE_HEAD)
-        lt.add_column("ID", style="dim")
-        lt.add_column("Relation", style="yellow")
-        lt.add_column("Source -> Target", style="cyan")
-        for lnk in all_links:
-            lt.add_row(str(lnk.get("id", "-")), str(lnk.get("link_type", "")), f"{lnk.get('source_key', key)} -> {lnk.get('target_key', '')}")
-        stdout_console.print(lt)
-
-    attachments = issue.get("attachments") or []
-    if attachments:
-        at = Table(title="Attachments", box=box.SIMPLE_HEAD)
-        at.add_column("ID", style="bold cyan")
-        at.add_column("Filename")
-        at.add_column("Size", justify="right")
-        at.add_column("By", style="green")
-        at.add_column("Description", style="dim")
-        for att in attachments:
-            at.add_row(
-                str(att.get("id", "")),
-                str(att.get("filename", "")),
-                f"{att.get('size_bytes', 0)} B",
-                str(att.get("uploaded_by", "-")),
-                str(att.get("description", "")),
-            )
-        stdout_console.print(at)
-
-    worklogs = issue.get("worklogs") or []
-    if worklogs:
-        wt = Table(title=f"Worklogs (Total: {fmt_minutes(issue.get('total_worklog_minutes'))})", box=box.SIMPLE_HEAD)
-        wt.add_column("ID", style="dim")
-        wt.add_column("Author", style="green")
-        wt.add_column("Duration", justify="right")
-        wt.add_column("Note")
-        for wl in worklogs:
-            wt.add_row(str(wl.get("id", "")), str(wl.get("author", "-")), fmt_minutes(wl.get("minutes")), str(wl.get("note", "")))
-        stdout_console.print(wt)
-
-    comments = issue.get("comments") or []
-    if comments:
-        ct = Table(title=f"Comments ({len(comments)})", box=box.SIMPLE_HEAD, show_lines=True)
-        ct.add_column("ID", style="dim", no_wrap=True)
-        ct.add_column("Author", style="green", no_wrap=True)
-        ct.add_column("Created", style="dim", no_wrap=True)
-        ct.add_column("Comment")
-        for cmt in comments:
-            ct.add_row(str(cmt.get("id", "")), str(cmt.get("author", "-")), str(cmt.get("created_at", "")), str(cmt.get("body", "")))
-        stdout_console.print(ct)
-
-
-def render_board(data: dict[str, Any]) -> None:
-    columns = data.get("columns") or []
-    total = data.get("total_issues", 0)
-    if not columns:
-        stdout_console.print("[dim]Board has no columns configured.[/dim]")
-        return
-
-    active_cols = [c for c in columns if c.get("issues") or c.get("status") in ("todo", "in_progress", "in_review", "blocked", "done")]
-    if not active_cols:
-        active_cols = columns
-
-    board_table = Table(title=f"Kanban Board ({total} issues)", box=box.ROUNDED, show_lines=True, expand=True)
-    for col in active_cols:
-        st = col.get("status", "")
-        cnt = col.get("count", len(col.get("issues") or []))
-        wip = col.get("wip_limit")
-        pts = col.get("points", 0)
-        wip_str = f"/{wip}" if wip else ""
-        over_wip = bool(wip and cnt > wip)
-        hdr_style = "bold red" if over_wip else STATUS_STYLES.get(st, "bold")
-        pts_txt = f" · {pts:g}pt" if pts else ""
-        board_table.add_column(f"[{hdr_style}]{st.upper()} ({cnt}{wip_str}{pts_txt})[/{hdr_style}]", ratio=1)
-
-    max_rows = max((len(c.get("issues") or []) for c in active_cols), default=0)
-    if max_rows == 0:
-        board_table.add_row(*["[dim]Empty[/dim]" for _ in active_cols])
-    else:
-        for idx in range(max_rows):
-            row_cells: list[str] = []
-            for col in active_cols:
-                col_issues = col.get("issues") or []
-                if idx < len(col_issues):
-                    iss = col_issues[idx]
-                    assignee = f" @{iss['assignee']}" if iss.get("assignee") else ""
-                    blk = " [bold red]![/bold red]" if iss.get("is_blocked") else ""
-                    cell = (
-                        f"[bold cyan]{iss.get('key')}[/bold cyan]{blk} {fmt_priority(iss.get('priority'))}[green]{assignee}[/green]\n"
-                        f"{iss.get('title', '')}"
-                    )
-                    row_cells.append(cell)
-                else:
-                    row_cells.append("")
-            board_table.add_row(*row_cells)
-    stdout_console.print(board_table)
-
-
-def render_graph(data: dict[str, Any]) -> None:
-    nodes = {n["key"]: n for n in (data.get("nodes") or []) if "key" in n}
-    edges = data.get("edges") or []
-    ready_keys = data.get("ready_keys") or []
-    blocked_keys = data.get("blocked_keys") or []
-
-    tree = Tree(f"[bold cyan]Dependency Graph[/bold cyan] ({len(nodes)} nodes, {len(edges)} edges)")
-    outgoing: dict[str, list[tuple[str, str]]] = {}
-    inbound_blocks: set[str] = set()
-    for e in edges:
-        src, tgt, etype = e.get("source", ""), e.get("target", ""), e.get("type", "relates_to")
-        outgoing.setdefault(src, []).append((etype, tgt))
-        if etype == "blocks":
-            inbound_blocks.add(tgt)
-
-    roots = [k for k in sorted(nodes) if k in outgoing and k not in inbound_blocks]
-    if not roots:
-        roots = [k for k in sorted(nodes) if k in outgoing]
-
-    def add_children(branch: Tree, key: str, seen: set[str]) -> None:
-        for etype, tgt in outgoing.get(key, []):
-            tnode = nodes.get(tgt, {"key": tgt, "title": "", "status": "?"})
-            label = f"[yellow]--({etype})-->[/yellow] [bold cyan]{tgt}[/bold cyan] ({fmt_status(tnode.get('status'))}) {tnode.get('title', '')}"
-            if tgt in seen:
-                branch.add(label + " [dim](cycle/ref)[/dim]")
-            else:
-                sub = branch.add(label)
-                add_children(sub, tgt, seen | {tgt})
-
-    if roots:
-        for rk in roots:
-            rnode = nodes.get(rk, {"key": rk, "title": "", "status": "?"})
-            b = tree.add(f"[bold cyan]{rk}[/bold cyan] ({fmt_status(rnode.get('status'))}) {rnode.get('title', '')}")
-            add_children(b, rk, {rk})
-    else:
-        tree.add("[dim]No explicit dependency links recorded yet.[/dim]")
-
-    stdout_console.print(tree)
-    stdout_console.print(
-        f"[bold green]Ready ({len(ready_keys)}):[/bold green] {', '.join(ready_keys) or '-'}   "
-        f"[bold red]Blocked ({len(blocked_keys)}):[/bold red] {', '.join(blocked_keys) or '-'}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Command Handlers — System, Daemon, UI, Search, Board & Issues
-# ---------------------------------------------------------------------------
-
-
-def can_open_gui_browser() -> bool:
-    if sys.platform == "darwin" or sys.platform.startswith("win"):
-        return True
-    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-
-
-def cmd_init(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
-    base_url, health = ensure_daemon(repo_root)
-    with ITrackClient(base_url) as client:
-        patch_body: dict[str, Any] = {}
-        if args.key:
-            patch_body["project_key"] = args.key.strip().upper()
-        if args.name:
-            patch_body["project_name"] = args.name.strip()
-        cfg = client.request("PATCH", "/api/v1/config", json_body=patch_body) if patch_body else client.request("GET", "/api/v1/config")
-
-    result = {
-        "status": "initialized",
-        "repo_root": str(repo_root),
-        "issues_dir": str(repo_root / "itrack-issues"),
-        "daemon_url": base_url,
-        "daemon_pid": health.get("pid"),
-        "config": cfg,
-    }
-    if json_mode:
-        emit_json(result)
-        return
+    meta_lines = [
+        "  ".join(badges),
+        f"[bold]Folder:[/bold] issues/{issue.get('folder') or issue.get('name')}",
+        f"[bold]Assignee:[/bold] {issue.get('assignee') or '-'}   "
+        f"[bold]Reporter:[/bold] {issue.get('reporter') or '-'}   "
+        f"[bold]Parent:[/bold] {issue.get('parent') or '-'}",
+        f"[bold]Sprint:[/bold] {issue.get('sprint') or '-'}   "
+        f"[bold]Milestone:[/bold] {issue.get('milestone') or '-'}   "
+        f"[bold]Points:[/bold] {issue.get('story_points') if issue.get('story_points') is not None else '-'}   "
+        f"[bold]Due:[/bold] {issue.get('due_date') or '-'}",
+        f"[bold]Tags:[/bold] {tags_str}   [bold]Components:[/bold] {comps_str}",
+        f"[bold]Custom Fields:[/bold] {cfields_str}",
+        f"[bold]Time Tracking:[/bold] {render_time_bar(logged, est)}",
+        f"[dim]Created: {issue.get('created_at', '-')}  |  Updated: {issue.get('updated_at', '-')}[/dim]",
+    ]
     stdout_console.print(
         Panel(
-            f"[bold green]Workspace Ready[/bold green]\n"
-            f"Project: [bold cyan]{cfg.get('project_name')}[/bold cyan] ([bold]{cfg.get('project_key')}[/bold])\n"
-            f"Storage: `{repo_root / 'itrack-issues'}`\n"
-            f"Daemon:  {base_url} (PID {health.get('pid')})",
-            title="itrack init",
-            border_style="green",
-        )
-    )
-
-
-def cmd_ui(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
-    req_port = int(args.port or 0)
-    probed = probe_daemon(repo_root)
-    if probed is not None and req_port > 0 and int(probed[1].get("port") or 0) != req_port:
-        stop_daemon(repo_root)
-        base_url, health = spawn_daemon(repo_root, requested_port=req_port)
-    elif probed is not None:
-        base_url, health = probed
-    else:
-        base_url, health = spawn_daemon(repo_root, requested_port=req_port)
-
-    url = f"{base_url}/"
-    opened = False
-    if not args.no_open and can_open_gui_browser():
-        try:
-            opened = bool(webbrowser.open(url))
-        except Exception:
-            opened = False
-
-    payload = {
-        "url": url,
-        "host": health.get("host", "127.0.0.1"),
-        "port": health.get("port"),
-        "pid": health.get("pid"),
-        "repo_root": str(repo_root),
-        "opened_browser": opened,
-    }
-    if json_mode:
-        emit_json(payload)
-        return
-    browser_note = "Opened in default browser" if opened else "Headless / --no-open (open URL in browser)"
-    stdout_console.print(
-        Panel(
-            f"[bold cyan]Web UI URL:[/bold cyan] [underline bold]{url}[/underline bold]\n"
-            f"[bold]Daemon PID:[/bold] {payload['pid']}   [bold]Port:[/bold] {payload['port']}\n"
-            f"[bold]Repository:[/bold] {repo_root}\n"
-            f"[dim]{browser_note}[/dim]",
-            title="itrack Web UI",
+            "\n".join(meta_lines),
+            title=f"[bold cyan]{issue.get('key')}[/bold cyan] — [bold]{issue.get('name')}[/bold]",
             border_style="cyan",
         )
     )
 
+    desc = issue.get("description") or ""
+    desc_embeds = issue.get("description_embeds") or []
+    if desc or desc_embeds:
+        body_str = desc if desc else "[dim](no text)[/dim]"
+        if desc_embeds:
+            emb_list = ", ".join(f"{e.get('id')} ({e.get('filename')})" for e in desc_embeds)
+            body_str += f"\n\n[magenta]Description Embeds:[/magenta] {emb_list}"
+        stdout_console.print(Panel(body_str, title="Description", border_style="dim"))
 
-def cmd_daemon(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
-    sub = args.daemon_action
-    if sub == "status":
-        probed = probe_daemon(repo_root)
-        if probed is None:
-            data = {"running": False, "status": "stopped", "repo_root": str(repo_root)}
-            if json_mode:
-                emit_json(data)
-            else:
-                stdout_console.print(f"[yellow]Daemon is stopped[/yellow] for `{repo_root}`.")
-            return
-        base_url, health = probed
-        data = {"running": True, **health}
-        if json_mode:
-            emit_json(data)
-        else:
-            stdout_console.print(
-                f"[bold green]Daemon running[/bold green] at [underline]{base_url}[/underline] "
-                f"(PID {health.get('pid')}, issues={health.get('issue_count', 0)}, uptime={health.get('uptime_seconds', 0):.1f}s)"
+    acs = issue.get("acceptance_criteria") or []
+    if acs:
+        ac_prog = issue.get("ac_progress") or {
+            "checked": sum(1 for a in acs if a.get("checked")),
+            "total": len(acs),
+        }
+        ac_lines = [
+            f"{make_bar(ac_prog.get('checked', 0), ac_prog.get('total', len(acs)))} "
+            f"({ac_prog.get('checked', 0)}/{ac_prog.get('total', len(acs))} checked)"
+        ]
+        for idx, item in enumerate(acs, 1):
+            mark = "[bold green]\\[x][/bold green]" if item.get("checked") else "[yellow]\\[ ][/yellow]"
+            ac_lines.append(f"{idx}. {mark} [cyan]{item.get('id', f'AC-{idx}')}[/cyan]: {item.get('text', '')}")
+        stdout_console.print(Panel("\n".join(ac_lines), title="Acceptance Criteria", border_style="green"))
+
+    subtasks = issue.get("subtasks") or []
+    if subtasks:
+        sp = issue.get("subtask_progress") or {
+            "completed": sum(1 for s in subtasks if s.get("completed") or s.get("state") == "done"),
+            "total": len(subtasks),
+        }
+        st_lines = [
+            f"{make_bar(sp.get('completed', 0), sp.get('total', len(subtasks)))} "
+            f"({sp.get('completed', 0)}/{sp.get('total', len(subtasks))} completed)"
+        ]
+        for s in subtasks:
+            st_lines.append(f"• [cyan]{s.get('key')}[/cyan] {fmt_state(s.get('state'))} — {s.get('name')}")
+        stdout_console.print(Panel("\n".join(st_lines), title="Subtasks", border_style="magenta"))
+
+    links = issue.get("links") or []
+    if links:
+        lt = Table(title="Linked Issues", box=box.SIMPLE)
+        lt.add_column("ID", style="cyan")
+        lt.add_column("Type", style="yellow")
+        lt.add_column("Direction", style="dim")
+        lt.add_column("Target", style="bold")
+        for lnk in links:
+            lt.add_row(
+                str(lnk.get("id", "")),
+                str(lnk.get("type", "")),
+                str(lnk.get("direction", "outbound")),
+                f"{lnk.get('target_key')} ({lnk.get('target_name', '')})",
             )
+        stdout_console.print(lt)
+
+    atts = issue.get("attachments") or []
+    if atts:
+        at = Table(title="Issue Attachments", box=box.SIMPLE)
+        at.add_column("ID", style="cyan")
+        at.add_column("Filename", style="bold")
+        at.add_column("MIME", style="dim")
+        at.add_column("Size", justify="right")
+        for a in atts:
+            at.add_row(
+                str(a.get("id", "")),
+                str(a.get("filename", "")),
+                str(a.get("mime_type", "")),
+                f"{a.get('size_bytes', 0)} B",
+            )
+        stdout_console.print(at)
+
+    comments = issue.get("comments") or []
+    if comments:
+        deleted_map = issue.get("deleted_attachments") or {}
+        att_map = {a.get("id"): a for a in atts if a.get("id")}
+        for cmt in comments:
+            stdout_console.print(render_comment_panel(cmt, deleted_map=deleted_map, issue_att_map=att_map))
+
+
+# ---------------------------------------------------------------------------
+# Workspace, Config, Server, UI, Stats, Tree, Search, Board & History
+# ---------------------------------------------------------------------------
+
+
+def _atomic_write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        if os.path.exists(tmp_name):
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+        raise
+
+
+def cmd_init(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
+    prefix_arg: str | None = None
+    if args.prefix is not None:
+        p = args.prefix.strip().upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9]{1,9}", p):
+            raise CLIError(
+                f"Invalid project prefix '{args.prefix}': expected 2..10 alphanumeric chars starting with a letter.",
+                error_code="invalid_prefix",
+                exit_code=1,
+            )
+        prefix_arg = p
+
+    title_arg: str | None = None
+    if args.title is not None:
+        t = args.title.strip()
+        if not t or len(t) > 120:
+            raise CLIError("Invalid project title: expected 1..120 non-whitespace characters.", "invalid_title", 1)
+        title_arg = t
+
+    issues_root = repo_root / "itrack-issues"
+    runtime_dir = issues_root / ".runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (issues_root / "issues").mkdir(parents=True, exist_ok=True)
+
+    lock_path = runtime_dir / "storage.lock"
+    with open(lock_path, "a+", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            gitignore_path = issues_root / ".gitignore"
+            if not gitignore_path.exists():
+                gitignore_path.write_text(".runtime/\nindex.sqlite*\n*.tmp\n", encoding="utf-8")
+
+            for fname, key in (
+                ("tags.json", "tags"),
+                ("sprints.json", "sprints"),
+                ("milestones.json", "milestones"),
+                ("views.json", "views"),
+            ):
+                fpath = issues_root / fname
+                if not fpath.exists():
+                    _atomic_write_json(fpath, {key: []})
+
+            cfg_path = issues_root / "config.json"
+            already_initialized = cfg_path.exists()
+            if not already_initialized:
+                ts = now_iso()
+                default_cfg = {
+                    "version": VERSION,
+                    "project_prefix": prefix_arg or "ITR",
+                    "project_title": title_arg or "iTrack Workspace",
+                    "default_category": "task",
+                    "default_state": "backlog",
+                    "default_priority": "medium",
+                    "default_severity": "sev3",
+                    "wip_limits": {},
+                    "preferences": {
+                        "theme": "dark",
+                        "default_swimlane": "none",
+                        "page_size": 25,
+                    },
+                    "sequences": {
+                        "issue": 0,
+                        "comment": 0,
+                        "attachment": 0,
+                        "link": 0,
+                        "worklog": 0,
+                        "history": 0,
+                        "sprint": 0,
+                        "milestone": 0,
+                        "view": 0,
+                    },
+                    "created_at": ts,
+                    "updated_at": ts,
+                }
+                _atomic_write_json(cfg_path, default_cfg)
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+    base_url, health = ensure_daemon(repo_root)
+    with ITrackClient(base_url) as client:
+        if already_initialized and (prefix_arg is not None or title_arg is not None):
+            updates: dict[str, Any] = {}
+            if prefix_arg is not None:
+                updates["project_prefix"] = prefix_arg
+            if title_arg is not None:
+                updates["project_title"] = title_arg
+            cfg = client.request("PATCH", "/api/v1/config", json_body=updates)
+        else:
+            cfg = client.request("GET", "/api/v1/config")
+
+    result = {
+        "initialized": True,
+        "already_initialized": already_initialized,
+        "repo_root": str(repo_root),
+        "storage_dir": str(issues_root),
+        "base_url": base_url,
+        "pid": health.get("pid"),
+        "config": cfg,
+    }
+    if json_mode:
+        emit_json(result)
+    else:
+        stdout_console.print(
+            Panel(
+                f"Workspace: [bold cyan]{cfg.get('project_title', 'iTrack Workspace')}[/bold cyan] "
+                f"([bold]{cfg.get('project_prefix', 'ITR')}[/bold])\n"
+                f"Storage:   {issues_root}\n"
+                f"Daemon:    {base_url} (PID {health.get('pid')})",
+                title="itrack Initialized" if not already_initialized else "itrack Workspace Ready",
+                border_style="green",
+            )
+        )
+
+
+def cmd_status(_args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
+    base_url, health = ensure_daemon(repo_root)
+    with ITrackClient(base_url) as client:
+        data = client.request("GET", "/api/v1/status")
+    if isinstance(data, dict):
+        data.setdefault("base_url", base_url)
+        data.setdefault("daemon", health)
+    if json_mode:
+        emit_json(data)
+    else:
+        stdout_console.print(
+            Panel(
+                f"Project: [bold cyan]{data.get('project_title', '-')}[/bold cyan] ({data.get('project_prefix', 'ITR')})\n"
+                f"Root:    {data.get('repo_root', repo_root)}\n"
+                f"Daemon:  {base_url} (PID {health.get('pid')})\n"
+                f"Issues:  [bold]{data.get('total_issues', data.get('issue_count', 0))}[/bold]   "
+                f"Sprints: {data.get('sprint_count', 0)}   "
+                f"Milestones: {data.get('milestone_count', 0)}   "
+                f"Tags: {data.get('tag_count', 0)}",
+                title="Workspace Status",
+                border_style="cyan",
+            )
+        )
+
+
+def cmd_reindex(_args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
+    base_url, _ = ensure_daemon(repo_root)
+    with ITrackClient(base_url) as client:
+        data = client.request("POST", "/api/v1/reindex")
+    if json_mode:
+        emit_json(data)
+    else:
+        stdout_console.print(
+            f"[bold green]Reindexed workspace[/bold green] "
+            f"({data.get('indexed_issues', data.get('total_issues', 0))} issues)."
+        )
+
+
+def _parse_config_value(key: str, raw_val: str) -> Any:
+    s = raw_val.strip()
+    if s.startswith(("{", "[")):
+        try:
+            return json.loads(s)
+        except json.JSONDecodeError as exc:
+            raise CLIError(f"Invalid JSON value for config key '{key}': {exc}", "invalid_config_value", 1) from exc
+    if key in ("page_size", "preferences.page_size") or key.startswith("wip_limits."):
+        try:
+            return int(s)
+        except ValueError as exc:
+            raise CLIError(f"Expected integer for config key '{key}', got '{raw_val}'.", "invalid_config_value", 1) from exc
+    if s.lower() in ("true", "false") and key not in ("project_title", "project_prefix"):
+        return s.lower() == "true"
+    if s.lower() in ("null", "none") and key.startswith("wip_limits."):
+        return None
+    return raw_val
+
+
+def cmd_config(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
+    base_url, _ = ensure_daemon(repo_root)
+    with ITrackClient(base_url) as client:
+        if args.config_action == "show":
+            cfg = client.request("GET", "/api/v1/config")
+            if json_mode:
+                emit_json(cfg)
+            else:
+                stdout_console.print(Panel(json.dumps(cfg, indent=2), title="Workspace Configuration", border_style="cyan"))
+            return
+
+        if args.config_action == "set":
+            val = _parse_config_value(args.key, args.value)
+            cfg = client.request("PATCH", "/api/v1/config", json_body={"key": args.key, "value": val})
+            if json_mode:
+                emit_json(cfg)
+            else:
+                stdout_console.print(f"[bold green]Updated config[/bold green] `{args.key}`.")
+            return
+
+
+def cmd_server(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
+    act = args.server_action
+    if act == "status":
+        meta = read_daemon_json(repo_root)
+        probed = probe_daemon(repo_root)
+        if probed is not None:
+            base_url, health = probed
+            res = {"running": True, "base_url": base_url, "stale_recovered": False, **health}
+            if json_mode:
+                emit_json(res)
+            else:
+                stdout_console.print(
+                    f"[bold green]Server running[/bold green] at [cyan]{base_url}[/cyan] (PID {health.get('pid')})"
+                )
+            return
+        stale_cleaned = False
+        djson = get_daemon_json_path(repo_root)
+        if meta is not None and djson.exists():
+            try:
+                djson.unlink()
+                stale_cleaned = True
+            except OSError:
+                pass
+        res = {"running": False, "stale_recovered": stale_cleaned, "repo_root": str(repo_root)}
+        if json_mode:
+            emit_json(res)
+        else:
+            note = " (cleaned stale daemon.json)" if stale_cleaned else ""
+            stdout_console.print(f"[yellow]Server stopped[/yellow]{note}")
         return
 
-    if sub == "stop":
+    if act == "start":
+        base_url, health = ensure_daemon(repo_root, requested_port=args.port)
+        res = {"running": True, "base_url": base_url, **health}
+        if json_mode:
+            emit_json(res)
+        else:
+            stdout_console.print(f"[bold green]Server active[/bold green] at [cyan]{base_url}[/cyan] (PID {health.get('pid')})")
+        return
+
+    if act == "stop":
         res = stop_daemon(repo_root)
         if json_mode:
             emit_json(res)
-        elif res.get("stopped"):
-            stdout_console.print(f"[green]Stopped daemon[/green] (PID {res.get('pid')}).")
         else:
-            stdout_console.print("[dim]Daemon was not running.[/dim]")
+            stdout_console.print(f"[yellow]Server {res.get('status')}[/yellow].")
         return
 
-    if sub == "start":
-        req_port = int(getattr(args, "port", 0) or 0)
-        probed = probe_daemon(repo_root)
-        if probed is not None:
-            cur_port = int(probed[1].get("port") or 0)
-            if req_port == 0 or cur_port == req_port:
-                res = {"running": True, "already_running": True, **probed[1]}
-                if json_mode:
-                    emit_json(res)
-                else:
-                    stdout_console.print(f"[green]Daemon already running[/green] at {probed[0]} (PID {probed[1].get('pid')}).")
-                return
-            stop_daemon(repo_root)
-        base_url, health = spawn_daemon(repo_root, requested_port=req_port)
-        res = {"running": True, "already_running": False, **health}
-        if json_mode:
-            emit_json(res)
-        else:
-            stdout_console.print(f"[bold green]Started daemon[/bold green] at {base_url} (PID {health.get('pid')}).")
-        return
-
-    if sub == "restart":
-        req_port = int(getattr(args, "port", 0) or 0)
+    if act == "restart":
         stop_daemon(repo_root)
-        base_url, health = spawn_daemon(repo_root, requested_port=req_port)
-        res = {"running": True, "restarted": True, **health}
+        base_url, health = spawn_daemon(repo_root, requested_port=args.port)
+        res = {"running": True, "restarted": True, "base_url": base_url, **health}
         if json_mode:
             emit_json(res)
         else:
-            stdout_console.print(f"[bold green]Restarted daemon[/bold green] at {base_url} (PID {health.get('pid')}).")
+            stdout_console.print(
+                f"[bold green]Server restarted[/bold green] at [cyan]{base_url}[/cyan] (PID {health.get('pid')})"
+            )
         return
 
-    if sub == "logs":
-        n_lines = int(getattr(args, "lines", 50) or 50)
-        log_path = get_daemon_log_path(repo_root)
-        content = read_log_tail(repo_root, lines=n_lines)
-        if json_mode:
-            emit_json({
-                "log_path": str(log_path),
-                "lines": content.splitlines() if content else [],
-                "content": content,
-            })
-        else:
-            if content:
-                stdout_console.print(Panel(content, title=f"Daemon Logs ({log_path})", border_style="dim"))
+
+def cmd_ui(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
+    if args.port < 0 or args.port > 65535:
+        raise CLIError(f"Invalid port '{args.port}': must be 0..65535.", "invalid_port", 1)
+
+    if args.foreground:
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        stop_daemon(repo_root)
+        server_script = locate_server_script()
+        cmd = [
+            sys.executable,
+            str(server_script),
+            "--root",
+            str(repo_root),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(args.port),
+        ]
+        proc = subprocess.Popen(cmd, cwd=str(repo_root), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 12.0
+            probed = None
+            while time.monotonic() < deadline:
+                probed = probe_daemon(repo_root)
+                if probed is not None:
+                    break
+                if proc.poll() is not None:
+                    raise CLIError("Foreground server exited prematurely.", "daemon_spawn_failed", 1)
+                time.sleep(0.05)
+            if probed is None:
+                raise CLIError("Timed out starting foreground UI server.", "daemon_timeout", 3)
+            base_url, health = probed
+            opened = False
+            if not args.no_browser:
+                try:
+                    opened = bool(webbrowser.open(base_url))
+                except Exception:
+                    opened = False
+            if json_mode:
+                emit_json({"url": base_url, "base_url": base_url, "pid": health.get("pid"), "foreground": True, "browser_opened": opened})
             else:
-                stdout_console.print(f"[dim]No daemon logs at {log_path}.[/dim]")
+                stdout_console.print(f"itrack Web UI running in foreground at {base_url} (Ctrl+C to stop)")
+                sys.stdout.flush()
+            proc.wait()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            stop_daemon(repo_root)
+            if proc.poll() is None:
+                proc.terminate()
         return
 
+    base_url, health = ensure_daemon(repo_root, requested_port=args.port)
+    # Verify live HTTP readiness of SPA root & health
+    with httpx.Client(timeout=5.0, trust_env=False) as hc:
+        r = hc.get(f"{base_url}/")
+        if r.status_code >= 400:
+            raise CLIError(f"UI endpoint returned HTTP {r.status_code}", "ui_error", 1)
 
-def cmd_stats(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
+    opened = False
+    if not args.no_browser:
+        try:
+            opened = bool(webbrowser.open(base_url))
+        except Exception:
+            opened = False
+
+    payload = {
+        "url": base_url,
+        "base_url": base_url,
+        "port": health.get("port") or urllib.parse.urlparse(base_url).port,
+        "pid": health.get("pid"),
+        "browser_opened": opened,
+    }
+    if json_mode:
+        emit_json(payload)
+    else:
+        stdout_console.print(f"itrack Web UI ready at [bold cyan]{base_url}[/bold cyan]")
+
+
+def cmd_stats(_args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
     base_url, _ = ensure_daemon(repo_root)
     with ITrackClient(base_url) as client:
         data = client.request("GET", "/api/v1/stats")
@@ -1276,851 +1400,1065 @@ def cmd_stats(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> Non
         emit_json(data)
         return
 
+    by_state = data.get("by_state") or {}
+    by_cat = data.get("by_category") or {}
+    by_prio = data.get("by_priority") or {}
+    in_prog_count = data.get(
+        "in_progress_issues",
+        sum(int(by_state.get(s, 0)) for s in ("in-progress", "in-review", "in-qa")),
+    )
+    completed_count = data.get("completed_issues", data.get("done_issues", int(by_state.get("done", 0))))
+    open_count = data.get(
+        "open_issues",
+        sum(int(by_state.get(s, 0)) for s in ("triage", "backlog", "todo", "ready", "on-hold", "blocked")),
+    )
     summary = (
-        f"[bold]Total:[/bold] {data.get('total_issues', 0)}   "
-        f"[cyan]Open:[/cyan] {data.get('open_count', 0)}   "
-        f"[green]Done:[/green] {data.get('done_count', 0)}   "
-        f"[red]Blocked:[/red] {data.get('blocked_count', 0)}   "
-        f"[bold yellow]Ready:[/bold yellow] {data.get('ready_count', 0)}\n"
-        f"[bold]Story Points:[/bold] {data.get('completed_points', 0):g} / {data.get('total_points', 0):g} completed"
+        f"Total Issues: [bold]{data.get('total_issues', 0)}[/bold]   "
+        f"Open: [cyan]{open_count}[/cyan]   "
+        f"In Progress: [yellow]{in_prog_count}[/yellow]   "
+        f"Completed: [green]{completed_count}[/green]   "
+        f"Blocked: [red]{data.get('blocked_issues', 0)}[/red]   "
+        f"Overdue: [red]{data.get('overdue_issues', 0)}[/red]\n"
+        f"Story Points: {data.get('completed_points', 0)}/{data.get('total_points', 0)}   "
+        f"Time: {data.get('total_logged_minutes', 0)}m logged / {data.get('total_estimate_minutes', 0)}m est"
     )
-    stdout_console.print(Panel(summary, title="Workspace Statistics", border_style="cyan"))
+    stdout_console.print(Panel(summary, title="Analytics Dashboard", border_style="cyan"))
 
-    t = Table(box=box.SIMPLE_HEAD)
-    t.add_column("By Status")
-    t.add_column("By Priority")
-    t.add_column("By Type")
-    t.add_column("By Assignee")
-    fmt_map = lambda d: "\n".join(f"{k}: [bold]{v}[/bold]" for k, v in (d or {}).items()) or "-"
-    t.add_row(
-        fmt_map(data.get("by_status")),
-        fmt_map(data.get("by_priority")),
-        fmt_map(data.get("by_type")),
-        fmt_map(data.get("by_assignee")),
-    )
-    stdout_console.print(t)
+    if by_state:
+        st_table = Table(title="Issues by State", box=box.SIMPLE)
+        st_table.add_column("State")
+        st_table.add_column("Count", justify="right")
+        for k, v in by_state.items():
+            st_table.add_row(fmt_state(k), str(v))
+        stdout_console.print(st_table)
+
+    if by_cat or by_prio:
+        cp_table = Table(title="Category & Priority Breakdown", box=box.SIMPLE)
+        cp_table.add_column("Dimension")
+        cp_table.add_column("Value")
+        cp_table.add_column("Count", justify="right")
+        for k, v in by_cat.items():
+            cp_table.add_row("category", str(k), str(v))
+        for k, v in by_prio.items():
+            cp_table.add_row("priority", fmt_priority(k), str(v))
+        stdout_console.print(cp_table)
 
 
-def cmd_reindex(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
+def _populate_rich_tree(parent_node: Tree, nodes: list[dict[str, Any]]) -> None:
+    for n in nodes:
+        blk = " [bold red]\\[BLOCKED][/bold red]" if n.get("is_blocked") else ""
+        label = (
+            f"[bold cyan]{n.get('key')}[/bold cyan] {fmt_state(n.get('state'))} "
+            f"[magenta]({n.get('category', 'task')})[/magenta] — {n.get('name')}{blk}"
+        )
+        branch = parent_node.add(label)
+        children = n.get("children") or n.get("subtasks") or []
+        if children:
+            _populate_rich_tree(branch, children)
+
+
+def cmd_tree(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
     base_url, _ = ensure_daemon(repo_root)
+    params = {"root": normalize_ref_str(args.issue)} if args.issue else None
     with ITrackClient(base_url) as client:
-        data = client.request("POST", "/api/v1/reindex")
+        data = client.request("GET", "/api/v1/tree", params=params)
     if json_mode:
         emit_json(data)
         return
-    stdout_console.print(
-        f"[bold green]Reindexed[/bold green] {data.get('indexed_issues', 0)} issues in {data.get('duration_ms', 0):.1f} ms."
-    )
 
-
-def cmd_config(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
-    base_url, _ = ensure_daemon(repo_root)
-    with ITrackClient(base_url) as client:
-        if args.config_action == "show":
-            data = client.request("GET", "/api/v1/config")
-        else:
-            body: dict[str, Any] = {}
-            if args.key:
-                body["project_key"] = args.key.strip().upper()
-            if args.name:
-                body["project_name"] = args.name.strip()
-            if args.default_type:
-                body["default_type"] = args.default_type.strip().lower()
-            if args.default_priority:
-                body["default_priority"] = args.default_priority.strip().lower()
-            if args.wip_limits:
-                try:
-                    body["wip_limits"] = json.loads(args.wip_limits)
-                except json.JSONDecodeError as exc:
-                    raise CLIError(f"Invalid JSON for --wip-limits: {exc}", "invalid_json", 400) from exc
-            data = client.request("PATCH", "/api/v1/config", json_body=body)
-
-    if json_mode:
-        emit_json(data)
-        return
-    t = Table(title="Project Configuration", box=box.ROUNDED)
-    t.add_column("Field", style="bold cyan")
-    t.add_column("Value")
-    for k in ("project_key", "project_name", "default_type", "default_priority", "statuses", "priorities", "issue_types", "wip_limits", "next_seq"):
-        if k in data:
-            val = data[k]
-            t.add_row(k, json.dumps(val) if isinstance(val, (list, dict)) else str(val))
-    stdout_console.print(t)
-
-
-def cmd_workflow(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
-    base_url, _ = ensure_daemon(repo_root)
-    with ITrackClient(base_url) as client:
-        if args.workflow_action == "show":
-            data = client.request("GET", "/api/v1/workflows")
-        else:
-            raw = args.file
-            p = Path(raw).expanduser()
-            text_payload = p.read_text(encoding="utf-8") if p.exists() and p.is_file() else raw
-            try:
-                wf_body = json.loads(text_payload)
-            except json.JSONDecodeError as exc:
-                raise CLIError(f"Invalid workflow JSON: {exc}", "invalid_json", 400) from exc
-            data = client.request("PUT", "/api/v1/workflows", json_body=wf_body)
-
-    if json_mode:
-        emit_json(data)
-        return
-    t = Table(title="Workflow State Machine", box=box.ROUNDED)
-    t.add_column("From Status", style="bold cyan")
-    t.add_column("Allowed Transitions")
-    transitions = data.get("transitions") or {}
-    for st in data.get("statuses") or list(transitions.keys()):
-        targets = ", ".join(transitions.get(st, [])) or "[dim]none[/dim]"
-        t.add_row(fmt_status(st), targets)
-    stdout_console.print(t)
-
-
-def cmd_export(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
-    base_url, _ = ensure_daemon(repo_root)
-    with ITrackClient(base_url) as client:
-        bundle = client.request("GET", "/api/v1/export")
-    if args.output:
-        out_path = Path(args.output).expanduser().resolve()
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(bundle, indent=2) + "\n", encoding="utf-8")
-        if json_mode:
-            emit_json({"status": "exported", "output_path": str(out_path), "issue_count": len(bundle.get("issues") or [])})
-        else:
-            stdout_console.print(f"[bold green]Exported workspace[/bold green] to `{out_path}`.")
-        return
-    emit_json(bundle)
-
-
-def cmd_import(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
-    in_path = Path(args.file).expanduser().resolve()
-    if not in_path.exists():
-        raise CLIError(f"Import file not found: '{in_path}'", "file_not_found", 400)
-    try:
-        bundle = json.loads(in_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise CLIError(f"Invalid JSON in '{in_path}': {exc}", "invalid_json", 400) from exc
-
-    # Support importing either `{bundle: ...}` or a direct export bundle
-    payload_bundle = bundle["bundle"] if isinstance(bundle, dict) and "bundle" in bundle and isinstance(bundle["bundle"], dict) else bundle
-    base_url, _ = ensure_daemon(repo_root)
-    with ITrackClient(base_url) as client:
-        res = client.request("POST", "/api/v1/import", json_body={"mode": args.mode, "bundle": payload_bundle})
-    if json_mode:
-        emit_json(res)
-        return
-    stdout_console.print(
-        f"[bold green]Imported workspace[/bold green] (mode={args.mode}): "
-        f"{res.get('imported_issues', 0)} issues, {res.get('imported_sprints', 0)} sprints, {res.get('imported_milestones', 0)} milestones."
-    )
+    if isinstance(data, dict):
+        roots = data.get("trees") or data.get("roots") or data.get("tree") or []
+        if not roots and data.get("key"):
+            roots = [data]
+    elif isinstance(data, list):
+        roots = data
+    else:
+        roots = []
+    rich_tree = Tree("[bold cyan]Issue Hierarchy & Dependency Tree[/bold cyan]")
+    _populate_rich_tree(rich_tree, roots)
+    stdout_console.print(rich_tree)
 
 
 def cmd_search(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
     base_url, _ = ensure_daemon(repo_root)
-    params: dict[str, Any] = {"limit": args.limit, "offset": args.offset}
-    if args.is_iql:
-        params["iql"] = args.query_str
+    params: dict[str, Any] = {
+        "page": args.page,
+        "page_size": args.page_size,
+        "sort": args.sort,
+        "order": args.order.lower() if args.order else None,
+    }
+    if args.iql:
+        params["iql"] = args.query
     else:
-        params["q"] = args.query_str
+        params["q"] = args.query
     with ITrackClient(base_url) as client:
         data = client.request("GET", "/api/v1/search", params=params)
     if json_mode:
         emit_json(data)
-        return
-    render_issue_table(
-        data.get("issues") or [],
-        title=f"Search Results: {args.query_str}",
-        total=data.get("total"),
-        snippets=data.get("snippets"),
-    )
-
-
-def cmd_iql(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
-    base_url, _ = ensure_daemon(repo_root)
-    with ITrackClient(base_url) as client:
-        if args.validate:
-            data = client.request("POST", "/api/v1/iql/validate", json_body={"iql": args.expr})
-            if json_mode:
-                emit_json(data)
-                if not data.get("valid"):
-                    sys.exit(1)
-                return
-            if data.get("valid"):
-                stdout_console.print(f"[bold green]Valid iQL:[/bold green] `{args.expr}`")
-            else:
-                raise CLIError(f"Invalid iQL: {data.get('error')} (pos {data.get('position')})", "invalid_iql", 400)
-            return
-
-        body: dict[str, Any] = {
-            "iql": args.expr,
-            "limit": args.limit,
-            "offset": args.offset,
-            "current_user": default_actor(repo_root),
-        }
-        data = client.request("POST", "/api/v1/iql/query", json_body=body)
-    if json_mode:
-        emit_json(data)
-        return
-    render_issue_table(data.get("issues") or [], title=f"iQL: {args.expr}", total=data.get("total"))
+    else:
+        render_issues_table(data, title=f"Search Results: {args.query}")
 
 
 def cmd_board(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
+    swimlane = args.swimlane.lower() if args.swimlane else "none"
+    if swimlane not in SWIMLANES:
+        raise CLIError(f"Invalid swimlane '{args.swimlane}'. Expected one of: {', '.join(SWIMLANES)}", "invalid_swimlane", 1)
     base_url, _ = ensure_daemon(repo_root)
     params = {
-        "sprint_id": norm_opt_key(args.sprint),
-        "epic_id": norm_opt_key(args.epic),
+        "swimlane": swimlane,
+        "category": normalize_hyphen_enum(args.category) if args.category else None,
+        "priority": normalize_hyphen_enum(args.priority) if args.priority else None,
         "assignee": args.assignee,
-        "iql": args.iql,
+        "sprint": args.sprint,
+        "tag": args.tag,
+        "q": args.query,
     }
     with ITrackClient(base_url) as client:
         data = client.request("GET", "/api/v1/board", params=params)
     if json_mode:
         emit_json(data)
         return
-    render_board(data)
+
+    lanes = data.get("swimlanes") or data.get("lanes") or []
+    wip_limits = data.get("wip_limits") or {}
+    if not lanes and "columns" in data:
+        lanes = [{"name": "All Issues", "columns": data["columns"]}]
+
+    for lane in lanes:
+        lane_title = lane.get("name") or lane.get("key") or "Board"
+        cols = lane.get("columns") or {}
+        t = Table(title=f"Kanban Board — Swimlane: {lane_title} ({swimlane})", box=box.ROUNDED)
+        col_items_list: list[tuple[str, list[dict[str, Any]]]] = []
+        if isinstance(cols, list):
+            for c in cols:
+                st = str(c.get("state", ""))
+                col_items_list.append((st, c.get("issues") or []))
+        elif isinstance(cols, dict):
+            for st, items in cols.items():
+                col_items_list.append((str(st), items if isinstance(items, list) else (items.get("issues") or [])))
+
+        for st, items in col_items_list:
+            lim = wip_limits.get(st)
+            wip_badge = f" [WIP {len(items)}/{lim}]" if lim else f" ({len(items)})"
+            if lim and len(items) > int(lim):
+                wip_badge = f" [bold red][WIP {len(items)}/{lim}!][/bold red]"
+            t.add_column(f"{st}{wip_badge}")
+
+        max_rows = max((len(items) for _, items in col_items_list), default=0)
+        for idx in range(max_rows):
+            row: list[str] = []
+            for _, items in col_items_list:
+                if idx < len(items):
+                    card = items[idx]
+                    row.append(f"[bold cyan]{card.get('key')}[/bold cyan] {card.get('name')}\n{fmt_priority(card.get('priority'))} {card.get('assignee') or ''}".strip())
+                else:
+                    row.append("")
+            t.add_row(*row)
+        stdout_console.print(t)
 
 
-def cmd_graph(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
+def cmd_history(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
     base_url, _ = ensure_daemon(repo_root)
+    ref = encode_ref(args.issue)
     with ITrackClient(base_url) as client:
-        data = client.request("GET", "/api/v1/graph/dependencies")
+        data = client.request("GET", f"/api/v1/issues/{ref}/history")
     if json_mode:
         emit_json(data)
         return
-    render_graph(data)
+
+    entries = data.get("history") if isinstance(data, dict) else data
+    entries = entries or []
+    t = Table(title=f"History for {args.issue} ({len(entries)} events)", box=box.ROUNDED)
+    t.add_column("ID", style="cyan")
+    t.add_column("Timestamp", style="dim")
+    t.add_column("Actor", style="green")
+    t.add_column("Action", style="yellow")
+    t.add_column("Diffs")
+    for h in entries:
+        diffs = h.get("diffs") or []
+        diff_str = "; ".join(f"{d.get('field')}: {d.get('old')} -> {d.get('new')}" for d in diffs) or "-"
+        t.add_row(
+            str(h.get("id", "")),
+            str(h.get("timestamp", "")),
+            str(h.get("actor", "")),
+            str(h.get("action", "")),
+            diff_str,
+        )
+    stdout_console.print(t)
+
+
+# ---------------------------------------------------------------------------
+# Issue, Comment, Attachment, Link, Agile, View, Worklog & Bulk Handlers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_text_source(
+    inline_text: str | None,
+    file_path: str | None,
+    use_stdin: bool,
+    label: str = "text",
+) -> str | None:
+    sources = sum([inline_text is not None, file_path is not None, bool(use_stdin)])
+    if sources > 1:
+        raise CLIError(f"Specify at most one {label} input flag.", "conflicting_input_flags", 1)
+    if inline_text is not None:
+        return inline_text
+    if file_path is not None:
+        p = Path(file_path).expanduser()
+        if not p.exists() or not p.is_file():
+            raise CLIError(f"{label.capitalize()} file not found: '{file_path}'", "file_not_found", 1)
+        return p.read_text(encoding="utf-8")
+    if use_stdin:
+        return sys.stdin.read()
+    return None
+
+
+def _parse_kv_fields(items: list[str] | None) -> dict[str, str]:
+    if not items:
+        return {}
+    out: dict[str, str] = {}
+    for raw in items:
+        if "=" not in raw:
+            raise CLIError(f"Invalid --field '{raw}': expected KEY=VAL format.", "invalid_field", 1)
+        k, v = raw.split("=", 1)
+        k = k.strip()
+        if not k:
+            raise CLIError(f"Invalid --field '{raw}': key cannot be empty.", "invalid_field", 1)
+        out[k] = v
+    return out
+
+
+def _find_ac_index(acs: list[dict[str, Any]], token: str) -> int:
+    s = token.strip()
+    for idx, item in enumerate(acs):
+        if str(item.get("id", "")).upper() == s.upper():
+            return idx
+    if re.fullmatch(r"\d+", s):
+        pos = int(s) - 1
+        if 0 <= pos < len(acs):
+            return pos
+        raise CLIError(f"Acceptance criterion index '{token}' out of range (1..{len(acs)}).", "invalid_ac_index", 1)
+    raise CLIError(f"Acceptance criterion '{token}' not found.", "ac_not_found", 4)
+
+
+def _next_ac_id(acs: list[dict[str, Any]]) -> str:
+    max_num = 0
+    for item in acs:
+        m = re.fullmatch(r"AC-(\d+)", str(item.get("id", "")), re.IGNORECASE)
+        if m:
+            max_num = max(max_num, int(m.group(1)))
+    return f"AC-{max_num + 1}"
 
 
 def cmd_issue(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
     act = args.issue_action
+    actor = default_actor(repo_root)
     base_url, _ = ensure_daemon(repo_root)
-    actor = getattr(args, "actor", None) or default_actor(repo_root)
 
     with ITrackClient(base_url) as client:
         if act == "create":
-            body: dict[str, Any] = {"title": args.title, "actor": actor}
-            if args.description is not None:
-                body["description"] = args.description
-            if args.type:
-                body["type"] = args.type.lower()
-            if args.status:
-                body["status"] = args.status.lower()
-            if args.priority:
-                body["priority"] = args.priority.lower()
-            if args.assignee:
-                body["assignee"] = None if args.assignee.lower() in ("none", "unassigned") else args.assignee
-            body["reporter"] = args.reporter or actor
-            if args.labels is not None:
-                body["labels"] = split_csv(args.labels) or []
-            if args.components is not None:
-                body["components"] = split_csv(args.components) or []
-            if args.epic:
-                body["epic_id"] = norm_opt_key(args.epic)
-            if args.parent:
-                body["parent_id"] = norm_opt_key(args.parent)
-            if args.sprint:
-                body["sprint_id"] = norm_opt_key(args.sprint)
-            if args.milestone:
-                body["milestone_id"] = norm_opt_key(args.milestone)
+            desc = _resolve_text_source(args.desc, args.desc_file, args.desc_stdin, label="description")
+            embed_paths = validate_upload_paths(args.embed, label="Embed image")
+            attach_paths = validate_upload_paths(args.attach, label="Attachment")
+            cfields = _parse_kv_fields(args.field)
+            tags = flatten_csv_tokens(args.tag)
+            comps = flatten_csv_tokens(args.component)
+
+            body: dict[str, Any] = {"name": args.name, "actor": actor}
+            if args.category is not None:
+                body["category"] = normalize_hyphen_enum(args.category)
+            if args.state is not None:
+                body["state"] = normalize_hyphen_enum(args.state)
+            if args.priority is not None:
+                body["priority"] = normalize_hyphen_enum(args.priority)
+            if args.severity is not None:
+                body["severity"] = normalize_hyphen_enum(args.severity)
+            if args.resolution is not None:
+                body["resolution"] = normalize_hyphen_enum(args.resolution)
+            if desc is not None:
+                body["description"] = desc
+            if args.ac:
+                body["acceptance_criteria"] = [
+                    {"id": f"AC-{idx}", "text": txt, "checked": False}
+                    for idx, txt in enumerate(args.ac, 1)
+                ]
+            if args.assignee is not None:
+                body["assignee"] = args.assignee
+            if args.reporter is not None:
+                body["reporter"] = args.reporter
+            if tags:
+                body["tags"] = tags
+            if comps:
+                body["components"] = comps
+            if args.parent is not None:
+                body["parent"] = normalize_ref_str(args.parent)
+            if args.sprint is not None:
+                body["sprint"] = normalize_ref_str(args.sprint)
+            if args.milestone is not None:
+                body["milestone"] = normalize_ref_str(args.milestone)
             if args.points is not None:
                 body["story_points"] = args.points
-            if args.due:
+            if args.estimate is not None:
+                body["estimate_minutes"] = args.estimate
+            if args.due is not None:
                 body["due_date"] = args.due
-            if getattr(args, "environment", None):
-                body["environment"] = args.environment
+            if cfields:
+                body["custom_fields"] = cfields
 
             issue = client.request("POST", "/api/v1/issues", json_body=body)
+            ref = encode_ref(issue.get("key") or args.name)
+
+            if embed_paths:
+                mp_files, handles = open_multipart_files([("files", embed_paths)])
+                try:
+                    client.request(
+                        "POST",
+                        f"/api/v1/issues/{ref}/embeds",
+                        files=[("uploaded_by", (None, actor))] + mp_files,
+                    )
+                finally:
+                    for fh in handles:
+                        fh.close()
+
+            if attach_paths:
+                mp_files, handles = open_multipart_files([("files", attach_paths)])
+                try:
+                    client.request(
+                        "POST",
+                        f"/api/v1/issues/{ref}/attachments",
+                        files=[("uploaded_by", (None, actor))] + mp_files,
+                    )
+                finally:
+                    for fh in handles:
+                        fh.close()
+
+            if embed_paths or attach_paths:
+                issue = client.request("GET", f"/api/v1/issues/{ref}")
+
             if json_mode:
                 emit_json(issue)
             else:
                 stdout_console.print(
                     f"[bold green]Created[/bold green] [bold cyan]{issue.get('key')}[/bold cyan]: "
-                    f"{issue.get('title')} ({fmt_type(issue.get('type'))}, {fmt_priority(issue.get('priority'))})"
+                    f"[bold]{issue.get('name')}[/bold] ({issue.get('state')})"
                 )
             return
 
-        if act == "list":
-            params = {
-                "iql": args.iql,
-                "q": args.query,
-                "status": args.status.lower() if args.status else None,
-                "priority": args.priority.lower() if args.priority else None,
-                "type": args.type.lower() if args.type else None,
-                "assignee": args.assignee,
-                "label": args.label,
-                "component": args.component,
-                "epic_id": norm_opt_key(args.epic) if args.epic else None,
-                "parent_id": norm_opt_key(args.parent) if args.parent else None,
-                "sprint_id": norm_opt_key(args.sprint) if args.sprint else None,
-                "milestone_id": norm_opt_key(args.milestone) if args.milestone else None,
-                "sort": getattr(args, "sort", None),
-                "limit": args.limit,
-                "offset": args.offset,
-            }
-            data = client.request("GET", "/api/v1/issues", params=params)
-            if json_mode:
-                emit_json(data)
-            else:
-                render_issue_table(data.get("issues") or [], title="Issues", total=data.get("total"))
-            return
-
-        if act == "ready":
-            params = {
-                "assignee": args.assignee,
-                "sprint_id": norm_opt_key(args.sprint) if args.sprint else None,
-                "limit": args.limit,
-            }
-            data = client.request("GET", "/api/v1/issues/ready", params=params)
-            if json_mode:
-                emit_json(data)
-            else:
-                render_issue_table(data.get("issues") or [], title="Ready Issues (Unblocked)", total=data.get("total"))
-            return
-
         if act == "show":
-            key = norm_key(args.key)
-            issue = client.request("GET", f"/api/v1/issues/{urllib.parse.quote(key, safe='')}")
+            issue = client.request("GET", f"/api/v1/issues/{encode_ref(args.issue)}")
             if json_mode:
                 emit_json(issue)
             else:
                 render_issue_detail(issue)
             return
 
-        if act == "update":
-            key = norm_key(args.key)
-            ukey = urllib.parse.quote(key, safe="")
-            body = {"actor": actor}
-            if args.title is not None:
-                body["title"] = args.title
-            if args.description is not None:
-                body["description"] = args.description
-            if args.type is not None:
-                body["type"] = args.type.lower()
-            if args.status is not None:
-                body["status"] = args.status.lower()
-            if args.priority is not None:
-                body["priority"] = args.priority.lower()
-            if args.assignee is not None:
-                body["assignee"] = None if args.assignee.lower() in ("none", "null", "unassigned") else args.assignee
-            if args.components is not None:
-                body["components"] = split_csv(args.components) or []
-            if args.epic is not None:
-                body["epic_id"] = norm_opt_key(args.epic)
-            if args.parent is not None:
-                body["parent_id"] = norm_opt_key(args.parent)
-            if args.sprint is not None:
-                body["sprint_id"] = norm_opt_key(args.sprint)
-            if args.milestone is not None:
-                body["milestone_id"] = norm_opt_key(args.milestone)
-            if args.points is not None:
-                body["story_points"] = args.points
-            if args.due is not None:
-                body["due_date"] = None if args.due.lower() in ("none", "null") else args.due
-            if args.resolution is not None:
-                body["resolution"] = None if args.resolution.lower() in ("none", "null") else args.resolution
-
-            if args.labels is not None:
-                body["labels"] = split_csv(args.labels) or []
-            else:
-                if args.add_label:
-                    add_list: list[str] = []
-                    for lb in args.add_label:
-                        for item in split_csv(lb) or []:
-                            if item not in add_list:
-                                add_list.append(item)
-                    if add_list:
-                        body["add_labels"] = add_list
-                if args.remove_label:
-                    rem_list: list[str] = []
-                    for lb in args.remove_label:
-                        for item in split_csv(lb) or []:
-                            if item not in rem_list:
-                                rem_list.append(item)
-                    if rem_list:
-                        body["remove_labels"] = rem_list
-
-            issue = client.request("PATCH", f"/api/v1/issues/{ukey}", json_body=body)
-            if json_mode:
-                emit_json(issue)
-            else:
-                stdout_console.print(f"[bold green]Updated[/bold green] [bold cyan]{issue.get('key')}[/bold cyan]: {issue.get('title')}")
-            return
-
-        if act == "delete":
-            key = norm_key(args.key)
-            res = client.request("DELETE", f"/api/v1/issues/{urllib.parse.quote(key, safe='')}")
-            if json_mode:
-                emit_json(res)
-            else:
-                stdout_console.print(f"[bold yellow]Deleted[/bold yellow] issue [bold cyan]{key}[/bold cyan].")
-            return
-
-        if act == "transition":
-            key = norm_key(args.key)
-            body = {
-                "status": args.status.lower(),
-                "resolution": getattr(args, "resolution", None),
-                "comment": getattr(args, "comment", None),
-                "force": bool(getattr(args, "force", False)),
-                "actor": actor,
+        if act == "list":
+            params: dict[str, Any] = {
+                "tab": normalize_hyphen_enum(args.tab) if args.tab else None,
+                "iql": args.query,
+                "category": normalize_hyphen_enum(args.category) if args.category else None,
+                "state": normalize_hyphen_enum(args.state) if args.state else None,
+                "priority": normalize_hyphen_enum(args.priority) if args.priority else None,
+                "severity": normalize_hyphen_enum(args.severity) if args.severity else None,
+                "resolution": normalize_hyphen_enum(args.resolution) if args.resolution else None,
+                "assignee": args.assignee,
+                "reporter": args.reporter,
+                "tag": args.tag,
+                "component": args.component,
+                "parent": normalize_ref_str(args.parent) if args.parent else None,
+                "sprint": normalize_ref_str(args.sprint) if args.sprint else None,
+                "milestone": normalize_ref_str(args.milestone) if args.milestone else None,
+                "overdue": True if args.overdue else None,
+                "sort": args.sort,
+                "order": args.order.lower() if args.order else None,
+                "page": args.page,
+                "page_size": args.page_size,
             }
-            issue = client.request("POST", f"/api/v1/issues/{urllib.parse.quote(key, safe='')}/transition", json_body=body)
+            data = client.request("GET", "/api/v1/issues", params=params)
+            if json_mode:
+                emit_json(data)
+            else:
+                render_issues_table(data, title="Issues")
+            return
+
+        if act == "edit":
+            if args.resolution is not None and args.clear_resolution:
+                raise CLIError("Cannot specify both --resolution and --clear-resolution.", "conflicting_flags", 1)
+            desc = _resolve_text_source(args.desc, args.desc_file, args.desc_stdin, label="description")
+            if desc is not None and args.clear_desc:
+                raise CLIError("Cannot specify both description text and --clear-desc.", "conflicting_flags", 1)
+            if args.assignee is not None and args.clear_assignee:
+                raise CLIError("Cannot specify both --assignee and --clear-assignee.", "conflicting_flags", 1)
+            if args.reporter is not None and args.clear_reporter:
+                raise CLIError("Cannot specify both --reporter and --clear-reporter.", "conflicting_flags", 1)
+            if args.parent is not None and args.clear_parent:
+                raise CLIError("Cannot specify both --parent and --clear-parent.", "conflicting_flags", 1)
+            if args.sprint is not None and args.clear_sprint:
+                raise CLIError("Cannot specify both --sprint and --clear-sprint.", "conflicting_flags", 1)
+            if args.milestone is not None and args.clear_milestone:
+                raise CLIError("Cannot specify both --milestone and --clear-milestone.", "conflicting_flags", 1)
+            if args.points is not None and args.clear_points:
+                raise CLIError("Cannot specify both --points and --clear-points.", "conflicting_flags", 1)
+            if args.estimate is not None and args.clear_estimate:
+                raise CLIError("Cannot specify both --estimate and --clear-estimate.", "conflicting_flags", 1)
+            if args.due is not None and args.clear_due:
+                raise CLIError("Cannot specify both --due and --clear-due.", "conflicting_flags", 1)
+
+            embed_paths = validate_upload_paths(args.embed, label="Embed image")
+            field_updates = _parse_kv_fields(args.field)
+
+            cur_ref_raw = args.issue
+            ref = encode_ref(cur_ref_raw)
+            cur_issue: dict[str, Any] | None = None
+
+            if args.name is not None:
+                cur_issue = client.request(
+                    "POST",
+                    f"/api/v1/issues/{ref}/rename",
+                    json_body={"new_name": args.name, "actor": actor},
+                )
+                cur_ref_raw = cur_issue.get("key") or args.name
+                ref = encode_ref(cur_ref_raw)
+
+            needs_current = any([
+                args.add_ac, args.edit_ac, args.check_ac, args.uncheck_ac, args.remove_ac,
+                args.add_tag, args.remove_tag,
+                args.add_component, args.remove_component,
+                field_updates, args.unset_field,
+            ])
+            if needs_current and cur_issue is None:
+                cur_issue = client.request("GET", f"/api/v1/issues/{ref}")
+
+            patch: dict[str, Any] = {}
+            if args.category is not None:
+                patch["category"] = normalize_hyphen_enum(args.category)
+            if args.state is not None:
+                patch["state"] = normalize_hyphen_enum(args.state)
+            if args.priority is not None:
+                patch["priority"] = normalize_hyphen_enum(args.priority)
+            if args.severity is not None:
+                patch["severity"] = normalize_hyphen_enum(args.severity)
+            if args.clear_resolution:
+                patch["resolution"] = None
+            elif args.resolution is not None:
+                patch["resolution"] = normalize_hyphen_enum(args.resolution)
+
+            if args.clear_desc:
+                patch["description"] = ""
+            elif desc is not None:
+                patch["description"] = desc
+
+            if args.clear_assignee:
+                patch["assignee"] = None
+            elif args.assignee is not None:
+                patch["assignee"] = args.assignee
+
+            if args.clear_reporter:
+                patch["reporter"] = None
+            elif args.reporter is not None:
+                patch["reporter"] = args.reporter
+
+            if args.clear_parent:
+                patch["parent"] = None
+            elif args.parent is not None:
+                patch["parent"] = normalize_ref_str(args.parent)
+
+            if args.clear_sprint:
+                patch["sprint"] = None
+            elif args.sprint is not None:
+                patch["sprint"] = normalize_ref_str(args.sprint)
+
+            if args.clear_milestone:
+                patch["milestone"] = None
+            elif args.milestone is not None:
+                patch["milestone"] = normalize_ref_str(args.milestone)
+
+            if args.clear_points:
+                patch["story_points"] = None
+            elif args.points is not None:
+                patch["story_points"] = args.points
+
+            if args.clear_estimate:
+                patch["estimate_minutes"] = None
+            elif args.estimate is not None:
+                patch["estimate_minutes"] = args.estimate
+
+            if args.clear_due:
+                patch["due_date"] = None
+            elif args.due is not None:
+                patch["due_date"] = args.due
+
+            # Acceptance criteria mutations
+            if args.clear_ac:
+                acs: list[dict[str, Any]] = []
+                if args.add_ac:
+                    for txt in args.add_ac:
+                        acs.append({"id": _next_ac_id(acs), "text": txt, "checked": False})
+                patch["acceptance_criteria"] = acs
+            elif any([args.add_ac, args.edit_ac, args.check_ac, args.uncheck_ac, args.remove_ac]):
+                assert cur_issue is not None
+                acs = [dict(x) for x in (cur_issue.get("acceptance_criteria") or [])]
+                if args.edit_ac:
+                    for target_tok, new_txt in args.edit_ac:
+                        idx = _find_ac_index(acs, target_tok)
+                        acs[idx]["text"] = new_txt
+                if args.check_ac:
+                    for target_tok in args.check_ac:
+                        idx = _find_ac_index(acs, target_tok)
+                        acs[idx]["checked"] = True
+                if args.uncheck_ac:
+                    for target_tok in args.uncheck_ac:
+                        idx = _find_ac_index(acs, target_tok)
+                        acs[idx]["checked"] = False
+                if args.remove_ac:
+                    indices_to_remove = sorted({_find_ac_index(acs, tok) for tok in args.remove_ac}, reverse=True)
+                    for idx in indices_to_remove:
+                        acs.pop(idx)
+                if args.add_ac:
+                    for txt in args.add_ac:
+                        acs.append({"id": _next_ac_id(acs), "text": txt, "checked": False})
+                patch["acceptance_criteria"] = acs
+
+            # Tags mutations
+            if args.clear_tags:
+                tags_list: list[str] = flatten_csv_tokens(args.add_tag)
+                patch["tags"] = tags_list
+            elif args.add_tag or args.remove_tag:
+                assert cur_issue is not None
+                tags_list = list(cur_issue.get("tags") or [])
+                for t in flatten_csv_tokens(args.add_tag):
+                    if t not in tags_list:
+                        tags_list.append(t)
+                rem_tags = set(flatten_csv_tokens(args.remove_tag))
+                tags_list = [t for t in tags_list if t not in rem_tags]
+                patch["tags"] = tags_list
+
+            # Components mutations
+            if args.clear_components:
+                comps_list: list[str] = flatten_csv_tokens(args.add_component)
+                patch["components"] = comps_list
+            elif args.add_component or args.remove_component:
+                assert cur_issue is not None
+                comps_list = list(cur_issue.get("components") or [])
+                for c in flatten_csv_tokens(args.add_component):
+                    if c not in comps_list:
+                        comps_list.append(c)
+                rem_comps = set(flatten_csv_tokens(args.remove_component))
+                comps_list = [c for c in comps_list if c not in rem_comps]
+                patch["components"] = comps_list
+
+            # Custom fields mutations
+            if args.clear_fields:
+                cf_dict: dict[str, Any] = dict(field_updates)
+                patch["custom_fields"] = cf_dict
+                patch["replace_custom_fields"] = True
+            elif field_updates or args.unset_field:
+                assert cur_issue is not None
+                cf_dict = dict(cur_issue.get("custom_fields") or {})
+                if args.unset_field:
+                    for k in flatten_csv_tokens(args.unset_field):
+                        cf_dict.pop(k, None)
+                cf_dict.update(field_updates)
+                patch["custom_fields"] = cf_dict
+                patch["replace_custom_fields"] = True
+
+            if patch:
+                patch["actor"] = actor
+                cur_issue = client.request("PATCH", f"/api/v1/issues/{ref}", json_body=patch)
+
+            if args.remove_embed:
+                for att_id in flatten_csv_tokens(args.remove_embed):
+                    cur_issue = client.request(
+                        "DELETE",
+                        f"/api/v1/issues/{ref}/embeds/{encode_ref(att_id)}",
+                    )
+
+            if embed_paths:
+                mp_files, handles = open_multipart_files([("files", embed_paths)])
+                try:
+                    cur_issue = client.request(
+                        "POST",
+                        f"/api/v1/issues/{ref}/embeds",
+                        files=[("uploaded_by", (None, actor))] + mp_files,
+                    )
+                finally:
+                    for fh in handles:
+                        fh.close()
+
+            if cur_issue is None or "key" not in cur_issue:
+                cur_issue = client.request("GET", f"/api/v1/issues/{ref}")
+
+            if json_mode:
+                emit_json(cur_issue)
+            else:
+                stdout_console.print(
+                    f"[bold green]Updated[/bold green] [bold cyan]{cur_issue.get('key')}[/bold cyan]: "
+                    f"[bold]{cur_issue.get('name')}[/bold]"
+                )
+            return
+
+        if act == "state":
+            body = {"state": normalize_hyphen_enum(args.state), "actor": actor}
+            if args.resolution is not None:
+                body["resolution"] = normalize_hyphen_enum(args.resolution)
+            issue = client.request("PATCH", f"/api/v1/issues/{encode_ref(args.issue)}", json_body=body)
             if json_mode:
                 emit_json(issue)
             else:
                 stdout_console.print(
-                    f"[bold green]Transitioned[/bold green] [bold cyan]{issue.get('key')}[/bold cyan] -> {fmt_status(issue.get('status'))}"
+                    f"[bold green]State updated[/bold green] [cyan]{issue.get('key')}[/cyan] -> {fmt_state(issue.get('state'))}"
                 )
             return
 
-        if act == "assign":
-            key = norm_key(args.key)
-            raw_u = args.username.strip()
-            assignee = None if raw_u.lower() in ("none", "null", "unassigned", "-") else raw_u
+        if act == "rename":
             issue = client.request(
                 "POST",
-                f"/api/v1/issues/{urllib.parse.quote(key, safe='')}/assign",
-                json_body={"assignee": assignee, "actor": actor},
+                f"/api/v1/issues/{encode_ref(args.issue)}/rename",
+                json_body={"new_name": args.new_name, "actor": actor},
             )
             if json_mode:
                 emit_json(issue)
             else:
                 stdout_console.print(
-                    f"[bold green]Assigned[/bold green] [bold cyan]{issue.get('key')}[/bold cyan] -> [green]{issue.get('assignee') or 'unassigned'}[/green]"
+                    f"[bold green]Renamed[/bold green] [cyan]{issue.get('key')}[/cyan] -> [bold]{issue.get('name')}[/bold]"
                 )
             return
 
         if act == "clone":
-            key = norm_key(args.key)
-            body = {
-                "include_subtasks": bool(args.include_subtasks),
-                "actor": actor,
-            }
-            if getattr(args, "title_prefix", None):
-                body["title_prefix"] = args.title_prefix
-            issue = client.request("POST", f"/api/v1/issues/{urllib.parse.quote(key, safe='')}/clone", json_body=body)
+            body = {"actor": actor}
+            if args.name is not None:
+                body["new_name"] = args.name
+            issue = client.request("POST", f"/api/v1/issues/{encode_ref(args.issue)}/clone", json_body=body)
             if json_mode:
                 emit_json(issue)
             else:
                 stdout_console.print(
-                    f"[bold green]Cloned[/bold green] {key} -> [bold cyan]{issue.get('key')}[/bold cyan]: {issue.get('title')}"
+                    f"[bold green]Cloned[/bold green] -> [bold cyan]{issue.get('key')}[/bold cyan]: {issue.get('name')}"
                 )
             return
 
-        if act == "claim":
-            key = norm_key(args.key)
-            agent_name = args.agent or actor
-            body = {"agent": agent_name, "note": args.note, "force": bool(args.force)}
-            issue = client.request("POST", f"/api/v1/issues/{urllib.parse.quote(key, safe='')}/claim", json_body=body)
+        if act == "archive":
+            issue = client.request(
+                "POST",
+                f"/api/v1/issues/{encode_ref(args.issue)}/archive",
+                json_body={"actor": actor},
+            )
+            if json_mode:
+                emit_json(issue)
+            else:
+                stdout_console.print(f"[yellow]Archived[/yellow] [cyan]{issue.get('key')}[/cyan]: {issue.get('name')}")
+            return
+
+        if act == "unarchive":
+            issue = client.request(
+                "POST",
+                f"/api/v1/issues/{encode_ref(args.issue)}/unarchive",
+                json_body={"actor": actor},
+            )
             if json_mode:
                 emit_json(issue)
             else:
                 stdout_console.print(
-                    f"[bold green]Claimed[/bold green] [bold cyan]{issue.get('key')}[/bold cyan] for agent [bold yellow]{agent_name}[/bold yellow] ({fmt_status(issue.get('status'))})"
+                    f"[bold green]Unarchived[/bold green] [cyan]{issue.get('key')}[/cyan]: {issue.get('name')} ({issue.get('state')})"
                 )
             return
 
-        if act == "release":
-            key = norm_key(args.key)
-            body = {
-                "agent": args.agent,
-                "status": args.status.lower() if args.status else None,
-                "note": args.note,
-            }
-            issue = client.request("POST", f"/api/v1/issues/{urllib.parse.quote(key, safe='')}/release", json_body=body)
+        if act == "delete":
+            require_yes(args.yes, f"issue '{args.issue}'")
+            res = client.request("DELETE", f"/api/v1/issues/{encode_ref(args.issue)}")
             if json_mode:
-                emit_json(issue)
+                emit_json(res)
             else:
-                stdout_console.print(
-                    f"[bold green]Released[/bold green] [bold cyan]{issue.get('key')}[/bold cyan] (status: {fmt_status(issue.get('status'))})"
-                )
+                stdout_console.print(f"[yellow]Deleted issue[/yellow] `{args.issue}`.")
             return
 
-        if act == "subtasks":
-            key = norm_key(args.key)
-            data = client.request("GET", f"/api/v1/issues/{urllib.parse.quote(key, safe='')}/subtasks")
+        if act == "context":
+            data = client.request("GET", f"/api/v1/issues/{encode_ref(args.issue)}/context")
             if json_mode:
                 emit_json(data)
             else:
-                render_issue_table(
-                    data.get("subtasks") or [],
-                    title=f"Subtasks of {key} ({data.get('completed_count', 0)}/{data.get('total_count', 0)} done)",
-                )
+                md_str = data.get("markdown") or json.dumps(data, indent=2)
+                stdout_console.print(Panel(md_str, title=f"Agent Context Pack — {data.get('key', args.issue)}", border_style="cyan"))
             return
-
-        if act == "subtask-add":
-            key = norm_key(args.key)
-            body = {
-                "title": args.title,
-                "description": args.description,
-                "priority": args.priority.lower() if args.priority else None,
-                "assignee": args.assignee,
-                "story_points": args.points,
-                "actor": actor,
-            }
-            sub_issue = client.request(
-                "POST",
-                f"/api/v1/issues/{urllib.parse.quote(key, safe='')}/subtasks",
-                json_body={k: v for k, v in body.items() if v is not None},
-            )
-            if json_mode:
-                emit_json(sub_issue)
-            else:
-                stdout_console.print(
-                    f"[bold green]Created subtask[/bold green] [bold cyan]{sub_issue.get('key')}[/bold cyan] under {key}: {sub_issue.get('title')}"
-                )
-            return
-
-        if act == "history":
-            key = norm_key(args.key)
-            data = client.request("GET", f"/api/v1/issues/{urllib.parse.quote(key, safe='')}/history")
-            if json_mode:
-                emit_json(data)
-            else:
-                hist = data.get("history") or []
-                t = Table(title=f"History for {key} ({len(hist)} events)", box=box.SIMPLE_HEAD)
-                t.add_column("Timestamp", style="dim", no_wrap=True)
-                t.add_column("Actor", style="green", no_wrap=True)
-                t.add_column("Action", style="yellow", no_wrap=True)
-                t.add_column("Changes")
-                for ev in hist:
-                    t.add_row(
-                        str(ev.get("timestamp", "")),
-                        str(ev.get("actor", "")),
-                        str(ev.get("action", "")),
-                        json.dumps(ev.get("changes") or {}),
-                    )
-                stdout_console.print(t)
-            return
-
-        if act == "bulk":
-            keys = [norm_key(k) for k in (split_csv(args.keys) or [])]
-            if not keys:
-                raise CLIError("Provide at least one issue key via --keys K1,K2.", "invalid_arguments", 400)
-            fields: dict[str, Any] = {}
-            if args.status:
-                fields["status"] = args.status.lower()
-            if args.priority:
-                fields["priority"] = args.priority.lower()
-            if args.assignee is not None:
-                fields["assignee"] = None if args.assignee.lower() in ("none", "unassigned") else args.assignee
-            if args.label:
-                fields["label"] = args.label
-                fields["labels"] = split_csv(args.label) or []
-            if args.sprint is not None:
-                fields["sprint_id"] = norm_opt_key(args.sprint)
-
-            res = client.request(
-                "POST",
-                "/api/v1/issues/bulk",
-                json_body={"keys": keys, "action": args.action, "fields": fields, "actor": actor},
-            )
-            if json_mode:
-                emit_json(res)
-            else:
-                stdout_console.print(
-                    f"[bold green]Bulk {args.action}:[/bold green] updated={len(res.get('updated') or [])}, "
-                    f"deleted={len(res.get('deleted') or [])}, errors={len(res.get('errors') or [])}"
-                )
-                for err_item in res.get("errors") or []:
-                    stderr_console.print(f"  [red]• {err_item}[/red]")
-            return
-
-        if act == "watch":
-            key = norm_key(args.key)
-            res = client.request(
-                "POST",
-                f"/api/v1/issues/{urllib.parse.quote(key, safe='')}/watchers",
-                json_body={"username": args.username},
-            )
-            if json_mode:
-                emit_json(res)
-            else:
-                stdout_console.print(f"[green]Added watcher[/green] `{args.username}` on {key}. Watchers: {', '.join(res.get('watchers') or [])}")
-            return
-
-        if act == "unwatch":
-            key = norm_key(args.key)
-            res = client.request(
-                "DELETE",
-                f"/api/v1/issues/{urllib.parse.quote(key, safe='')}/watchers/{urllib.parse.quote(args.username, safe='')}",
-            )
-            if json_mode:
-                emit_json(res)
-            else:
-                stdout_console.print(f"[yellow]Removed watcher[/yellow] `{args.username}` from {key}.")
-            return
-
-
-# ---------------------------------------------------------------------------
-# Command Handlers — Comments, Attachments, Links, Worklogs & Agile Resources
-# ---------------------------------------------------------------------------
 
 
 def cmd_comment(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
-    base_url, _ = ensure_daemon(repo_root)
+    act = args.comment_action
     actor = default_actor(repo_root)
-    key = norm_key(args.key)
-    ukey = urllib.parse.quote(key, safe="")
+    base_url, _ = ensure_daemon(repo_root)
+    ref = encode_ref(args.issue)
 
     with ITrackClient(base_url) as client:
-        if args.comment_action == "list":
-            data = client.request("GET", f"/api/v1/issues/{ukey}/comments")
+        if act == "add":
+            body_text = _resolve_text_source(args.body, args.body_file, args.stdin, label="comment body")
+            embed_paths = validate_upload_paths(args.embed, label="Comment embed image")
+            attach_paths = validate_upload_paths(args.attach, label="Comment attachment")
+            linked_ids = [normalize_ref_str(x) for x in flatten_csv_tokens(args.link_attachment)]
+
+            if body_text is None and not embed_paths and not attach_paths and not linked_ids:
+                raise CLIError(
+                    "Comment requires --body, --body-file, --stdin, --embed, --attach, or --link-attachment.",
+                    error_code="empty_comment",
+                    exit_code=1,
+                )
+
+            mp_files, handles = open_multipart_files([("embeds", embed_paths), ("attachments", attach_paths)])
+            form_parts = [
+                ("body", (None, body_text or "")),
+                ("author", (None, args.author or actor)),
+                ("linked_attachment_ids", (None, json.dumps(linked_ids))),
+            ]
+            try:
+                cmt = client.request("POST", f"/api/v1/issues/{ref}/comments", files=form_parts + mp_files)
+            finally:
+                for fh in handles:
+                    fh.close()
+
+            if json_mode:
+                emit_json(cmt)
+            else:
+                stdout_console.print(render_comment_panel(cmt))
+            return
+
+        if act == "list":
+            data = client.request("GET", f"/api/v1/issues/{ref}/comments")
             if json_mode:
                 emit_json(data)
             else:
-                comments = data.get("comments") or []
-                t = Table(title=f"Comments on {key} ({len(comments)})", box=box.ROUNDED, show_lines=True)
-                t.add_column("ID", style="bold cyan", no_wrap=True)
-                t.add_column("Author", style="green", no_wrap=True)
-                t.add_column("Updated", style="dim", no_wrap=True)
-                t.add_column("Body")
-                for c in comments:
-                    t.add_row(str(c.get("id", "")), str(c.get("author", "")), str(c.get("updated_at", "")), str(c.get("body", "")))
-                stdout_console.print(t)
+                cmts = data.get("comments") if isinstance(data, dict) else data
+                for cmt in (cmts or []):
+                    stdout_console.print(render_comment_panel(cmt))
+                if not cmts:
+                    stdout_console.print("[dim]No comments.[/dim]")
             return
 
-        if args.comment_action == "add":
-            cmt = client.request(
-                "POST",
-                f"/api/v1/issues/{ukey}/comments",
-                json_body={"body": args.body, "author": args.author or actor},
-            )
+        if act == "show":
+            cmt = client.request("GET", f"/api/v1/issues/{ref}/comments/{encode_ref(args.comment_id)}")
             if json_mode:
                 emit_json(cmt)
             else:
-                stdout_console.print(f"[bold green]Added comment[/bold green] [cyan]{cmt.get('id')}[/cyan] on {key}.")
+                stdout_console.print(render_comment_panel(cmt))
             return
 
-        if args.comment_action == "edit":
-            cid = urllib.parse.quote(args.comment_id.strip(), safe="")
+        if act == "edit":
+            body_text = _resolve_text_source(args.body, args.body_file, args.stdin, label="comment body")
+            add_embed_paths = validate_upload_paths(args.add_embed, label="Comment embed image")
+            add_attach_paths = validate_upload_paths(args.add_attach, label="Comment attachment")
+            rem_embeds = [normalize_ref_str(x) for x in flatten_csv_tokens(args.remove_embed)]
+            rem_attach = [normalize_ref_str(x) for x in flatten_csv_tokens(args.remove_attach)]
+            link_atts = [normalize_ref_str(x) for x in flatten_csv_tokens(args.link_attachment)]
+            unlink_atts = [normalize_ref_str(x) for x in flatten_csv_tokens(args.unlink_attachment)]
+
+            mp_files, handles = open_multipart_files([
+                ("add_embeds", add_embed_paths),
+                ("add_attachments", add_attach_paths),
+            ])
+            form_parts: list[tuple[str, tuple[Any, ...]]] = [
+                ("actor", (None, args.actor or actor)),
+                ("remove_embeds", (None, json.dumps(rem_embeds))),
+                ("remove_attachments", (None, json.dumps(rem_attach))),
+                ("link_attachments", (None, json.dumps(link_atts))),
+                ("unlink_attachments", (None, json.dumps(unlink_atts))),
+            ]
+            if body_text is not None:
+                form_parts.append(("body", (None, body_text)))
+            try:
+                cmt = client.request(
+                    "PATCH",
+                    f"/api/v1/issues/{ref}/comments/{encode_ref(args.comment_id)}",
+                    files=form_parts + mp_files,
+                )
+            finally:
+                for fh in handles:
+                    fh.close()
+
+            if json_mode:
+                emit_json(cmt)
+            else:
+                stdout_console.print(render_comment_panel(cmt))
+            return
+
+        if act == "embed-delete":
+            form_parts = [
+                ("actor", (None, actor)),
+                ("remove_embeds", (None, json.dumps([normalize_ref_str(args.att_id)]))),
+            ]
             cmt = client.request(
                 "PATCH",
-                f"/api/v1/issues/{ukey}/comments/{cid}",
-                json_body={"body": args.body, "actor": actor},
+                f"/api/v1/issues/{ref}/comments/{encode_ref(args.comment_id)}",
+                files=form_parts,
             )
             if json_mode:
                 emit_json(cmt)
             else:
-                stdout_console.print(f"[bold green]Updated comment[/bold green] [cyan]{cmt.get('id')}[/cyan] on {key}.")
+                stdout_console.print(f"[yellow]Removed embedded image[/yellow] `{args.att_id}` from `{args.comment_id}`.")
             return
 
-        if args.comment_action == "delete":
-            cid = urllib.parse.quote(args.comment_id.strip(), safe="")
-            res = client.request("DELETE", f"/api/v1/issues/{ukey}/comments/{cid}")
+        if act == "attach-delete":
+            form_parts = [
+                ("actor", (None, actor)),
+                ("remove_attachments", (None, json.dumps([normalize_ref_str(args.att_id)]))),
+            ]
+            cmt = client.request(
+                "PATCH",
+                f"/api/v1/issues/{ref}/comments/{encode_ref(args.comment_id)}",
+                files=form_parts,
+            )
+            if json_mode:
+                emit_json(cmt)
+            else:
+                stdout_console.print(f"[yellow]Removed comment attachment[/yellow] `{args.att_id}` from `{args.comment_id}`.")
+            return
+
+        if act == "delete":
+            require_yes(args.yes, f"comment '{args.comment_id}'")
+            res = client.request("DELETE", f"/api/v1/issues/{ref}/comments/{encode_ref(args.comment_id)}")
             if json_mode:
                 emit_json(res)
             else:
-                stdout_console.print(f"[yellow]Deleted comment[/yellow] `{args.comment_id}` from {key}.")
+                stdout_console.print(f"[yellow]Deleted comment[/yellow] `{args.comment_id}`.")
             return
 
 
 def cmd_attach(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
-    base_url, _ = ensure_daemon(repo_root)
+    act = args.attach_action
     actor = default_actor(repo_root)
-    key = norm_key(args.key)
-    ukey = urllib.parse.quote(key, safe="")
+    base_url, _ = ensure_daemon(repo_root)
+    ref = encode_ref(args.issue)
 
     with ITrackClient(base_url) as client:
-        if args.attach_action == "list":
-            data = client.request("GET", f"/api/v1/issues/{ukey}/attachments")
+        if act == "add":
+            paths = validate_upload_paths(args.files, label="Attachment")
+            mp_files, handles = open_multipart_files([("files", paths)])
+            try:
+                res = client.request(
+                    "POST",
+                    f"/api/v1/issues/{ref}/attachments",
+                    files=[("uploaded_by", (None, args.by or actor))] + mp_files,
+                )
+            finally:
+                for fh in handles:
+                    fh.close()
+            if json_mode:
+                emit_json(res)
+            else:
+                stdout_console.print(f"[bold green]Uploaded {len(paths)} attachment(s)[/bold green] to `{args.issue}`.")
+            return
+
+        if act == "list":
+            scope = (args.scope or "all").lower()
+            if scope not in ("issue", "comments", "all"):
+                raise CLIError(f"Invalid --scope '{args.scope}': expected issue, comments, or all.", "invalid_scope", 1)
+            data = client.request("GET", f"/api/v1/issues/{ref}/attachments", params={"scope": scope})
             if json_mode:
                 emit_json(data)
             else:
-                atts = data.get("attachments") or []
-                t = Table(title=f"Attachments on {key} ({len(atts)})", box=box.ROUNDED)
-                t.add_column("ID", style="bold cyan")
-                t.add_column("Filename")
+                items = data.get("attachments") if isinstance(data, dict) else data
+                items = items or []
+                t = Table(title=f"Attachments for {args.issue} (scope={scope}, {len(items)})", box=box.ROUNDED)
+                t.add_column("ID", style="cyan")
+                t.add_column("Scope", style="magenta")
+                t.add_column("Filename", style="bold")
                 t.add_column("MIME", style="dim")
                 t.add_column("Size", justify="right")
-                t.add_column("By", style="green")
-                t.add_column("Description")
-                for a in atts:
+                for a in items:
                     t.add_row(
                         str(a.get("id", "")),
+                        str(a.get("scope", "")),
                         str(a.get("filename", "")),
                         str(a.get("mime_type", "")),
                         f"{a.get('size_bytes', 0)} B",
-                        str(a.get("uploaded_by", "")),
-                        str(a.get("description", "")),
                     )
                 stdout_console.print(t)
             return
 
-        if args.attach_action == "upload":
-            fpath = Path(args.file_path).expanduser()
-            att = client.upload_attachment(
-                key,
-                fpath,
-                uploaded_by=args.by or actor,
-                description=args.description or "",
+        if act == "info":
+            data = client.request("GET", f"/api/v1/issues/{ref}/attachments/{encode_ref(args.att_id)}")
+            if json_mode:
+                emit_json(data)
+            else:
+                preview = data.get("preview_text") or data.get("preview") or ""
+                body = (
+                    f"ID: [bold cyan]{data.get('id')}[/bold cyan]   Filename: [bold]{data.get('filename')}[/bold]\n"
+                    f"Scope: {data.get('scope')}   MIME: {data.get('mime_type')}   Size: {data.get('size_bytes')} B\n"
+                    f"SHA-256: [dim]{data.get('sha256')}[/dim]"
+                )
+                if preview:
+                    body += f"\n\n[bold]Preview:[/bold]\n{preview}"
+                stdout_console.print(Panel(body, title="Attachment Info", border_style="cyan"))
+            return
+
+        if act == "download":
+            content, _ = client.download_bytes(
+                f"/api/v1/issues/{ref}/attachments/{encode_ref(args.att_id)}/download"
             )
-            if json_mode:
-                emit_json(att)
-            else:
-                stdout_console.print(
-                    f"[bold green]Uploaded[/bold green] [cyan]{att.get('id')}[/cyan] (`{att.get('filename')}`, {att.get('size_bytes', 0)} B) to {key}."
-                )
-            return
-
-        if args.attach_action == "download":
-            out_p = Path(args.output).expanduser() if args.output else None
-            att_id = norm_key(args.attachment_id) if args.attachment_id.lower().startswith("att-") else args.attachment_id
-            res = client.download_attachment(key, att_id, out_p)
+            out_path = Path(args.output).expanduser()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(content)
+            res = {"id": normalize_ref_str(args.att_id), "output": str(out_path), "size_bytes": len(content)}
             if json_mode:
                 emit_json(res)
             else:
-                stdout_console.print(
-                    f"[bold green]Downloaded[/bold green] `{att_id}` -> `{res['output_path']}` ({res['size_bytes']} B)."
-                )
+                stdout_console.print(f"[bold green]Downloaded[/bold green] `{args.att_id}` ({len(content)} B) -> `{out_path}`")
             return
 
-        if args.attach_action == "delete":
-            att_id = norm_key(args.attachment_id) if args.attachment_id.lower().startswith("att-") else args.attachment_id
-            res = client.request("DELETE", f"/api/v1/issues/{ukey}/attachments/{urllib.parse.quote(att_id, safe='')}")
+        if act == "delete":
+            require_yes(args.yes, f"attachment '{args.att_id}'")
+            res = client.request("DELETE", f"/api/v1/issues/{ref}/attachments/{encode_ref(args.att_id)}")
             if json_mode:
                 emit_json(res)
             else:
-                stdout_console.print(f"[yellow]Deleted attachment[/yellow] `{att_id}` from {key}.")
+                stdout_console.print(f"[yellow]Deleted attachment[/yellow] `{args.att_id}`.")
             return
 
 
 def cmd_link(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
-    base_url, _ = ensure_daemon(repo_root)
+    act = args.link_action
     actor = default_actor(repo_root)
-    key = norm_key(args.key)
-    ukey = urllib.parse.quote(key, safe="")
+    base_url, _ = ensure_daemon(repo_root)
+    ref = encode_ref(args.issue)
 
     with ITrackClient(base_url) as client:
-        if args.link_action == "list":
-            data = client.request("GET", f"/api/v1/issues/{ukey}/links")
+        if act == "add":
+            ltype = normalize_hyphen_enum(args.type)
+            res = client.request(
+                "POST",
+                f"/api/v1/issues/{ref}/links",
+                json_body={"type": ltype, "target": normalize_ref_str(args.target_issue), "actor": actor},
+            )
+            if json_mode:
+                emit_json(res)
+            else:
+                stdout_console.print(
+                    f"[bold green]Linked[/bold green] `{args.issue}` --\\[{ltype}]--> `{args.target_issue}`"
+                )
+            return
+
+        if act == "list":
+            data = client.request("GET", f"/api/v1/issues/{ref}/links")
             if json_mode:
                 emit_json(data)
             else:
-                links = data.get("links") or []
-                t = Table(title=f"Links on {key} ({len(links)})", box=box.ROUNDED)
-                t.add_column("ID", style="bold cyan")
-                t.add_column("Source", style="cyan")
+                links = data.get("links") if isinstance(data, dict) else data
+                links = links or []
+                t = Table(title=f"Links on {args.issue} ({len(links)})", box=box.ROUNDED)
+                t.add_column("ID", style="cyan")
                 t.add_column("Type", style="yellow")
-                t.add_column("Target", style="cyan")
+                t.add_column("Direction", style="dim")
+                t.add_column("Target", style="bold")
                 for lnk in links:
                     t.add_row(
                         str(lnk.get("id", "")),
-                        str(lnk.get("source_key", key)),
-                        str(lnk.get("link_type", "")),
-                        str(lnk.get("target_key", "")),
+                        str(lnk.get("type", "")),
+                        str(lnk.get("direction", "outbound")),
+                        f"{lnk.get('target_key')} ({lnk.get('target_name', '')})",
                     )
                 stdout_console.print(t)
             return
 
-        if args.link_action == "add":
-            target = norm_key(args.target_key)
-            lnk = client.request(
-                "POST",
-                f"/api/v1/issues/{ukey}/links",
-                json_body={"target_key": target, "link_type": args.link_type.lower(), "actor": actor},
-            )
-            if json_mode:
-                emit_json(lnk)
-            else:
-                stdout_console.print(
-                    f"[bold green]Linked[/bold green] [cyan]{key}[/cyan] --({lnk.get('link_type')})--> [cyan]{target}[/cyan] ([dim]{lnk.get('id')}[/dim])."
-                )
-            return
-
-        if args.link_action == "remove":
-            lid = urllib.parse.quote(args.link_id.strip(), safe="")
-            res = client.request("DELETE", f"/api/v1/issues/{ukey}/links/{lid}")
+        if act == "remove":
+            res = client.request("DELETE", f"/api/v1/issues/{ref}/links/{encode_ref(args.link_id)}")
             if json_mode:
                 emit_json(res)
             else:
-                stdout_console.print(f"[yellow]Removed link[/yellow] `{args.link_id}` from {key}.")
+                stdout_console.print(f"[yellow]Removed link[/yellow] `{args.link_id}`.")
             return
 
 
-def cmd_worklog(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
+def cmd_tag(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
+    act = args.tag_action
     base_url, _ = ensure_daemon(repo_root)
-    actor = default_actor(repo_root)
-    key = norm_key(args.key)
-    ukey = urllib.parse.quote(key, safe="")
-
     with ITrackClient(base_url) as client:
-        if args.worklog_action == "list":
-            data = client.request("GET", f"/api/v1/issues/{ukey}/worklogs")
+        if act == "create":
+            body = {"name": args.name}
+            if args.color is not None:
+                body["color"] = args.color
+            if args.desc is not None:
+                body["description"] = args.desc
+            res = client.request("POST", "/api/v1/tags", json_body=body)
+            if json_mode:
+                emit_json(res)
+            else:
+                stdout_console.print(f"[bold green]Created tag[/bold green] `{res.get('name', args.name)}`.")
+            return
+
+        if act == "list":
+            data = client.request("GET", "/api/v1/tags")
             if json_mode:
                 emit_json(data)
             else:
-                wls = data.get("worklogs") or []
-                t = Table(
-                    title=f"Worklogs on {key} (Total: {fmt_minutes(data.get('total_minutes'))})",
-                    box=box.ROUNDED,
-                )
-                t.add_column("ID", style="bold cyan")
-                t.add_column("Author", style="green")
-                t.add_column("Minutes", justify="right")
-                t.add_column("Note")
-                t.add_column("Created", style="dim")
-                for w in wls:
-                    t.add_row(
-                        str(w.get("id", "")),
-                        str(w.get("author", "")),
-                        fmt_minutes(w.get("minutes")),
-                        str(w.get("note", "")),
-                        str(w.get("created_at", "")),
-                    )
+                tags = data.get("tags") if isinstance(data, dict) else data
+                t = Table(title=f"Tags ({len(tags or [])})", box=box.ROUNDED)
+                t.add_column("Name", style="bold cyan")
+                t.add_column("Color", style="magenta")
+                t.add_column("Description", style="dim")
+                for tg in (tags or []):
+                    t.add_row(str(tg.get("name", "")), str(tg.get("color", "")), str(tg.get("description") or "-"))
                 stdout_console.print(t)
             return
 
-        if args.worklog_action == "add":
-            raw_dur = args.duration.strip()
-            body: dict[str, Any] = {
-                "author": args.author or actor,
-                "note": args.note or "",
-            }
-            if raw_dur.isdigit():
-                body["minutes"] = int(raw_dur)
-            else:
-                body["duration"] = raw_dur
-            wl = client.request("POST", f"/api/v1/issues/{ukey}/worklogs", json_body=body)
-            if json_mode:
-                emit_json(wl)
-            else:
-                stdout_console.print(
-                    f"[bold green]Logged[/bold green] {fmt_minutes(wl.get('minutes'))} on {key} ([cyan]{wl.get('id')}[/cyan])."
-                )
-            return
-
-        if args.worklog_action == "delete":
-            wid = urllib.parse.quote(args.worklog_id.strip(), safe="")
-            res = client.request("DELETE", f"/api/v1/issues/{ukey}/worklogs/{wid}")
+        if act == "edit":
+            body = {}
+            if args.new_name is not None:
+                body["new_name"] = args.new_name
+            if args.color is not None:
+                body["color"] = args.color
+            if args.desc is not None:
+                body["description"] = args.desc
+            res = client.request("PATCH", f"/api/v1/tags/{urllib.parse.quote(args.name, safe='')}", json_body=body)
             if json_mode:
                 emit_json(res)
             else:
-                stdout_console.print(f"[yellow]Deleted worklog[/yellow] `{args.worklog_id}` from {key}.")
+                stdout_console.print(f"[bold green]Updated tag[/bold green] `{args.name}`.")
+            return
+
+        if act == "delete":
+            require_yes(args.yes, f"tag '{args.name}'")
+            res = client.request("DELETE", f"/api/v1/tags/{urllib.parse.quote(args.name, safe='')}")
+            if json_mode:
+                emit_json(res)
+            else:
+                stdout_console.print(f"[yellow]Deleted tag[/yellow] `{args.name}`.")
             return
 
 
 def cmd_sprint(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
-    base_url, _ = ensure_daemon(repo_root)
     act = args.sprint_action
-
+    base_url, _ = ensure_daemon(repo_root)
     with ITrackClient(base_url) as client:
+        if act == "create":
+            body: dict[str, Any] = {"name": args.name}
+            if args.goal is not None:
+                body["goal"] = args.goal
+            if args.start is not None:
+                body["start_date"] = args.start
+            if args.end is not None:
+                body["end_date"] = args.end
+            res = client.request("POST", "/api/v1/sprints", json_body=body)
+            if json_mode:
+                emit_json(res)
+            else:
+                stdout_console.print(
+                    f"[bold green]Created sprint[/bold green] [cyan]{res.get('id')}[/cyan]: {res.get('name')}"
+                )
+            return
+
         if act == "list":
-            params = {"state": args.state.lower() if args.state else None}
+            params = {"state": args.state.lower()} if args.state else None
             data = client.request("GET", "/api/v1/sprints", params=params)
             if json_mode:
                 emit_json(data)
             else:
-                sprints = data.get("sprints") or []
-                t = Table(title=f"Sprints ({len(sprints)})", box=box.ROUNDED)
+                sprints = data.get("sprints") if isinstance(data, dict) else data
+                t = Table(title=f"Sprints ({len(sprints or [])})", box=box.ROUNDED)
                 t.add_column("ID", style="bold cyan")
                 t.add_column("Name", style="bold")
                 t.add_column("State", style="yellow")
-                t.add_column("Dates")
+                t.add_column("Dates", style="dim")
                 t.add_column("Goal")
-                for sp in sprints:
-                    sid = sp.get("id") or sp.get("key") or ""
+                for sp in (sprints or []):
                     t.add_row(
-                        str(sid),
+                        str(sp.get("id", "")),
                         str(sp.get("name", "")),
                         str(sp.get("state", "")),
                         f"{sp.get('start_date') or '-'} -> {sp.get('end_date') or '-'}",
@@ -2129,46 +2467,27 @@ def cmd_sprint(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> No
                 stdout_console.print(t)
             return
 
-        if act == "create":
-            body = {
-                "name": args.name,
-                "goal": args.goal,
-                "start_date": args.start,
-                "end_date": args.end,
-            }
-            sp = client.request("POST", "/api/v1/sprints", json_body={k: v for k, v in body.items() if v is not None})
-            if json_mode:
-                emit_json(sp)
-            else:
-                sid = sp.get("id") or sp.get("key")
-                stdout_console.print(f"[bold green]Created sprint[/bold green] [bold cyan]{sid}[/bold cyan]: {sp.get('name')}")
-            return
-
         if act == "show":
-            sid = norm_key(args.sprint_id)
-            data = client.request("GET", f"/api/v1/sprints/{urllib.parse.quote(sid, safe='')}")
+            res = client.request("GET", f"/api/v1/sprints/{encode_ref(args.sprint)}")
             if json_mode:
-                emit_json(data)
+                emit_json(res)
             else:
-                sp = data.get("sprint") or {}
-                m = data.get("metrics") or {}
+                sp = res.get("sprint") if isinstance(res, dict) and "sprint" in res else res
                 stdout_console.print(
                     Panel(
-                        f"[bold cyan]{sp.get('id') or sid}[/bold cyan] — [bold]{sp.get('name')}[/bold] ({sp.get('state')})\n"
-                        f"Goal: {sp.get('goal') or '-'}\n"
-                        f"Dates: {sp.get('start_date') or '-'} -> {sp.get('end_date') or '-'}\n"
-                        f"Progress: {m.get('done_issues', 0)}/{m.get('total_issues', 0)} issues "
-                        f"({m.get('done_points', 0):g}/{m.get('total_points', 0):g} pts, {m.get('progress_pct', 0):.1f}%)",
-                        title="Sprint Overview",
+                        f"Name:  [bold]{sp.get('name')}[/bold] ({sp.get('state')})\n"
+                        f"Goal:  {sp.get('goal') or '-'}\n"
+                        f"Dates: {sp.get('start_date') or '-'} -> {sp.get('end_date') or '-'}",
+                        title=f"Sprint {sp.get('id')}",
                         border_style="cyan",
                     )
                 )
-                render_issue_table(data.get("issues") or [], title=f"Sprint {sid} Issues")
+                if isinstance(res, dict) and res.get("issues"):
+                    render_issues_table({"issues": res["issues"], "total": len(res["issues"])}, title="Sprint Issues")
             return
 
-        if act == "update":
-            sid = norm_key(args.sprint_id)
-            body: dict[str, Any] = {}
+        if act == "edit":
+            body = {}
             if args.name is not None:
                 body["name"] = args.name
             if args.goal is not None:
@@ -2177,936 +2496,1132 @@ def cmd_sprint(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> No
                 body["start_date"] = args.start
             if args.end is not None:
                 body["end_date"] = args.end
-            if getattr(args, "state", None) is not None:
-                body["state"] = args.state.lower()
-            sp = client.request("PATCH", f"/api/v1/sprints/{urllib.parse.quote(sid, safe='')}", json_body=body)
+            res = client.request("PATCH", f"/api/v1/sprints/{encode_ref(args.sprint)}", json_body=body)
             if json_mode:
-                emit_json(sp)
+                emit_json(res)
             else:
-                stdout_console.print(f"[bold green]Updated sprint[/bold green] [cyan]{sid}[/cyan].")
+                stdout_console.print(f"[bold green]Updated sprint[/bold green] `{args.sprint}`.")
             return
 
         if act == "start":
-            sid = norm_key(args.sprint_id)
-            body = {k: v for k, v in {"start_date": args.start, "end_date": args.end}.items() if v is not None}
-            sp = client.request("POST", f"/api/v1/sprints/{urllib.parse.quote(sid, safe='')}/start", json_body=body)
+            body = {}
+            if args.start is not None:
+                body["start_date"] = args.start
+            if args.end is not None:
+                body["end_date"] = args.end
+            res = client.request("POST", f"/api/v1/sprints/{encode_ref(args.sprint)}/start", json_body=body)
             if json_mode:
-                emit_json(sp)
+                emit_json(res)
             else:
-                stdout_console.print(f"[bold green]Started sprint[/bold green] [cyan]{sid}[/cyan].")
+                stdout_console.print(f"[bold green]Started sprint[/bold green] `{args.sprint}`.")
             return
 
         if act == "complete":
-            sid = norm_key(args.sprint_id)
-            rollover = norm_opt_key(args.rollover)
+            rollover_to: str | None = None
+            if args.rollover and args.rollover.strip().lower() not in ("none", "null", "backlog"):
+                rollover_to = normalize_ref_str(args.rollover)
             res = client.request(
                 "POST",
-                f"/api/v1/sprints/{urllib.parse.quote(sid, safe='')}/complete",
-                json_body={"rollover_to": rollover},
+                f"/api/v1/sprints/{encode_ref(args.sprint)}/complete",
+                json_body={"rollover_to": rollover_to},
             )
             if json_mode:
                 emit_json(res)
             else:
-                rolled = res.get("rolled_over_keys") or []
-                stdout_console.print(
-                    f"[bold green]Completed sprint[/bold green] [cyan]{sid}[/cyan] (rolled over {len(rolled)} issues -> {rollover or 'backlog'})."
-                )
+                stdout_console.print(f"[bold green]Completed sprint[/bold green] `{args.sprint}`.")
             return
 
-        if act == "delete":
-            sid = norm_key(args.sprint_id)
-            res = client.request("DELETE", f"/api/v1/sprints/{urllib.parse.quote(sid, safe='')}")
+        if act == "assign":
+            issues = parse_issue_refs(args.issues, repo_root)
+            res = client.request(
+                "POST",
+                f"/api/v1/sprints/{encode_ref(args.sprint)}/assign",
+                json_body={"issues": issues},
+            )
             if json_mode:
                 emit_json(res)
             else:
-                stdout_console.print(f"[yellow]Deleted sprint[/yellow] `{sid}`.")
+                stdout_console.print(f"[bold green]Assigned {len(issues)} issue(s)[/bold green] to `{args.sprint}`.")
             return
 
-
-def cmd_epic(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
-    base_url, _ = ensure_daemon(repo_root)
-    actor = default_actor(repo_root)
-    with ITrackClient(base_url) as client:
-        if args.epic_action == "list":
-            data = client.request("GET", "/api/v1/epics")
+        if act == "remove":
+            issues = parse_issue_refs(args.issues, repo_root)
+            res = client.request(
+                "POST",
+                f"/api/v1/sprints/{encode_ref(args.sprint)}/remove",
+                json_body={"issues": issues},
+            )
             if json_mode:
-                emit_json(data)
+                emit_json(res)
             else:
-                epics = data.get("epics") or []
-                t = Table(title=f"Epics ({len(epics)})", box=box.ROUNDED)
-                t.add_column("Key", style="bold cyan")
-                t.add_column("Title", style="bold")
-                t.add_column("Status")
-                t.add_column("Priority")
-                t.add_column("Progress", justify="right")
-                t.add_column("Points", justify="right")
-                for ep in epics:
-                    iss = ep.get("issue") or {}
-                    t.add_row(
-                        str(iss.get("key", "")),
-                        str(iss.get("title", "")),
-                        fmt_status(iss.get("status")),
-                        fmt_priority(iss.get("priority")),
-                        f"{ep.get('done_count', 0)}/{ep.get('child_count', 0)} ({ep.get('progress_pct', 0):.0f}%)",
-                        f"{ep.get('done_points', 0):g}/{ep.get('total_points', 0):g}",
-                    )
-                stdout_console.print(t)
+                stdout_console.print(f"[yellow]Removed {len(issues)} issue(s)[/yellow] from `{args.sprint}`.")
             return
 
-        if args.epic_action == "create":
-            body: dict[str, Any] = {
-                "title": args.title,
-                "type": "epic",
-                "actor": actor,
-                "reporter": actor,
-            }
-            if args.description is not None:
-                body["description"] = args.description
-            if args.priority:
-                body["priority"] = args.priority.lower()
-            if args.assignee:
-                body["assignee"] = args.assignee
-            iss = client.request("POST", "/api/v1/issues", json_body=body)
+        if act == "delete":
+            require_yes(args.yes, f"sprint '{args.sprint}'")
+            res = client.request("DELETE", f"/api/v1/sprints/{encode_ref(args.sprint)}")
             if json_mode:
-                emit_json(iss)
+                emit_json(res)
             else:
-                stdout_console.print(f"[bold green]Created epic[/bold green] [bold cyan]{iss.get('key')}[/bold cyan]: {iss.get('title')}")
+                stdout_console.print(f"[yellow]Deleted sprint[/yellow] `{args.sprint}`.")
             return
 
 
 def cmd_milestone(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
-    base_url, _ = ensure_daemon(repo_root)
     act = args.milestone_action
+    base_url, _ = ensure_daemon(repo_root)
     with ITrackClient(base_url) as client:
+        if act == "create":
+            body: dict[str, Any] = {"name": args.name}
+            if args.desc is not None:
+                body["description"] = args.desc
+            if args.due is not None:
+                body["due_date"] = args.due
+            res = client.request("POST", "/api/v1/milestones", json_body=body)
+            if json_mode:
+                emit_json(res)
+            else:
+                stdout_console.print(
+                    f"[bold green]Created milestone[/bold green] [cyan]{res.get('id')}[/cyan]: {res.get('name')}"
+                )
+            return
+
         if act == "list":
-            data = client.request("GET", "/api/v1/milestones")
+            params = {"state": args.state.lower()} if args.state else None
+            data = client.request("GET", "/api/v1/milestones", params=params)
             if json_mode:
                 emit_json(data)
             else:
-                ms = data.get("milestones") or []
-                t = Table(title=f"Milestones ({len(ms)})", box=box.ROUNDED)
+                items = data.get("milestones") if isinstance(data, dict) else data
+                t = Table(title=f"Milestones ({len(items or [])})", box=box.ROUNDED)
                 t.add_column("ID", style="bold cyan")
                 t.add_column("Name", style="bold")
-                t.add_column("Status", style="yellow")
-                t.add_column("Target Date")
+                t.add_column("State", style="yellow")
+                t.add_column("Due Date", style="dim")
                 t.add_column("Description")
-                for m in ms:
+                for m in (items or []):
                     t.add_row(
-                        str(m.get("id") or m.get("key") or ""),
+                        str(m.get("id", "")),
                         str(m.get("name", "")),
-                        str(m.get("status", "")),
-                        str(m.get("target_date") or "-"),
+                        str(m.get("state", "")),
+                        str(m.get("due_date") or "-"),
                         str(m.get("description") or "-"),
                     )
                 stdout_console.print(t)
             return
 
-        if act == "create":
-            body = {"name": args.name, "description": args.description, "target_date": args.target}
-            m = client.request("POST", "/api/v1/milestones", json_body={k: v for k, v in body.items() if v is not None})
-            if json_mode:
-                emit_json(m)
-            else:
-                stdout_console.print(f"[bold green]Created milestone[/bold green] [bold cyan]{m.get('id')}[/bold cyan]: {m.get('name')}")
-            return
-
-        if act == "update":
-            mid = norm_key(args.milestone_id)
-            body = {
-                k: v
-                for k, v in {
-                    "name": args.name,
-                    "description": args.description,
-                    "target_date": args.target,
-                    "status": args.status.lower() if args.status else None,
-                }.items()
-                if v is not None
-            }
-            m = client.request("PATCH", f"/api/v1/milestones/{urllib.parse.quote(mid, safe='')}", json_body=body)
-            if json_mode:
-                emit_json(m)
-            else:
-                stdout_console.print(f"[bold green]Updated milestone[/bold green] [cyan]{mid}[/cyan].")
-            return
-
-        if act == "delete":
-            mid = norm_key(args.milestone_id)
-            res = client.request("DELETE", f"/api/v1/milestones/{urllib.parse.quote(mid, safe='')}")
-            if json_mode:
-                emit_json(res)
-            else:
-                stdout_console.print(f"[yellow]Deleted milestone[/yellow] `{mid}`.")
-            return
-
-
-def cmd_label(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
-    base_url, _ = ensure_daemon(repo_root)
-    with ITrackClient(base_url) as client:
-        if args.label_action == "list":
-            data = client.request("GET", "/api/v1/labels")
-            if json_mode:
-                emit_json(data)
-            else:
-                labels = data.get("labels") or []
-                t = Table(title=f"Labels ({len(labels)})", box=box.ROUNDED)
-                t.add_column("Name", style="bold magenta")
-                t.add_column("Color")
-                t.add_column("Description")
-                for lb in labels:
-                    t.add_row(str(lb.get("name", "")), str(lb.get("color", "")), str(lb.get("description", "")))
-                stdout_console.print(t)
-            return
-
-        if args.label_action == "add":
-            body = {"name": args.name, "color": args.color, "description": args.description}
-            lb = client.request("POST", "/api/v1/labels", json_body={k: v for k, v in body.items() if v is not None})
-            if json_mode:
-                emit_json(lb)
-            else:
-                stdout_console.print(f"[bold green]Added label[/bold green] [magenta]{lb.get('name')}[/magenta].")
-            return
-
-        if args.label_action == "delete":
-            res = client.request("DELETE", f"/api/v1/labels/{urllib.parse.quote(args.name, safe='')}")
-            if json_mode:
-                emit_json(res)
-            else:
-                stdout_console.print(f"[yellow]Deleted label[/yellow] `{args.name}`.")
-            return
-
-
-def cmd_component(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
-    base_url, _ = ensure_daemon(repo_root)
-    with ITrackClient(base_url) as client:
-        if args.component_action == "list":
-            data = client.request("GET", "/api/v1/components")
-            if json_mode:
-                emit_json(data)
-            else:
-                comps = data.get("components") or []
-                t = Table(title=f"Components ({len(comps)})", box=box.ROUNDED)
-                t.add_column("Name", style="bold cyan")
-                t.add_column("Lead", style="green")
-                t.add_column("Description")
-                for cp in comps:
-                    t.add_row(str(cp.get("name", "")), str(cp.get("lead") or "-"), str(cp.get("description") or "-"))
-                stdout_console.print(t)
-            return
-
-        if args.component_action == "add":
-            body = {"name": args.name, "lead": args.lead, "description": args.description}
-            cp = client.request("POST", "/api/v1/components", json_body={k: v for k, v in body.items() if v is not None})
-            if json_mode:
-                emit_json(cp)
-            else:
-                stdout_console.print(f"[bold green]Added component[/bold green] [cyan]{cp.get('name')}[/cyan].")
-            return
-
-        if args.component_action == "delete":
-            res = client.request("DELETE", f"/api/v1/components/{urllib.parse.quote(args.name, safe='')}")
-            if json_mode:
-                emit_json(res)
-            else:
-                stdout_console.print(f"[yellow]Deleted component[/yellow] `{args.name}`.")
-            return
-
-
-def cmd_user(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
-    base_url, _ = ensure_daemon(repo_root)
-    act = args.user_action
-    with ITrackClient(base_url) as client:
-        if act == "list":
-            data = client.request("GET", "/api/v1/users")
-            if json_mode:
-                emit_json(data)
-            else:
-                users = data.get("users") or []
-                t = Table(title=f"Users & Agents ({len(users)})", box=box.ROUNDED)
-                t.add_column("Username", style="bold green")
-                t.add_column("Display Name")
-                t.add_column("Role")
-                t.add_column("Agent?", justify="center")
-                t.add_column("Email", style="dim")
-                for u in users:
-                    t.add_row(
-                        str(u.get("username", "")),
-                        str(u.get("display_name") or "-"),
-                        str(u.get("role") or "-"),
-                        "🤖" if u.get("is_agent") else "👤",
-                        str(u.get("email") or "-"),
-                    )
-                stdout_console.print(t)
-            return
-
-        if act == "add":
-            body = {
-                "username": args.username,
-                "display_name": args.name,
-                "email": args.email,
-                "role": args.role,
-                "is_agent": bool(args.agent),
-                "avatar_color": getattr(args, "avatar_color", None),
-            }
-            u = client.request("POST", "/api/v1/users", json_body={k: v for k, v in body.items() if v is not None})
-            if json_mode:
-                emit_json(u)
-            else:
-                stdout_console.print(f"[bold green]Registered user[/bold green] [green]{u.get('username')}[/green].")
-            return
-
         if act == "show":
-            data = client.request("GET", f"/api/v1/users/{urllib.parse.quote(args.username, safe='')}")
+            res = client.request("GET", f"/api/v1/milestones/{encode_ref(args.milestone)}")
             if json_mode:
-                emit_json(data)
+                emit_json(res)
             else:
-                u = data.get("user") or {}
+                m = res.get("milestone") if isinstance(res, dict) and "milestone" in res else res
                 stdout_console.print(
                     Panel(
-                        f"Username: [bold green]{u.get('username')}[/bold green] ({'Agent' if u.get('is_agent') else 'Human'})\n"
-                        f"Display:  {u.get('display_name') or '-'}\n"
-                        f"Role:     {u.get('role') or '-'}   Email: {u.get('email') or '-'}\n"
-                        f"Assigned: {data.get('assigned_issues', 0)}   In Progress: {data.get('in_progress_issues', 0)}",
-                        title="User Profile",
-                        border_style="green",
+                        f"Name:  [bold]{m.get('name')}[/bold] ({m.get('state')})\n"
+                        f"Due:   {m.get('due_date') or '-'}\n"
+                        f"Desc:  {m.get('description') or '-'}",
+                        title=f"Milestone {m.get('id')}",
+                        border_style="cyan",
                     )
                 )
             return
 
-        if act == "update":
-            body = {
-                k: v
-                for k, v in {
-                    "display_name": args.name,
-                    "email": args.email,
-                    "role": args.role,
-                    "is_agent": True if args.agent else (False if args.human else None),
-                    "avatar_color": getattr(args, "avatar_color", None),
-                }.items()
-                if v is not None
-            }
-            u = client.request("PATCH", f"/api/v1/users/{urllib.parse.quote(args.username, safe='')}", json_body=body)
-            if json_mode:
-                emit_json(u)
-            else:
-                stdout_console.print(f"[bold green]Updated user[/bold green] [green]{u.get('username')}[/green].")
-            return
-
-        if act == "delete":
-            res = client.request("DELETE", f"/api/v1/users/{urllib.parse.quote(args.username, safe='')}")
+        if act == "edit":
+            body = {}
+            if args.name is not None:
+                body["name"] = args.name
+            if args.desc is not None:
+                body["description"] = args.desc
+            if args.due is not None:
+                body["due_date"] = args.due
+            res = client.request("PATCH", f"/api/v1/milestones/{encode_ref(args.milestone)}", json_body=body)
             if json_mode:
                 emit_json(res)
             else:
-                stdout_console.print(f"[yellow]Deleted user[/yellow] `{args.username}`.")
+                stdout_console.print(f"[bold green]Updated milestone[/bold green] `{args.milestone}`.")
+            return
+
+        if act == "close":
+            res = client.request("POST", f"/api/v1/milestones/{encode_ref(args.milestone)}/close")
+            if json_mode:
+                emit_json(res)
+            else:
+                stdout_console.print(f"[bold green]Closed milestone[/bold green] `{args.milestone}`.")
+            return
+
+        if act == "reopen":
+            res = client.request("POST", f"/api/v1/milestones/{encode_ref(args.milestone)}/reopen")
+            if json_mode:
+                emit_json(res)
+            else:
+                stdout_console.print(f"[bold green]Reopened milestone[/bold green] `{args.milestone}`.")
+            return
+
+        if act == "delete":
+            require_yes(args.yes, f"milestone '{args.milestone}'")
+            res = client.request("DELETE", f"/api/v1/milestones/{encode_ref(args.milestone)}")
+            if json_mode:
+                emit_json(res)
+            else:
+                stdout_console.print(f"[yellow]Deleted milestone[/yellow] `{args.milestone}`.")
             return
 
 
 def cmd_view(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
-    base_url, _ = ensure_daemon(repo_root)
     act = args.view_action
+    base_url, _ = ensure_daemon(repo_root)
     with ITrackClient(base_url) as client:
+        if act == "create":
+            body: dict[str, Any] = {"name": args.name, "query": args.query}
+            if args.tab is not None:
+                body["tab"] = normalize_hyphen_enum(args.tab)
+            if args.sort is not None:
+                body["sort"] = args.sort
+            if args.order is not None:
+                body["order"] = args.order.lower()
+            if args.swimlane is not None:
+                body["swimlane"] = args.swimlane.lower()
+            if args.desc is not None:
+                body["description"] = args.desc
+            res = client.request("POST", "/api/v1/views", json_body=body)
+            if json_mode:
+                emit_json(res)
+            else:
+                stdout_console.print(
+                    f"[bold green]Created view[/bold green] [cyan]{res.get('id')}[/cyan]: {res.get('name')}"
+                )
+            return
+
         if act == "list":
             data = client.request("GET", "/api/v1/views")
             if json_mode:
                 emit_json(data)
             else:
-                views = data.get("views") or []
-                t = Table(title=f"Saved Views ({len(views)})", box=box.ROUNDED)
+                views = data.get("views") if isinstance(data, dict) else data
+                t = Table(title=f"Saved Views ({len(views or [])})", box=box.ROUNDED)
                 t.add_column("ID", style="bold cyan")
                 t.add_column("Name", style="bold")
-                t.add_column("Layout")
-                t.add_column("iQL", style="yellow")
+                t.add_column("Tab", style="magenta")
+                t.add_column("Query", style="yellow")
                 t.add_column("Description", style="dim")
-                for v in views:
+                for v in (views or []):
                     t.add_row(
                         str(v.get("id", "")),
                         str(v.get("name", "")),
-                        str(v.get("layout", "list")),
-                        str(v.get("iql", "")),
+                        str(v.get("tab") or "all"),
+                        str(v.get("query") or ""),
                         str(v.get("description") or "-"),
                     )
                 stdout_console.print(t)
             return
 
-        if act == "create":
-            body = {
-                "name": args.name,
-                "iql": args.iql,
-                "layout": args.layout,
-                "description": args.description,
-                "icon": getattr(args, "icon", None),
-            }
-            v = client.request("POST", "/api/v1/views", json_body={k: val for k, val in body.items() if val is not None})
-            if json_mode:
-                emit_json(v)
-            else:
-                stdout_console.print(f"[bold green]Created view[/bold green] [cyan]{v.get('id')}[/cyan]: {v.get('name')}")
-            return
-
-        if act == "update":
-            vid = norm_key(args.view_id)
-            body = {
-                k: val
-                for k, val in {
-                    "name": args.name,
-                    "iql": args.iql,
-                    "layout": args.layout,
-                    "description": args.description,
-                    "icon": getattr(args, "icon", None),
-                }.items()
-                if val is not None
-            }
-            v = client.request("PATCH", f"/api/v1/views/{urllib.parse.quote(vid, safe='')}", json_body=body)
-            if json_mode:
-                emit_json(v)
-            else:
-                stdout_console.print(f"[bold green]Updated view[/bold green] [cyan]{vid}[/cyan].")
-            return
-
-        if act == "delete":
-            vid = norm_key(args.view_id)
-            res = client.request("DELETE", f"/api/v1/views/{urllib.parse.quote(vid, safe='')}")
+        if act == "show":
+            res = client.request("GET", f"/api/v1/views/{encode_ref(args.view)}")
             if json_mode:
                 emit_json(res)
             else:
-                stdout_console.print(f"[yellow]Deleted view[/yellow] `{vid}`.")
+                stdout_console.print(Panel(json.dumps(res, indent=2), title=f"Saved View {res.get('id', args.view)}", border_style="cyan"))
+            return
+
+        if act == "run":
+            body = {}
+            if args.page is not None:
+                body["page"] = args.page
+            if args.page_size is not None:
+                body["page_size"] = args.page_size
+            data = client.request("POST", f"/api/v1/views/{encode_ref(args.view)}/run", json_body=body)
+            if json_mode:
+                emit_json(data)
+            else:
+                render_issues_table(data, title=f"Saved View: {args.view}")
+            return
+
+        if act == "edit":
+            body = {}
+            if args.name is not None:
+                body["name"] = args.name
+            if args.query is not None:
+                body["query"] = args.query
+            if args.tab is not None:
+                body["tab"] = normalize_hyphen_enum(args.tab)
+            if args.sort is not None:
+                body["sort"] = args.sort
+            if args.order is not None:
+                body["order"] = args.order.lower()
+            if args.swimlane is not None:
+                body["swimlane"] = args.swimlane.lower()
+            if args.desc is not None:
+                body["description"] = args.desc
+            res = client.request("PATCH", f"/api/v1/views/{encode_ref(args.view)}", json_body=body)
+            if json_mode:
+                emit_json(res)
+            else:
+                stdout_console.print(f"[bold green]Updated view[/bold green] `{args.view}`.")
+            return
+
+        if act == "delete":
+            require_yes(args.yes, f"view '{args.view}'")
+            res = client.request("DELETE", f"/api/v1/views/{encode_ref(args.view)}")
+            if json_mode:
+                emit_json(res)
+            else:
+                stdout_console.print(f"[yellow]Deleted view[/yellow] `{args.view}`.")
+            return
+
+
+def cmd_worklog(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
+    act = args.worklog_action
+    actor = default_actor(repo_root)
+    base_url, _ = ensure_daemon(repo_root)
+    ref = encode_ref(args.issue)
+
+    with ITrackClient(base_url) as client:
+        if act == "add":
+            raw_dur = args.duration_or_minutes.strip()
+            body: dict[str, Any] = {"author": args.author or actor}
+            if re.fullmatch(r"-?\d+", raw_dur):
+                body["minutes"] = int(raw_dur)
+            else:
+                body["duration"] = raw_dur
+            if args.note is not None:
+                body["note"] = args.note
+            res = client.request("POST", f"/api/v1/issues/{ref}/worklogs", json_body=body)
+            if json_mode:
+                emit_json(res)
+            else:
+                wl = res.get("worklog") if isinstance(res, dict) and "worklog" in res else res
+                stdout_console.print(
+                    f"[bold green]Logged work[/bold green] [cyan]{wl.get('id', '')}[/cyan] "
+                    f"({wl.get('minutes', raw_dur)}m) on `{args.issue}`."
+                )
+            return
+
+        if act == "list":
+            data = client.request("GET", f"/api/v1/issues/{ref}/worklogs")
+            if json_mode:
+                emit_json(data)
+            else:
+                wls = data.get("worklogs") if isinstance(data, dict) else data
+                tp = data.get("time_progress") if isinstance(data, dict) else {}
+                logged = int((tp or {}).get("logged_minutes", sum(int(w.get("minutes", 0)) for w in (wls or []))))
+                est = (tp or {}).get("estimate_minutes")
+                stdout_console.print(f"[bold]Time Progress:[/bold] {render_time_bar(logged, est)}")
+                t = Table(title=f"Worklogs on {args.issue} ({len(wls or [])})", box=box.ROUNDED)
+                t.add_column("ID", style="cyan")
+                t.add_column("Author", style="green")
+                t.add_column("Minutes", justify="right")
+                t.add_column("Created", style="dim")
+                t.add_column("Note")
+                for w in (wls or []):
+                    t.add_row(
+                        str(w.get("id", "")),
+                        str(w.get("author", "")),
+                        str(w.get("minutes", 0)),
+                        str(w.get("created_at", "")),
+                        str(w.get("note") or "-"),
+                    )
+                stdout_console.print(t)
+            return
+
+        if act == "delete":
+            require_yes(args.yes, f"worklog '{args.worklog_id}'")
+            res = client.request("DELETE", f"/api/v1/issues/{ref}/worklogs/{encode_ref(args.worklog_id)}")
+            if json_mode:
+                emit_json(res)
+            else:
+                stdout_console.print(f"[yellow]Deleted worklog[/yellow] `{args.worklog_id}`.")
+            return
+
+
+def cmd_bulk(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
+    act = args.bulk_action
+    actor = default_actor(repo_root)
+    issues = parse_issue_refs(args.issues, repo_root)
+    if not issues and not args.query:
+        raise CLIError("Specify target issues via --issues and/or --query.", "missing_bulk_targets", 1)
+
+    base_url, _ = ensure_daemon(repo_root)
+    with ITrackClient(base_url) as client:
+        if act == "update":
+            if args.assignee is not None and args.clear_assignee:
+                raise CLIError("Cannot specify both --assignee and --clear-assignee.", "conflicting_flags", 1)
+            if args.sprint is not None and args.clear_sprint:
+                raise CLIError("Cannot specify both --sprint and --clear-sprint.", "conflicting_flags", 1)
+            if args.milestone is not None and args.clear_milestone:
+                raise CLIError("Cannot specify both --milestone and --clear-milestone.", "conflicting_flags", 1)
+            if args.archive and args.unarchive:
+                raise CLIError("Cannot specify both --archive and --unarchive.", "conflicting_flags", 1)
+
+            updates: dict[str, Any] = {}
+            if args.state is not None:
+                updates["state"] = normalize_hyphen_enum(args.state)
+            if args.priority is not None:
+                updates["priority"] = normalize_hyphen_enum(args.priority)
+            if args.severity is not None:
+                updates["severity"] = normalize_hyphen_enum(args.severity)
+            if args.category is not None:
+                updates["category"] = normalize_hyphen_enum(args.category)
+            if args.clear_assignee:
+                updates["assignee"] = None
+            elif args.assignee is not None:
+                updates["assignee"] = args.assignee
+            if args.add_tag:
+                updates["add_tags"] = flatten_csv_tokens(args.add_tag)
+            if args.remove_tag:
+                updates["remove_tags"] = flatten_csv_tokens(args.remove_tag)
+            if args.clear_sprint:
+                updates["sprint"] = None
+            elif args.sprint is not None:
+                updates["sprint"] = normalize_ref_str(args.sprint)
+            if args.clear_milestone:
+                updates["milestone"] = None
+            elif args.milestone is not None:
+                updates["milestone"] = normalize_ref_str(args.milestone)
+            if args.archive:
+                updates["archived"] = True
+            elif args.unarchive:
+                updates["archived"] = False
+
+            if not updates:
+                raise CLIError("No update fields specified for bulk update.", "empty_bulk_updates", 1)
+
+            payload: dict[str, Any] = {"updates": updates, "actor": actor}
+            if issues:
+                payload["issues"] = issues
+            if args.query is not None:
+                payload["query"] = args.query
+
+            res = client.request("POST", "/api/v1/bulk/update", json_body=payload)
+            if json_mode:
+                emit_json(res)
+            else:
+                stdout_console.print(
+                    f"[bold green]Bulk updated[/bold green] {res.get('updated_count', len(res.get('updated', [])))} issue(s)."
+                )
+            return
+
+        if act == "delete":
+            require_yes(args.yes, "bulk-matched issues")
+            payload = {"actor": actor}
+            if issues:
+                payload["issues"] = issues
+            if args.query is not None:
+                payload["query"] = args.query
+            res = client.request("POST", "/api/v1/bulk/delete", json_body=payload)
+            if json_mode:
+                emit_json(res)
+            else:
+                stdout_console.print(
+                    f"[yellow]Bulk deleted[/yellow] {res.get('deleted_count', len(res.get('deleted', [])))} issue(s)."
+                )
             return
 
 
 # ---------------------------------------------------------------------------
-# CLI Argument Parser & Entrypoint
+# Strict Exit-Code ArgumentParser & Complete Section 7 Subcommand Tree
 # ---------------------------------------------------------------------------
 
 
 class CLIArgumentParser(argparse.ArgumentParser):
-    """ArgumentParser subclass raising CLIError on parse failure for clean --json parity."""
+    """ArgumentParser subclass exiting with code 1 (never 2) on parse/usage errors."""
 
     def error(self, message: str) -> NoReturn:
-        raise CLIError(message, error_code="invalid_arguments", status_code=400)
-
-
-def _configure_issue_create_parser(p: argparse.ArgumentParser) -> None:
-    p.add_argument("title", help="Issue summary/title")
-    p.add_argument("-d", "--description", "--desc", dest="description", help="Markdown description")
-    p.add_argument("-t", "--type", help="Issue type (epic, story, task, bug, subtask, spike)")
-    p.add_argument("-s", "--status", help="Initial status")
-    p.add_argument("-p", "--priority", help="Priority (none, low, medium, high, urgent)")
-    p.add_argument("-a", "--assignee", help="Assignee username")
-    p.add_argument("-r", "--reporter", help="Reporter username")
-    p.add_argument("-l", "--labels", "--label", dest="labels", help="Comma-separated labels")
-    p.add_argument("-c", "--components", "--component", dest="components", help="Comma-separated components")
-    p.add_argument("--epic", help="Parent epic key (e.g. ITK-1)")
-    p.add_argument("--parent", help="Parent issue key")
-    p.add_argument("--sprint", help="Sprint ID (e.g. SPR-1)")
-    p.add_argument("--milestone", help="Milestone ID (e.g. MIL-1)")
-    p.add_argument("--points", type=float, help="Story points estimate")
-    p.add_argument("--due", help="Due date (YYYY-MM-DD)")
-    p.add_argument("--environment", help="Environment context")
-    p.add_argument("--actor", help="Actor username")
-    p.set_defaults(issue_action="create", handler=cmd_issue)
-
-
-def _configure_issue_list_parser(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--iql", help="iQL filter expression")
-    p.add_argument("-q", "--query", help="Full-text search filter")
-    p.add_argument("-s", "--status", help="Filter by status")
-    p.add_argument("-p", "--priority", help="Filter by priority")
-    p.add_argument("-t", "--type", help="Filter by issue type")
-    p.add_argument("-a", "--assignee", help="Filter by assignee")
-    p.add_argument("-l", "--label", help="Filter by label")
-    p.add_argument("-c", "--component", help="Filter by component")
-    p.add_argument("--epic", help="Filter by epic key")
-    p.add_argument("--parent", help="Filter by parent key")
-    p.add_argument("--sprint", help="Filter by sprint ID")
-    p.add_argument("--milestone", help="Filter by milestone ID")
-    p.add_argument("--sort", help="Sort clause")
-    p.add_argument("--limit", type=int, default=200, help="Max issues (default 200)")
-    p.add_argument("--offset", type=int, default=0, help="Pagination offset")
-    p.set_defaults(issue_action="list", handler=cmd_issue)
-
-
-def _configure_issue_ready_parser(p: argparse.ArgumentParser) -> None:
-    p.add_argument("-a", "--assignee", help="Filter by assignee")
-    p.add_argument("--sprint", help="Filter by sprint ID")
-    p.add_argument("--limit", type=int, default=50, help="Max issues (default 50)")
-    p.set_defaults(issue_action="ready", handler=cmd_issue)
-
-
-def _configure_issue_transition_parser(p: argparse.ArgumentParser, fixed_status: str | None = None) -> None:
-    p.add_argument("key", help="Issue key (e.g. ITK-1)")
-    if fixed_status is None:
-        p.add_argument("status", help="Target status")
-    else:
-        p.set_defaults(status=fixed_status)
-    p.add_argument("--resolution", help="Optional resolution (e.g. fixed, wontfix, duplicate)")
-    p.add_argument("-m", "--comment", "--message", dest="comment", help="Transition comment")
-    p.add_argument("--force", action="store_true", help="Force transition bypassing workflow guard")
-    p.add_argument("--actor", help="Actor username")
-    p.set_defaults(issue_action="transition", handler=cmd_issue)
-
-
-def _configure_issue_claim_parser(p: argparse.ArgumentParser) -> None:
-    p.add_argument("key", help="Issue key (e.g. ITK-1)")
-    p.add_argument("--agent", help="Agent or user identifier claiming this issue")
-    p.add_argument("-m", "--note", "--message", dest="note", help="Optional claim note")
-    p.add_argument("--force", action="store_true", help="Override existing claim by another agent")
-    p.set_defaults(issue_action="claim", handler=cmd_issue)
-
-
-def _configure_issue_release_parser(p: argparse.ArgumentParser) -> None:
-    p.add_argument("key", help="Issue key (e.g. ITK-1)")
-    p.add_argument("--agent", help="Agent identifier releasing claim")
-    p.add_argument("-s", "--status", help="Target status after release (default todo)")
-    p.add_argument("-m", "--note", "--message", dest="note", help="Optional handoff/release note")
-    p.set_defaults(issue_action="release", handler=cmd_issue)
+        raise CLIError(message, error_code="invalid_arguments", exit_code=1)
 
 
 def build_parser() -> CLIArgumentParser:
     parser = CLIArgumentParser(
-        prog="itrack",
-        description="itrack — Git-rooted Jira/Linear-grade CLI, Agent Coordinator & Web UI launcher.",
+        prog="itrack.py",
+        description="itrack — Git-rooted local-first CLI, Self-Teaching Manual & Web UI launcher.",
     )
-    parser.add_argument("-V", "--version", action="store_true", help="Show itrack version")
-    parser.add_argument("--manual", action="store_true", help="Show complete Agent & Operator Manual")
+    parser.add_argument("--json", action="store_true", help="Emit strictly valid JSON to stdout")
+    parser.add_argument("--root", metavar="PATH", help="Target Git repository root (overrides ITRACK_ROOT and cwd)")
+    parser.add_argument("-V", "--version", action="store_true", help="Print version and exit 0")
 
     sub = parser.add_subparsers(dest="command")
 
-    # manual
-    p_manual = sub.add_parser("manual", help="Display Law 3 Agent & Operator Manual")
-    p_manual.set_defaults(handler=lambda _a, r, j: render_agent_manual(r, j))
-
-    # init
-    p_init = sub.add_parser("init", help="Initialize workspace and optionally configure project key/name")
-    p_init.add_argument("--key", help="Project issue key prefix (e.g. ITK)")
-    p_init.add_argument("--name", help="Human-readable project name")
+    # 2. init
+    p_init = sub.add_parser("init", help="Initialize workspace under <repo_root>/itrack-issues/")
+    p_init.add_argument("--prefix", help="Issue key prefix (default ITR)")
+    p_init.add_argument("--title", help="Workspace project title (default 'iTrack Workspace')")
     p_init.set_defaults(handler=cmd_init)
 
-    # ui
-    p_ui = sub.add_parser("ui", help="Ensure daemon is running and launch embedded Web SPA")
-    p_ui.add_argument("--port", type=int, default=0, help="Preferred TCP port (default ephemeral)")
-    p_ui.add_argument("--no-open", action="store_true", help="Do not launch desktop web browser")
-    p_ui.set_defaults(handler=cmd_ui)
+    # 3. status
+    sub.add_parser("status", help="Show workspace & daemon status summary").set_defaults(handler=cmd_status)
 
-    # daemon / server
-    p_daemon = sub.add_parser("daemon", aliases=["server"], help="Manage per-repo background server")
-    dsub = p_daemon.add_subparsers(dest="daemon_action", required=True)
-    p_dstart = dsub.add_parser("start", help="Start background daemon")
-    p_dstart.add_argument("--port", type=int, default=0, help="TCP port (0 for auto ephemeral)")
-    dsub.add_parser("stop", help="Stop background daemon")
-    p_drestart = dsub.add_parser("restart", help="Restart background daemon")
-    p_drestart.add_argument("--port", type=int, default=0, help="TCP port (0 for auto ephemeral)")
-    dsub.add_parser("status", help="Show daemon health status")
-    p_dlogs = dsub.add_parser("logs", help="Show recent daemon log output")
-    p_dlogs.add_argument("-n", "--lines", type=int, default=50, help="Number of tail lines")
-    p_daemon.set_defaults(handler=cmd_daemon)
+    # 4. reindex
+    sub.add_parser("reindex", help="Rebuild index.sqlite + FTS5 from canonical on-disk JSON").set_defaults(handler=cmd_reindex)
 
-    # stats & reindex
-    sub.add_parser("stats", help="Show workspace metrics and distributions").set_defaults(handler=cmd_stats)
-    sub.add_parser("reindex", help="Rebuild SQLite + FTS5 index from canonical JSON files").set_defaults(handler=cmd_reindex)
-
-    # config
-    p_cfg = sub.add_parser("config", help="Show or update workspace configuration")
+    # 5. config
+    p_cfg = sub.add_parser("config", help="View or update workspace configuration")
     csub = p_cfg.add_subparsers(dest="config_action", required=True)
-    csub.add_parser("show", help="Show config.json")
-    p_cset = csub.add_parser("set", help="Update config fields")
-    p_cset.add_argument("--key", help="Project key prefix")
-    p_cset.add_argument("--name", help="Project name")
-    p_cset.add_argument("--default-type", help="Default issue type")
-    p_cset.add_argument("--default-priority", help="Default priority")
-    p_cset.add_argument("--wip-limits", help="JSON object mapping status to WIP limit")
+    csub.add_parser("show", help="Show full workspace config")
+    p_cset = csub.add_parser("set", help="Set a configuration key")
+    p_cset.add_argument("key", help="Configuration key (e.g. project_title, default_state, default_priority, wip_limits)")
+    p_cset.add_argument("value", help="Configuration value (string, number, boolean, or JSON)")
     p_cfg.set_defaults(handler=cmd_config)
 
-    # workflow
-    p_wf = sub.add_parser("workflow", help="Show or replace workflow status transitions")
-    wfsub = p_wf.add_subparsers(dest="workflow_action", required=True)
-    wfsub.add_parser("show", help="Show workflow transitions")
-    p_wfset = wfsub.add_parser("set", help="Set workflow transitions from JSON file or inline JSON")
-    p_wfset.add_argument("--file", required=True, help="Path to JSON file or inline JSON string")
-    p_wf.set_defaults(handler=cmd_workflow)
+    # 6. server
+    p_srv = sub.add_parser("server", help="Manage per-repository background HTTP daemon")
+    ssub = p_srv.add_subparsers(dest="server_action", required=True)
+    p_sstart = ssub.add_parser("start", help="Start background daemon")
+    p_sstart.add_argument("--port", type=int, default=0, help="TCP port (0 for ephemeral)")
+    ssub.add_parser("stop", help="Gracefully stop background daemon")
+    p_srestart = ssub.add_parser("restart", help="Restart background daemon")
+    p_srestart.add_argument("--port", type=int, default=0, help="TCP port (0 for ephemeral)")
+    ssub.add_parser("status", help="Show daemon liveness & health")
+    p_srv.set_defaults(handler=cmd_server)
 
-    # export & import
-    p_exp = sub.add_parser("export", help="Export full workspace bundle as JSON")
-    p_exp.add_argument("-o", "--output", help="Write export bundle to file")
-    p_exp.set_defaults(handler=cmd_export)
+    # 7. ui
+    p_ui = sub.add_parser("ui", help="Ensure server is running and launch offline Web UI")
+    p_ui.add_argument("--port", type=int, default=0, help="Preferred TCP port")
+    p_ui.add_argument("--no-browser", action="store_true", help="Do not open desktop browser")
+    p_ui.add_argument("--foreground", action="store_true", help="Run UI server in foreground")
+    p_ui.set_defaults(handler=cmd_ui)
 
-    p_imp = sub.add_parser("import", help="Import workspace bundle from JSON file")
-    p_imp.add_argument("file", help="Path to JSON bundle")
-    p_imp.add_argument("--mode", choices=["merge", "replace"], default="merge", help="Import mode (default merge)")
-    p_imp.set_defaults(handler=cmd_import)
-
-    # Top-level issue shortcuts
-    _configure_issue_create_parser(sub.add_parser("create", help="Shortcut for `issue create`"))
-    _configure_issue_list_parser(sub.add_parser("list", help="Shortcut for `issue list`"))
-    p_top_show = sub.add_parser("show", help="Shortcut for `issue show <KEY>`")
-    p_top_show.add_argument("key", help="Issue key")
-    p_top_show.set_defaults(issue_action="show", handler=cmd_issue)
-    _configure_issue_ready_parser(sub.add_parser("ready", help="Shortcut for `issue ready` (unblocked work)"))
-    _configure_issue_claim_parser(sub.add_parser("claim", help="Atomically claim an issue for an agent"))
-    _configure_issue_release_parser(sub.add_parser("release", help="Release an issue claim"))
-    _configure_issue_transition_parser(sub.add_parser("transition", help="Shortcut for `issue transition <KEY> <STATUS>`"))
-    _configure_issue_transition_parser(sub.add_parser("move", help="Alias for `issue transition <KEY> <STATUS>`"))
-    _configure_issue_transition_parser(sub.add_parser("close", help="Transition issue to `done`"), fixed_status="done")
-    _configure_issue_transition_parser(sub.add_parser("reopen", help="Transition issue back to `todo`"), fixed_status="todo")
-
-    # search, iql, board, graph
-    p_search = sub.add_parser("search", help="Full-text FTS5 or iQL search")
-    p_search.add_argument("query_str", help="Search text or iQL expression")
-    p_search.add_argument("--iql", dest="is_iql", action="store_true", help="Interpret query as iQL")
-    p_search.add_argument("--limit", type=int, default=50, help="Max results")
-    p_search.add_argument("--offset", type=int, default=0, help="Pagination offset")
-    p_search.set_defaults(handler=cmd_search)
-
-    p_iql = sub.add_parser("iql", help="Execute or validate an iQL query")
-    p_iql.add_argument("expr", help="iQL query string")
-    p_iql.add_argument("--validate", action="store_true", help="Validate syntax and output AST without executing")
-    p_iql.add_argument("--limit", type=int, default=200, help="Result limit")
-    p_iql.add_argument("--offset", type=int, default=0, help="Result offset")
-    p_iql.set_defaults(handler=cmd_iql)
-
-    p_board = sub.add_parser("board", help="Render terminal Kanban board")
-    p_board.add_argument("--sprint", help="Filter by sprint ID")
-    p_board.add_argument("--epic", help="Filter by epic key")
-    p_board.add_argument("-a", "--assignee", help="Filter by assignee")
-    p_board.add_argument("--iql", help="Filter by iQL expression")
-    p_board.set_defaults(handler=cmd_board)
-
-    sub.add_parser("graph", help="Render issue dependency & blocker tree").set_defaults(handler=cmd_graph)
-
-    # issue resource group
-    p_issue = sub.add_parser("issue", help="Manage issues, subtasks, claims, transitions & bulk actions")
+    # 8. issue
+    p_issue = sub.add_parser("issue", help="Complete issue CRUD, folder renames, lifecycle & agent context")
     isub = p_issue.add_subparsers(dest="issue_action", required=True)
-    _configure_issue_create_parser(isub.add_parser("create", help="Create a new issue"))
-    _configure_issue_list_parser(isub.add_parser("list", help="List and filter issues"))
-    _configure_issue_ready_parser(isub.add_parser("ready", help="List unblocked actionable issues"))
 
-    p_ishow = isub.add_parser("show", help="Show complete details of an issue")
-    p_ishow.add_argument("key", help="Issue key")
+    p_ic = isub.add_parser("create", help="Create an issue (creates folder issues/<name>/)")
+    p_ic.add_argument("name", help="Exact issue name (spaces & Unicode supported)")
+    p_ic.add_argument("--category", help="Issue category")
+    p_ic.add_argument("--state", help="Initial workflow state")
+    p_ic.add_argument("--priority", help="Priority level")
+    p_ic.add_argument("--severity", help="Severity level")
+    p_ic.add_argument("--resolution", help="Initial resolution")
+    p_ic.add_argument("--desc", help="Rich Markdown description")
+    p_ic.add_argument("--desc-file", metavar="PATH", help="Read description Markdown from file")
+    p_ic.add_argument("--desc-stdin", action="store_true", help="Read description Markdown from stdin")
+    p_ic.add_argument("--embed", nargs="+", action="extend", metavar="IMG", help="Inline embedded image(s) for description")
+    p_ic.add_argument("--attach", nargs="+", action="extend", metavar="FILE", help="Whole-issue file attachment(s)")
+    p_ic.add_argument("--ac", nargs="+", action="extend", metavar="TEXT", help="Acceptance criterion item(s)")
+    p_ic.add_argument("--assignee", metavar="USER", help="Assignee username")
+    p_ic.add_argument("--reporter", metavar="USER", help="Reporter username")
+    p_ic.add_argument("--tag", nargs="+", action="extend", metavar="TAG", help="Tag(s)")
+    p_ic.add_argument("--component", nargs="+", action="extend", metavar="COMP", help="Component(s)")
+    p_ic.add_argument("--parent", metavar="ISSUE", help="Parent issue key or name")
+    p_ic.add_argument("--sprint", metavar="SPRINT", help="Sprint ID or name")
+    p_ic.add_argument("--milestone", metavar="MIL", help="Milestone ID or name")
+    p_ic.add_argument("--points", type=float, metavar="FLOAT", help="Story points")
+    p_ic.add_argument("--estimate", type=int, metavar="INT", help="Time estimate in minutes")
+    p_ic.add_argument("--due", metavar="YYYY-MM-DD", help="Due date (YYYY-MM-DD)")
+    p_ic.add_argument("--field", nargs="+", action="extend", metavar="KEY=VAL", help="Custom field key=value pair(s)")
 
-    p_iupd = isub.add_parser("update", help="Update fields on an issue")
-    p_iupd.add_argument("key", help="Issue key")
-    p_iupd.add_argument("--title", help="New title")
-    p_iupd.add_argument("-d", "--description", "--desc", dest="description", help="New description")
-    p_iupd.add_argument("-t", "--type", help="New issue type")
-    p_iupd.add_argument("-s", "--status", help="New status")
-    p_iupd.add_argument("-p", "--priority", help="New priority")
-    p_iupd.add_argument("-a", "--assignee", help="New assignee (or 'none')")
-    p_iupd.add_argument("--add-label", action="append", help="Add label(s)")
-    p_iupd.add_argument("--remove-label", action="append", help="Remove label(s)")
-    p_iupd.add_argument("-l", "--labels", dest="labels", help="Replace all labels (comma-separated)")
-    p_iupd.add_argument("-c", "--components", dest="components", help="Replace all components (comma-separated)")
-    p_iupd.add_argument("--epic", help="Epic key (or 'none')")
-    p_iupd.add_argument("--parent", help="Parent issue key (or 'none')")
-    p_iupd.add_argument("--sprint", help="Sprint ID (or 'none')")
-    p_iupd.add_argument("--milestone", help="Milestone ID (or 'none')")
-    p_iupd.add_argument("--points", type=float, help="Story points")
-    p_iupd.add_argument("--due", help="Due date YYYY-MM-DD (or 'none')")
-    p_iupd.add_argument("--resolution", help="Resolution")
-    p_iupd.add_argument("--actor", help="Actor username")
+    p_ishow = isub.add_parser("show", help="Show enriched issue details")
+    p_ishow.add_argument("issue", help="Issue key (ITR-N) or exact issue name")
 
-    p_idel = isub.add_parser("delete", help="Delete an issue")
-    p_idel.add_argument("key", help="Issue key")
+    p_ilist = isub.add_parser("list", help="Paginated & filtered issue list")
+    p_ilist.add_argument("--tab", help="Preset filter tab")
+    p_ilist.add_argument("--query", metavar="IQL", help="iQL filter query")
+    p_ilist.add_argument("--category", metavar="CAT", help="Filter by category")
+    p_ilist.add_argument("--state", metavar="STATE", help="Filter by state")
+    p_ilist.add_argument("--priority", metavar="PRIO", help="Filter by priority")
+    p_ilist.add_argument("--severity", metavar="SEV", help="Filter by severity")
+    p_ilist.add_argument("--resolution", metavar="RES", help="Filter by resolution")
+    p_ilist.add_argument("--assignee", metavar="USER", help="Filter by assignee")
+    p_ilist.add_argument("--reporter", metavar="USER", help="Filter by reporter")
+    p_ilist.add_argument("--tag", metavar="TAG", help="Filter by tag")
+    p_ilist.add_argument("--component", metavar="COMP", help="Filter by component")
+    p_ilist.add_argument("--parent", metavar="ISSUE", help="Filter by parent issue")
+    p_ilist.add_argument("--sprint", metavar="SPRINT", help="Filter by sprint")
+    p_ilist.add_argument("--milestone", metavar="MIL", help="Filter by milestone")
+    p_ilist.add_argument("--overdue", action="store_true", help="Only overdue issues")
+    p_ilist.add_argument("--sort", metavar="FIELD", help="Sort field")
+    p_ilist.add_argument("--order", choices=["asc", "desc"], help="Sort direction (asc or desc)")
+    p_ilist.add_argument("--page", type=int, metavar="INT", help="Page number (1-indexed)")
+    p_ilist.add_argument("--page-size", type=int, metavar="INT", help="Page size (e.g. 10, 25, 50, 100)")
 
-    _configure_issue_transition_parser(isub.add_parser("transition", aliases=["move"], help="Transition issue status"))
-    _configure_issue_transition_parser(isub.add_parser("close", help="Close issue (-> done)"), fixed_status="done")
-    _configure_issue_transition_parser(isub.add_parser("reopen", help="Reopen issue (-> todo)"), fixed_status="todo")
+    p_iedit = isub.add_parser("edit", help="Edit or clear/unset any issue field")
+    p_iedit.add_argument("issue", help="Issue key (ITR-N) or exact issue name")
+    p_iedit.add_argument("--name", metavar="NEW_NAME", help="Rename issue & folder atomically")
+    p_iedit.add_argument("--category", metavar="CAT", help="Set category")
+    p_iedit.add_argument("--state", metavar="STATE", help="Set workflow state")
+    p_iedit.add_argument("--priority", metavar="PRIO", help="Set priority")
+    p_iedit.add_argument("--severity", metavar="SEV", help="Set severity")
+    p_iedit.add_argument("--resolution", metavar="RES", help="Set resolution")
+    p_iedit.add_argument("--clear-resolution", action="store_true", help="Clear resolution to null")
+    p_iedit.add_argument("--desc", metavar="TEXT", help="Replace Markdown description")
+    p_iedit.add_argument("--desc-file", metavar="PATH", help="Replace description from file")
+    p_iedit.add_argument("--desc-stdin", action="store_true", help="Replace description from stdin")
+    p_iedit.add_argument("--clear-desc", action="store_true", help="Clear description to empty")
+    p_iedit.add_argument("--embed", nargs="+", action="extend", metavar="IMG", help="Add inline embedded image(s) to description")
+    p_iedit.add_argument("--remove-embed", nargs="+", action="extend", metavar="ATT_ID", help="Delete embedded image(s) from description")
+    p_iedit.add_argument("--add-ac", nargs="+", action="extend", metavar="TEXT", help="Append acceptance criteria item(s)")
+    p_iedit.add_argument("--edit-ac", nargs=2, action="append", metavar=("ID_OR_IDX", "TEXT"), help="Edit acceptance criterion text")
+    p_iedit.add_argument("--check-ac", nargs="+", action="extend", metavar="ID_OR_IDX", help="Check [x] acceptance criterion")
+    p_iedit.add_argument("--uncheck-ac", nargs="+", action="extend", metavar="ID_OR_IDX", help="Uncheck [ ] acceptance criterion")
+    p_iedit.add_argument("--remove-ac", nargs="+", action="extend", metavar="ID_OR_IDX", help="Remove acceptance criterion")
+    p_iedit.add_argument("--clear-ac", action="store_true", help="Clear all acceptance criteria")
+    p_iedit.add_argument("--assignee", metavar="USER", help="Set assignee")
+    p_iedit.add_argument("--clear-assignee", action="store_true", help="Clear assignee")
+    p_iedit.add_argument("--reporter", metavar="USER", help="Set reporter")
+    p_iedit.add_argument("--clear-reporter", action="store_true", help="Clear reporter")
+    p_iedit.add_argument("--add-tag", nargs="+", action="extend", metavar="TAG", help="Add tag(s)")
+    p_iedit.add_argument("--remove-tag", nargs="+", action="extend", metavar="TAG", help="Remove tag(s)")
+    p_iedit.add_argument("--clear-tags", action="store_true", help="Clear all tags")
+    p_iedit.add_argument("--add-component", nargs="+", action="extend", metavar="COMP", help="Add component(s)")
+    p_iedit.add_argument("--remove-component", nargs="+", action="extend", metavar="COMP", help="Remove component(s)")
+    p_iedit.add_argument("--clear-components", action="store_true", help="Clear all components")
+    p_iedit.add_argument("--parent", metavar="ISSUE", help="Set parent issue")
+    p_iedit.add_argument("--clear-parent", action="store_true", help="Clear parent issue")
+    p_iedit.add_argument("--sprint", metavar="SPRINT", help="Assign to sprint")
+    p_iedit.add_argument("--clear-sprint", action="store_true", help="Remove from sprint")
+    p_iedit.add_argument("--milestone", metavar="MIL", help="Assign to milestone")
+    p_iedit.add_argument("--clear-milestone", action="store_true", help="Remove from milestone")
+    p_iedit.add_argument("--points", type=float, metavar="FLOAT", help="Set story points")
+    p_iedit.add_argument("--clear-points", action="store_true", help="Clear story points")
+    p_iedit.add_argument("--estimate", type=int, metavar="INT", help="Set estimate minutes")
+    p_iedit.add_argument("--clear-estimate", action="store_true", help="Clear estimate minutes")
+    p_iedit.add_argument("--due", metavar="YYYY-MM-DD", help="Set due date")
+    p_iedit.add_argument("--clear-due", action="store_true", help="Clear due date")
+    p_iedit.add_argument("--field", nargs="+", action="extend", metavar="KEY=VAL", help="Set custom field(s)")
+    p_iedit.add_argument("--unset-field", nargs="+", action="extend", metavar="KEY", help="Remove custom field key(s)")
+    p_iedit.add_argument("--clear-fields", action="store_true", help="Clear all custom fields")
 
-    p_iasn = isub.add_parser("assign", help="Assign or unassign an issue")
-    p_iasn.add_argument("key", help="Issue key")
-    p_iasn.add_argument("username", help="Username or 'none'")
-    p_iasn.add_argument("--actor", help="Actor username")
+    p_istate = isub.add_parser("state", help="Transition issue workflow state")
+    p_istate.add_argument("issue", help="Issue key or exact name")
+    p_istate.add_argument("state", help="Target state")
+    p_istate.add_argument("--resolution", metavar="RES", help="Optional resolution")
 
-    p_iclone = isub.add_parser("clone", help="Clone an existing issue")
-    p_iclone.add_argument("key", help="Issue key to clone")
-    p_iclone.add_argument("--include-subtasks", action="store_true", help="Clone child subtasks too")
-    p_iclone.add_argument("--title-prefix", help="Prefix for cloned issue title")
-    p_iclone.add_argument("--actor", help="Actor username")
+    p_irename = isub.add_parser("rename", help="Atomically rename issue and on-disk folder")
+    p_irename.add_argument("issue", help="Current issue key or exact name")
+    p_irename.add_argument("new_name", help="New exact issue name")
 
-    _configure_issue_claim_parser(isub.add_parser("claim", help="Claim issue for an agent"))
-    _configure_issue_release_parser(isub.add_parser("release", help="Release issue claim"))
+    p_iclone = isub.add_parser("clone", help="Clone an issue")
+    p_iclone.add_argument("issue", help="Source issue key or exact name")
+    p_iclone.add_argument("--name", metavar="NEW_NAME", help="Optional name for cloned issue")
 
-    p_isubs = isub.add_parser("subtasks", help="List subtasks of an issue")
-    p_isubs.add_argument("key", help="Parent issue key")
+    p_iarch = isub.add_parser("archive", help="Archive an issue")
+    p_iarch.add_argument("issue", help="Issue key or exact name")
 
-    p_isubadd = isub.add_parser("subtask-add", help="Create a subtask under a parent issue")
-    p_isubadd.add_argument("key", help="Parent issue key")
-    p_isubadd.add_argument("title", help="Subtask title")
-    p_isubadd.add_argument("-d", "--description", "--desc", dest="description", help="Subtask description")
-    p_isubadd.add_argument("-p", "--priority", help="Priority")
-    p_isubadd.add_argument("-a", "--assignee", help="Assignee")
-    p_isubadd.add_argument("--points", type=float, help="Story points")
-    p_isubadd.add_argument("--actor", help="Actor username")
+    p_iunarch = isub.add_parser("unarchive", help="Unarchive an issue")
+    p_iunarch.add_argument("issue", help="Issue key or exact name")
 
-    p_ihist = isub.add_parser("history", help="Show audit history of an issue")
-    p_ihist.add_argument("key", help="Issue key")
+    p_idel = isub.add_parser("delete", help="Permanently delete an issue and its folder")
+    p_idel.add_argument("issue", help="Issue key or exact name")
+    p_idel.add_argument("--yes", action="store_true", help="Confirm permanent deletion")
 
-    p_ibulk = isub.add_parser("bulk", help="Perform bulk operations across issue keys")
-    p_ibulk.add_argument("--keys", required=True, help="Comma-separated issue keys (e.g. ITK-1,ITK-2)")
-    p_ibulk.add_argument(
-        "--action",
-        required=True,
-        choices=["update", "transition", "delete", "label_add", "label_remove", "sprint"],
-        help="Bulk action",
-    )
-    p_ibulk.add_argument("-s", "--status", help="Target status")
-    p_ibulk.add_argument("-p", "--priority", help="Target priority")
-    p_ibulk.add_argument("-a", "--assignee", help="Target assignee")
-    p_ibulk.add_argument("-l", "--label", help="Label name(s)")
-    p_ibulk.add_argument("--sprint", help="Sprint ID (or 'none')")
-    p_ibulk.add_argument("--actor", help="Actor username")
-
-    p_iwatch = isub.add_parser("watch", help="Add watcher to an issue")
-    p_iwatch.add_argument("key", help="Issue key")
-    p_iwatch.add_argument("username", help="Username")
-
-    p_iunwatch = isub.add_parser("unwatch", help="Remove watcher from an issue")
-    p_iunwatch.add_argument("key", help="Issue key")
-    p_iunwatch.add_argument("username", help="Username")
+    p_ictx = isub.add_parser("context", help="Generate structured Agent Context Pack")
+    p_ictx.add_argument("issue", help="Issue key or exact name")
     p_issue.set_defaults(handler=cmd_issue)
 
-    # comment
-    p_cmt = sub.add_parser("comment", help="Manage issue comments")
+    # 9. comment
+    p_cmt = sub.add_parser("comment", help="Manage rich Markdown comments, inline embeds & comment attachments")
     cmtsub = p_cmt.add_subparsers(dest="comment_action", required=True)
-    p_cl = cmtsub.add_parser("list", help="List comments on issue")
-    p_cl.add_argument("key", help="Issue key")
-    p_ca = cmtsub.add_parser("add", help="Add comment to issue")
-    p_ca.add_argument("key", help="Issue key")
-    p_ca.add_argument("body", help="Markdown comment body")
-    p_ca.add_argument("--author", help="Author username")
-    p_ce = cmtsub.add_parser("edit", help="Edit existing comment")
-    p_ce.add_argument("key", help="Issue key")
-    p_ce.add_argument("comment_id", help="Comment ID")
-    p_ce.add_argument("body", help="Updated comment body")
-    p_cd = cmtsub.add_parser("delete", help="Delete comment")
-    p_cd.add_argument("key", help="Issue key")
-    p_cd.add_argument("comment_id", help="Comment ID")
+
+    p_cadd = cmtsub.add_parser("add", help="Add a rich comment to an issue")
+    p_cadd.add_argument("issue", help="Issue key or exact name")
+    p_cadd.add_argument("--body", metavar="TEXT", help="Markdown comment body")
+    p_cadd.add_argument("--body-file", metavar="PATH", help="Read comment Markdown from file")
+    p_cadd.add_argument("--stdin", action="store_true", help="Read comment Markdown from stdin")
+    p_cadd.add_argument("--author", metavar="USER", help="Comment author")
+    p_cadd.add_argument("--embed", nargs="+", action="extend", metavar="IMG", help="Inline embedded image(s)")
+    p_cadd.add_argument("--attach", nargs="+", action="extend", metavar="FILE", help="Comment-scoped attachment(s)")
+    p_cadd.add_argument("--link-attachment", nargs="+", action="extend", metavar="ATT_ID", help="Link existing whole-issue attachment ID(s)")
+
+    p_clist = cmtsub.add_parser("list", help="List comments on an issue")
+    p_clist.add_argument("issue", help="Issue key or exact name")
+
+    p_cshow = cmtsub.add_parser("show", help="Show a single comment")
+    p_cshow.add_argument("issue", help="Issue key or exact name")
+    p_cshow.add_argument("comment_id", help="Comment ID (e.g. CMT-1)")
+
+    p_cedit = cmtsub.add_parser("edit", help="Edit comment body, embeds, attachments, or linked attachments")
+    p_cedit.add_argument("issue", help="Issue key or exact name")
+    p_cedit.add_argument("comment_id", help="Comment ID")
+    p_cedit.add_argument("--body", metavar="TEXT", help="Updated Markdown body")
+    p_cedit.add_argument("--body-file", metavar="PATH", help="Read updated Markdown from file")
+    p_cedit.add_argument("--stdin", action="store_true", help="Read updated Markdown from stdin")
+    p_cedit.add_argument("--actor", metavar="USER", help="Editor username")
+    p_cedit.add_argument("--add-embed", nargs="+", action="extend", metavar="IMG", help="Add inline embedded image(s)")
+    p_cedit.add_argument("--remove-embed", nargs="+", action="extend", metavar="ATT_ID", help="Delete inline embedded image(s)")
+    p_cedit.add_argument("--add-attach", nargs="+", action="extend", metavar="FILE", help="Add comment-scoped attachment(s)")
+    p_cedit.add_argument("--remove-attach", nargs="+", action="extend", metavar="ATT_ID", help="Delete comment-scoped attachment(s)")
+    p_cedit.add_argument("--link-attachment", nargs="+", action="extend", metavar="ATT_ID", help="Link whole-issue attachment ID(s)")
+    p_cedit.add_argument("--unlink-attachment", nargs="+", action="extend", metavar="ATT_ID", help="Unlink whole-issue attachment ID(s)")
+
+    p_cedel = cmtsub.add_parser("embed-delete", help="Delete a single inline embedded image from a comment")
+    p_cedel.add_argument("issue", help="Issue key or exact name")
+    p_cedel.add_argument("comment_id", help="Comment ID")
+    p_cedel.add_argument("att_id", help="Embedded image attachment ID")
+
+    p_cadel = cmtsub.add_parser("attach-delete", help="Delete a single comment-scoped attachment")
+    p_cadel.add_argument("issue", help="Issue key or exact name")
+    p_cadel.add_argument("comment_id", help="Comment ID")
+    p_cadel.add_argument("att_id", help="Comment attachment ID")
+
+    p_cdel = cmtsub.add_parser("delete", help="Delete a full comment and its owned files")
+    p_cdel.add_argument("issue", help="Issue key or exact name")
+    p_cdel.add_argument("comment_id", help="Comment ID")
+    p_cdel.add_argument("--yes", action="store_true", help="Confirm comment deletion")
     p_cmt.set_defaults(handler=cmd_comment)
 
-    # attach / attachment
-    p_att = sub.add_parser("attach", aliases=["attachment"], help="Manage file attachments on issues")
+    # 10. attach
+    p_att = sub.add_parser("attach", help="Manage whole-issue and unified attachments")
     attsub = p_att.add_subparsers(dest="attach_action", required=True)
-    p_al = attsub.add_parser("list", help="List attachments on issue")
-    p_al.add_argument("key", help="Issue key")
-    p_au = attsub.add_parser("upload", help="Upload file attachment to issue")
-    p_au.add_argument("key", help="Issue key")
-    p_au.add_argument("file_path", help="Local path to file")
-    p_au.add_argument("--by", help="Uploader username")
-    p_au.add_argument("-d", "--description", help="Attachment description")
-    p_ad = attsub.add_parser("download", help="Download attachment from issue")
-    p_ad.add_argument("key", help="Issue key")
-    p_ad.add_argument("attachment_id", help="Attachment ID (e.g. ATT-1)")
-    p_ad.add_argument("-o", "--output", help="Destination path")
-    p_ax = attsub.add_parser("delete", help="Delete attachment from issue")
-    p_ax.add_argument("key", help="Issue key")
-    p_ax.add_argument("attachment_id", help="Attachment ID")
+
+    p_aadd = attsub.add_parser("add", help="Upload whole-issue attachment(s)")
+    p_aadd.add_argument("issue", help="Issue key or exact name")
+    p_aadd.add_argument("files", nargs="+", help="Local file path(s) to attach")
+    p_aadd.add_argument("--by", metavar="USER", help="Uploader username")
+
+    p_alist = attsub.add_parser("list", help="List attachments on an issue")
+    p_alist.add_argument("issue", help="Issue key or exact name")
+    p_alist.add_argument("--scope", choices=["issue", "comments", "all"], default="all", help="Attachment scope filter")
+
+    p_ainfo = attsub.add_parser("info", help="Inspect attachment metadata & text preview")
+    p_ainfo.add_argument("issue", help="Issue key or exact name")
+    p_ainfo.add_argument("att_id", help="Attachment ID (e.g. ATT-1)")
+
+    p_adl = attsub.add_parser("download", help="Download attachment bytes to disk")
+    p_adl.add_argument("issue", help="Issue key or exact name")
+    p_adl.add_argument("att_id", help="Attachment ID")
+    p_adl.add_argument("-o", "--output", required=True, metavar="OUTPUT_PATH", help="Destination file path")
+
+    p_adel = attsub.add_parser("delete", help="Delete whole-issue attachment")
+    p_adel.add_argument("issue", help="Issue key or exact name")
+    p_adel.add_argument("att_id", help="Attachment ID")
+    p_adel.add_argument("--yes", action="store_true", help="Confirm attachment deletion")
     p_att.set_defaults(handler=cmd_attach)
 
-    # link
-    p_lnk = sub.add_parser("link", help="Manage typed dependency & relationship links")
+    # 11. link
+    p_lnk = sub.add_parser("link", help="Manage bidirectional issue dependency & relationship links")
     lnksub = p_lnk.add_subparsers(dest="link_action", required=True)
-    p_ll = lnksub.add_parser("list", help="List links on issue")
-    p_ll.add_argument("key", help="Issue key")
-    p_la = lnksub.add_parser("add", help="Create link between two issues")
-    p_la.add_argument("key", help="Source issue key")
-    p_la.add_argument("link_type", help="Link type (blocks, blocked_by, relates_to, duplicates, clones)")
-    p_la.add_argument("target_key", help="Target issue key")
-    p_lr = lnksub.add_parser("remove", aliases=["delete"], help="Remove link by ID")
-    p_lr.add_argument("key", help="Issue key")
-    p_lr.add_argument("link_id", help="Link ID")
-    p_lnk.set_defaults(list_or_mod=True, handler=cmd_link)
-    # Normalize `delete` alias to `remove`
-    p_lr.set_defaults(link_action="remove")
 
-    # worklog
-    p_wl = sub.add_parser("worklog", help="Track time spent on issues")
-    wlsub = p_wl.add_subparsers(dest="worklog_action", required=True)
-    p_wll = wlsub.add_parser("list", help="List worklogs on issue")
-    p_wll.add_argument("key", help="Issue key")
-    p_wla = wlsub.add_parser("add", help="Add worklog entry (e.g. '1h 30m' or '90')")
-    p_wla.add_argument("key", help="Issue key")
-    p_wla.add_argument("duration", help="Duration string ('1h 30m') or integer minutes ('90')")
-    p_wla.add_argument("-m", "--note", "--message", dest="note", help="Worklog note")
-    p_wla.add_argument("--author", help="Author username")
-    p_wld = wlsub.add_parser("delete", help="Delete worklog entry")
-    p_wld.add_argument("key", help="Issue key")
-    p_wld.add_argument("worklog_id", help="Worklog ID")
-    p_wl.set_defaults(handler=cmd_worklog)
+    p_ladd = lnksub.add_parser("add", help="Add bidirectional link between two issues")
+    p_ladd.add_argument("issue", help="Source issue key or exact name")
+    p_ladd.add_argument("type", help="Link type (blocks, blocked-by, relates-to, duplicates, parent-of, clones)")
+    p_ladd.add_argument("target_issue", help="Target issue key or exact name")
 
-    # sprint
-    p_sp = sub.add_parser("sprint", help="Manage Agile sprints")
-    spsub = p_sp.add_subparsers(dest="sprint_action", required=True)
-    p_spl = spsub.add_parser("list", help="List sprints")
-    p_spl.add_argument("--state", help="Filter by state (planned, active, completed)")
-    p_spc = spsub.add_parser("create", help="Create sprint")
-    p_spc.add_argument("name", help="Sprint name")
-    p_spc.add_argument("--goal", help="Sprint goal")
-    p_spc.add_argument("--start", help="Start date (YYYY-MM-DD)")
-    p_spc.add_argument("--end", help="End date (YYYY-MM-DD)")
-    p_sps = spsub.add_parser("show", help="Show sprint metrics and issues")
-    p_sps.add_argument("sprint_id", help="Sprint ID (e.g. SPR-1)")
-    p_spu = spsub.add_parser("update", help="Update sprint details")
-    p_spu.add_argument("sprint_id", help="Sprint ID")
-    p_spu.add_argument("--name", help="New name")
-    p_spu.add_argument("--goal", help="New goal")
-    p_spu.add_argument("--start", help="Start date")
-    p_spu.add_argument("--end", help="End date")
-    p_spu.add_argument("--state", help="State")
-    p_spgo = spsub.add_parser("start", help="Start sprint")
-    p_spgo.add_argument("sprint_id", help="Sprint ID")
-    p_spgo.add_argument("--start", help="Start date")
-    p_spgo.add_argument("--end", help="End date")
-    p_spdone = spsub.add_parser("complete", help="Complete sprint and roll over unfinished work")
-    p_spdone.add_argument("sprint_id", help="Sprint ID")
-    p_spdone.add_argument("--rollover", help="Target sprint ID or 'backlog'")
-    p_spdel = spsub.add_parser("delete", help="Delete sprint")
-    p_spdel.add_argument("sprint_id", help="Sprint ID")
-    p_sp.set_defaults(handler=cmd_sprint)
+    p_llist = lnksub.add_parser("list", help="List links on an issue")
+    p_llist.add_argument("issue", help="Issue key or exact name")
 
-    # epic
-    p_ep = sub.add_parser("epic", help="List or create epics with rollup progress")
-    epsub = p_ep.add_subparsers(dest="epic_action", required=True)
-    epsub.add_parser("list", help="List epics and child completion progress")
-    p_epc = epsub.add_parser("create", help="Create a new epic")
-    p_epc.add_argument("title", help="Epic title")
-    p_epc.add_argument("-d", "--description", "--desc", dest="description", help="Epic description")
-    p_epc.add_argument("-p", "--priority", help="Priority")
-    p_epc.add_argument("-a", "--assignee", help="Assignee")
-    p_ep.set_defaults(handler=cmd_epic)
+    p_lrem = lnksub.add_parser("remove", help="Remove bidirectional link by ID")
+    p_lrem.add_argument("issue", help="Issue key or exact name")
+    p_lrem.add_argument("link_id", help="Link ID (e.g. LNK-1)")
+    p_lnk.set_defaults(handler=cmd_link)
 
-    # milestone
-    p_ms = sub.add_parser("milestone", help="Manage release milestones")
-    mssub = p_ms.add_subparsers(dest="milestone_action", required=True)
-    mssub.add_parser("list", help="List milestones")
-    p_msc = mssub.add_parser("create", help="Create milestone")
-    p_msc.add_argument("name", help="Milestone name")
-    p_msc.add_argument("-d", "--description", "--desc", dest="description", help="Description")
-    p_msc.add_argument("--target", help="Target release date (YYYY-MM-DD)")
-    p_msu = mssub.add_parser("update", help="Update milestone")
-    p_msu.add_argument("milestone_id", help="Milestone ID (e.g. MIL-1)")
-    p_msu.add_argument("--name", help="New name")
-    p_msu.add_argument("-d", "--description", "--desc", dest="description", help="Description")
-    p_msu.add_argument("--target", help="Target date")
-    p_msu.add_argument("--status", choices=["unreleased", "released", "archived"], help="Milestone status")
-    p_msd = mssub.add_parser("delete", help="Delete milestone")
-    p_msd.add_argument("milestone_id", help="Milestone ID")
-    p_ms.set_defaults(handler=cmd_milestone)
+    # 12. tree
+    p_tree = sub.add_parser("tree", help="Render parent/subtask & blocker hierarchy tree")
+    p_tree.add_argument("issue", nargs="?", help="Optional root issue key or exact name")
+    p_tree.set_defaults(handler=cmd_tree)
 
-    # label
-    p_lb = sub.add_parser("label", help="Manage project labels")
-    lbsub = p_lb.add_subparsers(dest="label_action", required=True)
-    lbsub.add_parser("list", help="List labels")
-    p_lba = lbsub.add_parser("add", help="Create/update label")
-    p_lba.add_argument("name", help="Label name")
-    p_lba.add_argument("--color", help="Hex color (e.g. #ef4444)")
-    p_lba.add_argument("-d", "--description", help="Description")
-    p_lbd = lbsub.add_parser("delete", help="Delete label")
-    p_lbd.add_argument("name", help="Label name")
-    p_lb.set_defaults(handler=cmd_label)
+    # 13. search
+    p_search = sub.add_parser("search", help="Search issues via FTS5 full-text or structured iQL")
+    p_search.add_argument("query", help="Full-text query or iQL expression")
+    p_search.add_argument("--iql", action="store_true", help="Evaluate query strictly as iQL")
+    p_search.add_argument("--page", type=int, metavar="INT", help="Page number")
+    p_search.add_argument("--page-size", type=int, metavar="INT", help="Page size")
+    p_search.add_argument("--sort", metavar="FIELD", help="Sort field")
+    p_search.add_argument("--order", choices=["asc", "desc"], help="Sort direction")
+    p_search.set_defaults(handler=cmd_search)
 
-    # component
-    p_cp = sub.add_parser("component", help="Manage system components")
-    cpsub = p_cp.add_subparsers(dest="component_action", required=True)
-    cpsub.add_parser("list", help="List components")
-    p_cpa = cpsub.add_parser("add", help="Create/update component")
-    p_cpa.add_argument("name", help="Component name")
-    p_cpa.add_argument("--lead", help="Component lead username")
-    p_cpa.add_argument("-d", "--description", help="Description")
-    p_cpd = cpsub.add_parser("delete", help="Delete component")
-    p_cpd.add_argument("name", help="Component name")
-    p_cp.set_defaults(handler=cmd_component)
+    # 14. board
+    p_board = sub.add_parser("board", help="Render Kanban board across workflow columns & swimlanes")
+    p_board.add_argument("--swimlane", choices=SWIMLANES, default="none", help="Swimlane grouping")
+    p_board.add_argument("--category", metavar="CAT", help="Filter by category")
+    p_board.add_argument("--priority", metavar="PRIO", help="Filter by priority")
+    p_board.add_argument("--assignee", metavar="USER", help="Filter by assignee")
+    p_board.add_argument("--sprint", metavar="SPRINT", help="Filter by sprint")
+    p_board.add_argument("--tag", metavar="TAG", help="Filter by tag")
+    p_board.add_argument("--query", metavar="IQL", help="Filter by iQL or search query")
+    p_board.set_defaults(handler=cmd_board)
 
-    # user
-    p_usr = sub.add_parser("user", help="Manage team members & AI agents")
-    usrsub = p_usr.add_subparsers(dest="user_action", required=True)
-    usrsub.add_parser("list", help="List users and agents")
-    p_ua = usrsub.add_parser("add", help="Register user or AI agent")
-    p_ua.add_argument("username", help="Unique username/handle")
-    p_ua.add_argument("--name", help="Display name")
-    p_ua.add_argument("--email", help="Email address")
-    p_ua.add_argument("--role", help="Role (e.g. developer, lead, coding-agent)")
-    p_ua.add_argument("--agent", action="store_true", help="Mark account as AI agent")
-    p_ua.add_argument("--avatar-color", help="Hex color")
-    p_us = usrsub.add_parser("show", help="Show user profile & active workload")
-    p_us.add_argument("username", help="Username")
-    p_uu = usrsub.add_parser("update", help="Update user/agent profile")
-    p_uu.add_argument("username", help="Username")
-    p_uu.add_argument("--name", help="Display name")
-    p_uu.add_argument("--email", help="Email")
-    p_uu.add_argument("--role", help="Role")
-    p_uu.add_argument("--agent", action="store_true", help="Mark as AI agent")
-    p_uu.add_argument("--human", action="store_true", help="Mark as human user")
-    p_uu.add_argument("--avatar-color", help="Hex color")
-    p_ud = usrsub.add_parser("delete", help="Delete user")
-    p_ud.add_argument("username", help="Username")
-    p_usr.set_defaults(handler=cmd_user)
+    # 15. tag
+    p_tag = sub.add_parser("tag", help="Manage colored project tags")
+    tsub = p_tag.add_subparsers(dest="tag_action", required=True)
+    p_tc = tsub.add_parser("create", help="Create a colored tag")
+    p_tc.add_argument("name", help="Tag name")
+    p_tc.add_argument("--color", metavar="HEX", help="Hex color (e.g. #ef4444)")
+    p_tc.add_argument("--desc", metavar="TEXT", help="Tag description")
+    tsub.add_parser("list", help="List tags")
+    p_te = tsub.add_parser("edit", help="Edit or rename tag across workspace")
+    p_te.add_argument("name", help="Current tag name")
+    p_te.add_argument("--new-name", metavar="NAME", help="New tag name")
+    p_te.add_argument("--color", metavar="HEX", help="New hex color")
+    p_te.add_argument("--desc", metavar="TEXT", help="New description")
+    p_td = tsub.add_parser("delete", help="Delete tag and scrub from issues")
+    p_td.add_argument("name", help="Tag name")
+    p_td.add_argument("--yes", action="store_true", help="Confirm tag deletion")
+    p_tag.set_defaults(handler=cmd_tag)
 
-    # view
-    p_vw = sub.add_parser("view", help="Manage saved iQL views")
-    vwsub = p_vw.add_subparsers(dest="view_action", required=True)
-    vwsub.add_parser("list", help="List saved views")
-    p_vwc = vwsub.add_parser("create", help="Create saved view")
-    p_vwc.add_argument("name", help="View name")
-    p_vwc.add_argument("--iql", required=True, help="iQL filter expression")
-    p_vwc.add_argument("--layout", choices=["board", "list"], default="list", help="Default view layout")
-    p_vwc.add_argument("-d", "--description", help="Description")
-    p_vwc.add_argument("--icon", help="Optional icon")
-    p_vwu = vwsub.add_parser("update", help="Update saved view")
-    p_vwu.add_argument("view_id", help="View ID (e.g. VIEW-1)")
-    p_vwu.add_argument("--name", help="New name")
-    p_vwu.add_argument("--iql", help="New iQL expression")
-    p_vwu.add_argument("--layout", choices=["board", "list"], help="Layout")
-    p_vwu.add_argument("-d", "--description", help="Description")
-    p_vwu.add_argument("--icon", help="Icon")
-    p_vwd = vwsub.add_parser("delete", help="Delete saved view")
-    p_vwd.add_argument("view_id", help="View ID")
+    # 16. sprint
+    p_spr = sub.add_parser("sprint", help="Manage Agile sprints & incomplete issue rollover")
+    spsub = p_spr.add_subparsers(dest="sprint_action", required=True)
+    p_sc = spsub.add_parser("create", help="Create a sprint")
+    p_sc.add_argument("name", help="Sprint name")
+    p_sc.add_argument("--goal", metavar="TEXT", help="Sprint goal")
+    p_sc.add_argument("--start", metavar="YYYY-MM-DD", help="Start date")
+    p_sc.add_argument("--end", metavar="YYYY-MM-DD", help="End date")
+    p_sl = spsub.add_parser("list", help="List sprints")
+    p_sl.add_argument("--state", choices=["planned", "active", "completed"], help="Filter by sprint state")
+    p_ss = spsub.add_parser("show", help="Show sprint details and assigned issues")
+    p_ss.add_argument("sprint", help="Sprint ID (SPR-1) or name")
+    p_se = spsub.add_parser("edit", help="Edit sprint details")
+    p_se.add_argument("sprint", help="Sprint ID or name")
+    p_se.add_argument("--name", metavar="NAME", help="New sprint name")
+    p_se.add_argument("--goal", metavar="TEXT", help="New sprint goal")
+    p_se.add_argument("--start", metavar="YYYY-MM-DD", help="New start date")
+    p_se.add_argument("--end", metavar="YYYY-MM-DD", help="New end date")
+    p_sgo = spsub.add_parser("start", help="Start a planned sprint")
+    p_sgo.add_argument("sprint", help="Sprint ID or name")
+    p_sgo.add_argument("--start", metavar="YYYY-MM-DD", help="Start date")
+    p_sgo.add_argument("--end", metavar="YYYY-MM-DD", help="End date")
+    p_sdone = spsub.add_parser("complete", help="Complete active sprint with optional rollover")
+    p_sdone.add_argument("sprint", help="Sprint ID or name")
+    p_sdone.add_argument("--rollover", metavar="SPRINT_OR_NONE", help="Target sprint for incomplete issues (or none)")
+    p_sasn = spsub.add_parser("assign", help="Assign issues to sprint")
+    p_sasn.add_argument("sprint", help="Sprint ID or name")
+    p_sasn.add_argument("issues", nargs="+", help="Issue keys or names")
+    p_srem = spsub.add_parser("remove", help="Remove issues from sprint")
+    p_srem.add_argument("sprint", help="Sprint ID or name")
+    p_srem.add_argument("issues", nargs="+", help="Issue keys or names")
+    p_sdel = spsub.add_parser("delete", help="Delete sprint")
+    p_sdel.add_argument("sprint", help="Sprint ID or name")
+    p_sdel.add_argument("--yes", action="store_true", help="Confirm sprint deletion")
+    p_spr.set_defaults(handler=cmd_sprint)
+
+    # 17. milestone
+    p_mil = sub.add_parser("milestone", help="Manage release milestones")
+    msub = p_mil.add_subparsers(dest="milestone_action", required=True)
+    p_mc = msub.add_parser("create", help="Create a milestone")
+    p_mc.add_argument("name", help="Milestone name")
+    p_mc.add_argument("--desc", metavar="TEXT", help="Milestone description")
+    p_mc.add_argument("--due", metavar="YYYY-MM-DD", help="Due date")
+    p_ml = msub.add_parser("list", help="List milestones")
+    p_ml.add_argument("--state", choices=["open", "closed", "all"], help="Filter by state")
+    p_ms = msub.add_parser("show", help="Show milestone details")
+    p_ms.add_argument("milestone", help="Milestone ID (MIL-1) or name")
+    p_me = msub.add_parser("edit", help="Edit milestone")
+    p_me.add_argument("milestone", help="Milestone ID or name")
+    p_me.add_argument("--name", metavar="NAME", help="New milestone name")
+    p_me.add_argument("--desc", metavar="TEXT", help="New description")
+    p_me.add_argument("--due", metavar="YYYY-MM-DD", help="New due date")
+    p_mclose = msub.add_parser("close", help="Close milestone")
+    p_mclose.add_argument("milestone", help="Milestone ID or name")
+    p_mreopen = msub.add_parser("reopen", help="Reopen milestone")
+    p_mreopen.add_argument("milestone", help="Milestone ID or name")
+    p_mdel = msub.add_parser("delete", help="Delete milestone")
+    p_mdel.add_argument("milestone", help="Milestone ID or name")
+    p_mdel.add_argument("--yes", action="store_true", help="Confirm milestone deletion")
+    p_mil.set_defaults(handler=cmd_milestone)
+
+    # 18. view
+    p_vw = sub.add_parser("view", help="Manage named Saved Views")
+    vsub = p_vw.add_subparsers(dest="view_action", required=True)
+    p_vc = vsub.add_parser("create", help="Create a named Saved View")
+    p_vc.add_argument("name", help="Saved view name")
+    p_vc.add_argument("--query", required=True, metavar="IQL", help="Saved iQL or search query")
+    p_vc.add_argument("--tab", metavar="TAB", help="Preset tab")
+    p_vc.add_argument("--sort", metavar="FIELD", help="Sort field")
+    p_vc.add_argument("--order", choices=["asc", "desc"], help="Sort direction")
+    p_vc.add_argument("--swimlane", choices=SWIMLANES, help="Board swimlane")
+    p_vc.add_argument("--desc", metavar="TEXT", help="View description")
+    vsub.add_parser("list", help="List saved views")
+    p_vs = vsub.add_parser("show", help="Show saved view definition")
+    p_vs.add_argument("view", help="View ID (VIEW-1) or name")
+    p_vr = vsub.add_parser("run", help="Execute saved view and return matching issues")
+    p_vr.add_argument("view", help="View ID or name")
+    p_vr.add_argument("--page", type=int, metavar="INT", help="Page number")
+    p_vr.add_argument("--page-size", type=int, metavar="INT", help="Page size")
+    p_ve = vsub.add_parser("edit", help="Edit saved view")
+    p_ve.add_argument("view", help="View ID or name")
+    p_ve.add_argument("--name", metavar="NAME", help="New view name")
+    p_ve.add_argument("--query", metavar="IQL", help="New query")
+    p_ve.add_argument("--tab", metavar="TAB", help="New tab")
+    p_ve.add_argument("--sort", metavar="FIELD", help="New sort field")
+    p_ve.add_argument("--order", choices=["asc", "desc"], help="New sort direction")
+    p_ve.add_argument("--swimlane", choices=SWIMLANES, help="New swimlane")
+    p_ve.add_argument("--desc", metavar="TEXT", help="New description")
+    p_vd = vsub.add_parser("delete", help="Delete saved view")
+    p_vd.add_argument("view", help="View ID or name")
+    p_vd.add_argument("--yes", action="store_true", help="Confirm view deletion")
     p_vw.set_defaults(handler=cmd_view)
 
+    # 19. worklog
+    p_wl = sub.add_parser("worklog", help="Track logged work time on issues")
+    wlsub = p_wl.add_subparsers(dest="worklog_action", required=True)
+    p_wa = wlsub.add_parser("add", help="Log work duration (e.g. '1h 30m', '45m', or '90')")
+    p_wa.add_argument("issue", help="Issue key or exact name")
+    p_wa.add_argument("duration_or_minutes", help="Duration string or integer minutes")
+    p_wa.add_argument("--author", metavar="USER", help="Worklog author")
+    p_wa.add_argument("--note", metavar="TEXT", help="Worklog note")
+    p_wl_list = wlsub.add_parser("list", help="List worklogs and time progress bar")
+    p_wl_list.add_argument("issue", help="Issue key or exact name")
+    p_wd = wlsub.add_parser("delete", help="Delete worklog entry")
+    p_wd.add_argument("issue", help="Issue key or exact name")
+    p_wd.add_argument("worklog_id", help="Worklog ID (e.g. WL-1)")
+    p_wd.add_argument("--yes", action="store_true", help="Confirm worklog deletion")
+    p_wl.set_defaults(handler=cmd_worklog)
+
+    # 20. history
+    p_hist = sub.add_parser("history", help="Show chronological audit trail & field diffs for an issue")
+    p_hist.add_argument("issue", help="Issue key or exact name")
+    p_hist.set_defaults(handler=cmd_history)
+
+    # 21. bulk
+    p_bulk = sub.add_parser("bulk", help="Batch update or delete issues by explicit list or iQL query")
+    bsub = p_bulk.add_subparsers(dest="bulk_action", required=True)
+    p_bu = bsub.add_parser("update", help="Bulk update fields across matching issues")
+    p_bu.add_argument("--issues", nargs="+", action="extend", metavar="CSV_OR_LIST", help="Issue keys or names")
+    p_bu.add_argument("--query", metavar="IQL", help="iQL selector query")
+    p_bu.add_argument("--state", metavar="STATE", help="Set state")
+    p_bu.add_argument("--priority", metavar="PRIO", help="Set priority")
+    p_bu.add_argument("--severity", metavar="SEV", help="Set severity")
+    p_bu.add_argument("--category", metavar="CAT", help="Set category")
+    p_bu.add_argument("--assignee", metavar="USER", help="Set assignee")
+    p_bu.add_argument("--clear-assignee", action="store_true", help="Clear assignee")
+    p_bu.add_argument("--add-tag", nargs="+", action="extend", metavar="TAG", help="Add tag(s)")
+    p_bu.add_argument("--remove-tag", nargs="+", action="extend", metavar="TAG", help="Remove tag(s)")
+    p_bu.add_argument("--sprint", metavar="SPRINT", help="Assign to sprint")
+    p_bu.add_argument("--clear-sprint", action="store_true", help="Clear sprint")
+    p_bu.add_argument("--milestone", metavar="MIL", help="Assign to milestone")
+    p_bu.add_argument("--clear-milestone", action="store_true", help="Clear milestone")
+    p_bu.add_argument("--archive", action="store_true", help="Archive matched issues")
+    p_bu.add_argument("--unarchive", action="store_true", help="Unarchive matched issues")
+
+    p_bd = bsub.add_parser("delete", help="Bulk delete matching issues")
+    p_bd.add_argument("--issues", nargs="+", action="extend", metavar="CSV_OR_LIST", help="Issue keys or names")
+    p_bd.add_argument("--query", metavar="IQL", help="iQL selector query")
+    p_bd.add_argument("--yes", action="store_true", help="Confirm bulk deletion")
+    p_bulk.set_defaults(handler=cmd_bulk)
+
+    # 22. stats
+    sub.add_parser("stats", help="Show workspace analytics, velocity & distributions").set_defaults(handler=cmd_stats)
+
     return parser
+
+
+# ---------------------------------------------------------------------------
+# 100% Drift-Proof Self-Teaching Zero-Arg Manual (Programmatic AST Walk)
+# ---------------------------------------------------------------------------
+
+
+def collect_parser_catalog(parser: argparse.ArgumentParser) -> list[dict[str, Any]]:
+    """Walk `build_parser()` recursively to extract 100% of subcommands, args & flags."""
+    catalog: list[dict[str, Any]] = []
+
+    def _walk(p: argparse.ArgumentParser, prefix: list[str]) -> None:
+        pos_args: list[str] = []
+        opt_entries: list[dict[str, Any]] = []
+        sub_action: argparse._SubParsersAction | None = None
+
+        for act in p._actions:
+            if isinstance(act, argparse._SubParsersAction):
+                sub_action = act
+                continue
+            if act.option_strings:
+                opt_entries.append({
+                    "flags": list(act.option_strings),
+                    "metavar": act.metavar,
+                    "help": act.help or "",
+                    "required": bool(getattr(act, "required", False)),
+                })
+            else:
+                pos_args.append(act.dest)
+
+        cmd_path = " ".join(prefix)
+        catalog.append({
+            "command": cmd_path,
+            "description": p.description or "",
+            "positionals": pos_args,
+            "options": opt_entries,
+            "has_subcommands": sub_action is not None,
+        })
+
+        if sub_action is not None:
+            seen_ids: set[int] = set()
+            for sub_name, sub_parser in sub_action.choices.items():
+                if id(sub_parser) in seen_ids:
+                    continue
+                seen_ids.add(id(sub_parser))
+                _walk(sub_parser, prefix + [sub_name])
+
+    _walk(parser, [])
+    return catalog
+
+
+def generate_manual_markdown(parser: argparse.ArgumentParser, repo_root: Path) -> str:
+    catalog = collect_parser_catalog(parser)
+    lines: list[str] = [
+        f"# itrack v{VERSION} — Complete Self-Teaching Agent & Operator Manual",
+        "",
+        f"- **Repository Root**: `{repo_root}`",
+        f"- **Canonical Storage**: `{repo_root}/itrack-issues/` (Git-tracked folder-per-issue JSON + gitignored `.runtime/` SQLite FTS5 index & daemon state)",
+        "- **Dependencies & Setup**: Install runtime and test dependencies via `pip install -r itrack-requirements.txt`.",
+        "- **Dual Issue Addressing**: Every `<issue>` parameter accepts **either** the immutable key (`ITR-1`) **or** the exact issue folder name with spaces (`\"OAuth2 Token Refresh Race\"`).",
+        "- **Global Position-Independent Flags**: `--json` (pure JSON stdout), `--root <PATH>` (target Git root), `-V` / `--version`, `-h` / `--help`.",
+        "",
+        "## 1. Runnable Quickstart Workflow",
+        "",
+        "```bash",
+        'python itrack.py init --prefix ITR --title "Platform Core"',
+        'python itrack.py tag create security --color "#ef4444" --desc "Security items"',
+        'python itrack.py sprint create "Sprint 1" --goal "Auth hardening" --start 2026-11-01 --end 2026-11-14',
+        "python itrack.py sprint start SPR-1",
+        'python itrack.py milestone create "v2.0" --desc "Major release" --due 2026-12-01',
+        'python itrack.py issue create "OAuth2 Token Refresh Race" --category bug --state todo --priority critical --severity sev1 --desc "Race under concurrent 401s" --ac "Single refresh flight" --tag security --sprint SPR-1 --milestone MIL-1 --points 5 --estimate 120 --due 2026-11-30 --field env=prod',
+        'python itrack.py issue create "Add Retry Backoff Tests" --category subtask --parent ITR-1 --priority high',
+        'python itrack.py issue edit "OAuth2 Token Refresh Race" --state in-progress --assignee alice --check-ac AC-1',
+        'python itrack.py comment add ITR-1 --body "Reproduced race condition under load" --author alice',
+        "python itrack.py link add ITR-1 blocks ITR-2",
+        'python itrack.py worklog add ITR-1 45m --author alice --note "Root cause analysis"',
+        "python itrack.py issue list --tab active",
+        'python itrack.py search "priority = critical AND state != done ORDER BY priority DESC" --iql',
+        "python itrack.py board --swimlane priority",
+        "python itrack.py tree ITR-1",
+        'python itrack.py view create "Critical Active" --query "priority = critical" --tab active',
+        "python itrack.py view run VIEW-1",
+        "python itrack.py issue context ITR-1",
+        "python itrack.py history ITR-1",
+        "python itrack.py stats",
+        "python itrack.py status",
+        "python itrack.py server stop",
+        "```",
+        "",
+        "## 2. Canonical Enums",
+        "",
+        f"- **Categories (13)**: {', '.join(f'`{x}`' for x in CATEGORIES)}",
+        f"- **Workflow States (12)**: {', '.join(f'`{x}`' for x in STATES)} *(spaced inputs like `\"in progress\"` normalize automatically)*",
+        f"- **Priorities (5)**: {', '.join(f'`{x}`' for x in PRIORITIES)}",
+        f"- **Severities (5)**: {', '.join(f'`{x}`' for x in SEVERITIES)}",
+        f"- **Resolutions (6)**: {', '.join(f'`{x}`' for x in RESOLUTIONS)}",
+        f"- **Link Types (6)**: {', '.join(f'`{x}`' for x in LINK_TYPES)}",
+        f"- **Preset Filter Tabs (8)**: {', '.join(f'`{x}`' for x in PRESET_TABS)}",
+        f"- **Kanban Swimlanes (5)**: {', '.join(f'`{x}`' for x in SWIMLANES)}",
+        "",
+        "## 3. iQL (iTrack Query Language) & FTS5 Search",
+        "",
+        "- **Comparison & Match Operators**: `=`, `!=`, `>`, `>=`, `<`, `<=`, `~`, `!~`, `IN`, `NOT IN`, `IS EMPTY`, `IS NOT EMPTY`",
+        "- **Logical & Ordering Clauses**: `AND`, `OR`, `NOT`, `ORDER BY` (`ASC` / `DESC`)",
+        "- **Queryable Fields**: `key`, `name` (`title`), `category` (`type`), `state` (`status`), `priority`, `severity`, `resolution`, `assignee`, `reporter`, `tag` (`tags`), `component` (`components`), `parent`, `sprint`, `milestone`, `points` (`story_points`), `estimate` (`estimate_minutes`), `logged` (`logged_minutes`), `due` (`due_date`), `archived`, `blocked`, `overdue`, `text` (FTS5 across title, description, comments, and attachment names).",
+        "",
+        "## 4. Exit Codes",
+        "",
+    ]
+
+    for code, desc in EXIT_CODE_DOCS.items():
+        lines.append(f"- **`{code}`**: {desc}")
+
+    lines.extend([
+        "",
+        "## 5. Complete CLI Subcommand & Flag Reference",
+        "",
+    ])
+
+    for entry in catalog:
+        cmd = entry["command"]
+        heading = "`python itrack.py` (Global Options)" if not cmd else f"`python itrack.py {cmd}`"
+        pos_str = " ".join(f"<{p}>" for p in entry["positionals"])
+        sig = f"python itrack.py {cmd} {pos_str}".strip() if cmd else "python itrack.py [--json] [--root PATH] [-V|--version] [-h|--help]"
+        lines.append(f"### {heading}")
+        lines.append(f"- Usage: `{sig}`")
+        for opt in entry["options"]:
+            flag_str = ", ".join(f"`{f}`" for f in opt["flags"])
+            req = " *(required)*" if opt["required"] else ""
+            lines.append(f"  - {flag_str}{req}: {opt['help']}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def build_manual_payload(parser: argparse.ArgumentParser, repo_root: Path) -> dict[str, Any]:
+    catalog = collect_parser_catalog(parser)
+    return {
+        "name": "itrack",
+        "version": VERSION,
+        "repo_root": str(repo_root),
+        "setup": "pip install -r itrack-requirements.txt",
+        "enums": {
+            "categories": CATEGORIES,
+            "states": STATES,
+            "priorities": PRIORITIES,
+            "severities": SEVERITIES,
+            "resolutions": RESOLUTIONS,
+            "link_types": LINK_TYPES,
+            "preset_tabs": PRESET_TABS,
+            "swimlanes": SWIMLANES,
+        },
+        "iql_operators": IQL_OPERATORS,
+        "exit_codes": {str(k): v for k, v in EXIT_CODE_DOCS.items()},
+        "commands": [
+            {
+                "command": c["command"],
+                "positionals": c["positionals"],
+                "flags": [f for opt in c["options"] for f in opt["flags"]],
+            }
+            for c in catalog
+        ],
+        "markdown": generate_manual_markdown(parser, repo_root),
+    }
+
+
+def render_zero_arg_manual(parser: argparse.ArgumentParser, repo_root: Path, json_mode: bool) -> None:
+    if json_mode:
+        emit_json(build_manual_payload(parser, repo_root))
+    else:
+        sys.stdout.write(generate_manual_markdown(parser, repo_root))
+        sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 
 
 def main(argv: list[str] | None = None) -> None:
     raw_argv = sys.argv[1:] if argv is None else list(argv)
     prelim_json = "--json" in raw_argv
+    parser = build_parser()
+
     try:
-        json_mode, root_arg, remaining = extract_global_flags(raw_argv)
+        json_mode, root_arg, remaining, cmd_path, used_flags = extract_global_flags_and_surface(raw_argv, parser)
     except CLIError as err:
+        record_cli_surface("", ["--json"] if prelim_json else [])
         handle_cli_error(err, prelim_json)
 
-    # Law 2: Verify Git repository root before doing anything else (exits with code 2 if invalid).
+    record_cli_surface(cmd_path, used_flags)
+
+    # Law 2: Enforce Git repository root (exits 2 if outside Git root or inside subdirectory).
     repo_root = resolve_and_check_git_root(root_arg, json_mode)
 
-    # Law 3: Zero-Arg Agent Manual (or explicit manual/--manual) — never spawns daemon!
-    if not remaining or remaining == ["manual"] or "--manual" in remaining:
-        render_agent_manual(repo_root, json_mode)
+    # Zero-arg manual (does not require init and never spawns daemon).
+    if not remaining:
+        render_zero_arg_manual(parser, repo_root, json_mode)
         return
 
+    # Handle -V / --version prior to subcommand validation & init check.
     if remaining in (["-V"], ["--version"]):
         if json_mode:
             emit_json({"name": "itrack", "version": VERSION})
         else:
-            stdout_console.print(f"itrack {VERSION}")
+            sys.stdout.write(f"itrack {VERSION}\n")
+            sys.stdout.flush()
         return
 
-    parser = build_parser()
     try:
         args = parser.parse_args(remaining)
         if getattr(args, "version", False):
             if json_mode:
                 emit_json({"name": "itrack", "version": VERSION})
             else:
-                stdout_console.print(f"itrack {VERSION}")
-            return
-        if getattr(args, "manual", False) or not getattr(args, "command", None):
-            render_agent_manual(repo_root, json_mode)
+                sys.stdout.write(f"itrack {VERSION}\n")
+                sys.stdout.flush()
             return
 
-        # Normalize `issue move` alias to `transition`
-        if getattr(args, "issue_action", None) == "move":
-            args.issue_action = "transition"
-        if getattr(args, "link_action", None) == "delete":
-            args.link_action = "remove"
+        if not getattr(args, "command", None):
+            render_zero_arg_manual(parser, repo_root, json_mode)
+            return
+
+        # Exit 3 on any command other than zero-arg manual, --help, --version, and init
+        if args.command != "init":
+            ensure_workspace_initialized(repo_root)
 
         handler = getattr(args, "handler", None)
         if handler is None:
-            render_agent_manual(repo_root, json_mode)
+            render_zero_arg_manual(parser, repo_root, json_mode)
             return
         handler(args, repo_root, json_mode)
     except CLIError as err:
