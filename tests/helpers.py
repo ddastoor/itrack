@@ -47,6 +47,10 @@ EXPECTED_ROOT_ENTRIES: set[str] = {
     "itrack-server.py",
     "itrack-requirements.txt",
     "tests",
+    "SPEC.md",
+    "todo.md",
+    "AGENTS.md",
+    ".env.example",
 }
 
 CATEGORIES: list[str] = [

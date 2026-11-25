@@ -173,10 +173,21 @@ def test_law1_clean_repository_root_and_requirements_footprint() -> None:
     assert ITRACK_PY.is_file()
     assert ITRACK_SERVER_PY.is_file()
     assert ITRACK_REQUIREMENTS.is_file()
+    for doc_name in ("SPEC.md", "todo.md", "AGENTS.md", ".env.example"):
+        assert (REPO_ROOT / doc_name).is_file()
     assert not (REPO_ROOT / "requirements.txt").exists()
 
     non_git_entries = set(os.listdir(REPO_ROOT)) - {".git"}
-    assert non_git_entries == {"itrack.py", "itrack-server.py", "itrack-requirements.txt", "tests"}
+    assert non_git_entries == {
+        "itrack.py",
+        "itrack-server.py",
+        "itrack-requirements.txt",
+        "tests",
+        "SPEC.md",
+        "todo.md",
+        "AGENTS.md",
+        ".env.example",
+    }
     assert non_git_entries == EXPECTED_ROOT_ENTRIES
 
     req_lines = [
