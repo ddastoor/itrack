@@ -174,6 +174,13 @@ def parse_issue_refs(items: list[str] | None, repo_root: Path) -> list[str]:
         if "," in raw and not (issues_dir / raw).exists():
             parts = [p.strip() for p in raw.split(",") if p.strip()]
             out.extend(normalize_ref_str(p) for p in parts)
+        elif "," in raw and (issues_dir / raw / "issue.json").is_file():
+            try:
+                iss_obj = json.loads((issues_dir / raw / "issue.json").read_text(encoding="utf-8"))
+                key_val = str(iss_obj.get("key") or "").strip()
+                out.append(key_val.upper() if key_val else normalize_ref_str(raw))
+            except Exception:
+                out.append(normalize_ref_str(raw))
         else:
             val = normalize_ref_str(raw)
             if val.strip():
@@ -250,6 +257,10 @@ def _get_subparsers_map(parser: argparse.ArgumentParser) -> dict[str, argparse.A
     return {}
 
 
+def _is_global_extract_token(tok: str) -> bool:
+    return tok in ("--json", "--root") or tok.startswith("--root=")
+
+
 def extract_global_flags_and_surface(
     argv: list[str],
     root_parser: argparse.ArgumentParser,
@@ -278,7 +289,7 @@ def extract_global_flags_and_surface(
             continue
         if tok == "--root":
             used_flags.add("--root")
-            if i + 1 >= n:
+            if i + 1 >= n or argv[i + 1] == "--" or argv[i + 1] == "--json":
                 raise CLIError("Option '--root' requires a path argument.", "invalid_arguments", 1)
             root_arg = argv[i + 1]
             i += 2
@@ -311,13 +322,12 @@ def extract_global_flags_and_surface(
                 i += 1
                 if "=" not in tok:
                     if action.nargs is None:
-                        # Consume 1 value token (even if it starts with '-' unless it is --json/--root?)
-                        if i < n and argv[i] != "--":
+                        if i < n and argv[i] != "--" and not _is_global_extract_token(argv[i]):
                             remaining.append(argv[i])
                             i += 1
                     elif isinstance(action.nargs, int) and action.nargs > 0:
                         for _ in range(action.nargs):
-                            if i < n and argv[i] != "--":
+                            if i < n and argv[i] != "--" and not _is_global_extract_token(argv[i]):
                                 remaining.append(argv[i])
                                 i += 1
                     elif action.nargs in ("+", "*"):
@@ -650,6 +660,14 @@ def stop_daemon(repo_root: Path) -> dict[str, Any]:
         term_deadline = time.monotonic() + 2.0
         while time.monotonic() < term_deadline and is_pid_alive(pid):
             time.sleep(0.04)
+        if is_pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+            kill_deadline = time.monotonic() + 1.0
+            while time.monotonic() < kill_deadline and is_pid_alive(pid):
+                time.sleep(0.04)
 
     if djson.exists():
         try:
@@ -731,6 +749,12 @@ class ITrackClient:
                 data=data,
                 files=files,
             )
+        except ValueError as exc:
+            raise CLIError(
+                f"Invalid request value: {exc}",
+                error_code="invalid_arguments",
+                exit_code=1,
+            ) from exc
         except httpx.HTTPError as exc:
             raise CLIError(
                 f"Failed communicating with itrack daemon ({self.base_url}): {exc}",
@@ -1107,30 +1131,28 @@ def cmd_init(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None
             if not already_initialized:
                 ts = now_iso()
                 default_cfg = {
-                    "version": VERSION,
                     "project_prefix": prefix_arg or "ITR",
                     "project_title": title_arg or "iTrack Workspace",
                     "default_category": "task",
                     "default_state": "backlog",
                     "default_priority": "medium",
                     "default_severity": "sev3",
+                    "default_assignee": None,
                     "wip_limits": {},
                     "preferences": {
                         "theme": "dark",
                         "default_swimlane": "none",
                         "page_size": 25,
                     },
-                    "sequences": {
-                        "issue": 0,
-                        "comment": 0,
-                        "attachment": 0,
-                        "link": 0,
-                        "worklog": 0,
-                        "history": 0,
-                        "sprint": 0,
-                        "milestone": 0,
-                        "view": 0,
-                    },
+                    "next_issue_seq": 1,
+                    "next_att_seq": 1,
+                    "next_comment_seq": 1,
+                    "next_link_seq": 1,
+                    "next_worklog_seq": 1,
+                    "next_history_seq": 1,
+                    "next_sprint_seq": 1,
+                    "next_milestone_seq": 1,
+                    "next_view_seq": 1,
                     "created_at": ts,
                     "updated_at": ts,
                 }
@@ -1321,6 +1343,9 @@ def cmd_ui(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
         signal.signal(signal.SIGINT, signal.default_int_handler)
         stop_daemon(repo_root)
         server_script = locate_server_script()
+        rdir = get_runtime_dir(repo_root)
+        rdir.mkdir(parents=True, exist_ok=True)
+        log_path = get_daemon_log_path(repo_root)
         cmd = [
             sys.executable,
             str(server_script),
@@ -1331,7 +1356,8 @@ def cmd_ui(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
             "--port",
             str(args.port),
         ]
-        proc = subprocess.Popen(cmd, cwd=str(repo_root), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(log_path, "a", encoding="utf-8") as log_f:
+            proc = subprocess.Popen(cmd, cwd=str(repo_root), stdout=log_f, stderr=log_f)
         try:
             deadline = time.monotonic() + 12.0
             probed = None
@@ -1340,10 +1366,18 @@ def cmd_ui(args: argparse.Namespace, repo_root: Path, json_mode: bool) -> None:
                 if probed is not None:
                     break
                 if proc.poll() is not None:
-                    raise CLIError("Foreground server exited prematurely.", "daemon_spawn_failed", 1)
+                    tail = read_log_tail(repo_root, 25)
+                    msg = "Foreground server exited prematurely."
+                    if tail:
+                        msg = f"{msg}\n{tail}"
+                    raise CLIError(msg, "daemon_spawn_failed", 1)
                 time.sleep(0.05)
             if probed is None:
-                raise CLIError("Timed out starting foreground UI server.", "daemon_timeout", 3)
+                tail = read_log_tail(repo_root, 25)
+                msg = "Timed out starting foreground UI server."
+                if tail:
+                    msg = f"{msg}\n{tail}"
+                raise CLIError(msg, "daemon_timeout", 3)
             base_url, health = probed
             opened = False
             if not args.no_browser:
@@ -3571,39 +3605,40 @@ def render_zero_arg_manual(parser: argparse.ArgumentParser, repo_root: Path, jso
 # ---------------------------------------------------------------------------
 
 
+def _silence_broken_pipe() -> None:
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        os.close(devnull)
+    except OSError:
+        pass
+
+
 def main(argv: list[str] | None = None) -> None:
     raw_argv = sys.argv[1:] if argv is None else list(argv)
-    prelim_json = "--json" in raw_argv
+    pre_dd = raw_argv[: raw_argv.index("--")] if "--" in raw_argv else raw_argv
+    prelim_json = "--json" in pre_dd
     parser = build_parser()
 
     try:
-        json_mode, root_arg, remaining, cmd_path, used_flags = extract_global_flags_and_surface(raw_argv, parser)
-    except CLIError as err:
-        record_cli_surface("", ["--json"] if prelim_json else [])
-        handle_cli_error(err, prelim_json)
+        try:
+            json_mode, root_arg, remaining, cmd_path, used_flags = extract_global_flags_and_surface(raw_argv, parser)
+        except CLIError as err:
+            record_cli_surface("", ["--json"] if prelim_json else [])
+            handle_cli_error(err, prelim_json)
 
-    record_cli_surface(cmd_path, used_flags)
+        record_cli_surface(cmd_path, used_flags)
 
-    # Law 2: Enforce Git repository root (exits 2 if outside Git root or inside subdirectory).
-    repo_root = resolve_and_check_git_root(root_arg, json_mode)
+        # Law 2: Enforce Git repository root (exits 2 if outside Git root or inside subdirectory).
+        repo_root = resolve_and_check_git_root(root_arg, json_mode)
 
-    # Zero-arg manual (does not require init and never spawns daemon).
-    if not remaining:
-        render_zero_arg_manual(parser, repo_root, json_mode)
-        return
+        # Zero-arg manual (does not require init and never spawns daemon).
+        if not remaining:
+            render_zero_arg_manual(parser, repo_root, json_mode)
+            return
 
-    # Handle -V / --version prior to subcommand validation & init check.
-    if remaining in (["-V"], ["--version"]):
-        if json_mode:
-            emit_json({"name": "itrack", "version": VERSION})
-        else:
-            sys.stdout.write(f"itrack {VERSION}\n")
-            sys.stdout.flush()
-        return
-
-    try:
-        args = parser.parse_args(remaining)
-        if getattr(args, "version", False):
+        # Handle -V / --version prior to subcommand validation & init check.
+        if remaining in (["-V"], ["--version"]):
             if json_mode:
                 emit_json({"name": "itrack", "version": VERSION})
             else:
@@ -3611,21 +3646,34 @@ def main(argv: list[str] | None = None) -> None:
                 sys.stdout.flush()
             return
 
-        if not getattr(args, "command", None):
-            render_zero_arg_manual(parser, repo_root, json_mode)
-            return
+        try:
+            args = parser.parse_args(remaining)
+            if getattr(args, "version", False):
+                if json_mode:
+                    emit_json({"name": "itrack", "version": VERSION})
+                else:
+                    sys.stdout.write(f"itrack {VERSION}\n")
+                    sys.stdout.flush()
+                return
 
-        # Exit 3 on any command other than zero-arg manual, --help, --version, and init
-        if args.command != "init":
-            ensure_workspace_initialized(repo_root)
+            if not getattr(args, "command", None):
+                render_zero_arg_manual(parser, repo_root, json_mode)
+                return
 
-        handler = getattr(args, "handler", None)
-        if handler is None:
-            render_zero_arg_manual(parser, repo_root, json_mode)
-            return
-        handler(args, repo_root, json_mode)
-    except CLIError as err:
-        handle_cli_error(err, json_mode)
+            # Exit 3 on any command other than zero-arg manual, --help, --version, and init
+            if args.command != "init":
+                ensure_workspace_initialized(repo_root)
+
+            handler = getattr(args, "handler", None)
+            if handler is None:
+                render_zero_arg_manual(parser, repo_root, json_mode)
+                return
+            handler(args, repo_root, json_mode)
+        except CLIError as err:
+            handle_cli_error(err, json_mode)
+    except BrokenPipeError:
+        _silence_broken_pipe()
+        return
 
 
 if __name__ == "__main__":

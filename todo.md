@@ -8,12 +8,12 @@
 - **Repository**: `ddastoor/itrack` (`https://github.com/ddastoor/itrack`)
 - **Active Branch**: `main` (tracking `origin/main`)
 - **Version**: `2.0.0` (`itrack.py:31`, `itrack-server.py:51`)
-- **Clean-Root Repository Footprint (8 Allowed Entries)**:
+- **Clean-Root Repository Footprint (7 Allowed Entries)**:
   - `itrack.py` (`3,632` lines / `159,547` B) — Git-rooted CLI client, Rich TUI renderer, flock-guarded auto-daemon spawner & programmatic zero-arg manual generator.
   - `itrack-server.py` (`8,767` lines / `411,736` B) — Per-repository FastAPI/Uvicorn local HTTP daemon, canonical folder-per-issue JSON storage engine, SQLite + FTS5 + iQL compiler/query engine & self-contained zero-CDN single-page Web UI (`SPA_HTML`).
   - `itrack-requirements.txt` (`9` lines / `149` B) — Runtime (`fastapi`, `uvicorn`, `pydantic`, `python-multipart`, `httpx`, `rich`) and verification (`pytest`, `coverage`, `playwright`) dependencies.
   - `tests/` (`12` files / `15,185` lines / `88` test functions) — `conftest.py`, `helpers.py`, `run_all.py`, and suites `test_01` through `test_09`.
-  - `SPEC.md`, `todo.md`, `AGENTS.md`, `.env.example` — Cloud-to-Local handoff specification, execution roadmap, agent rules & environment variable reference.
+  - `SPEC.md`, `todo.md`, `.env.example` — Cloud-to-Local handoff specification, execution roadmap & environment variable reference.
 
 ### Recent Git Commit History (`main`)
 - `HEAD` (handoff commit) — `docs(handoff): add SPEC.md, todo.md, AGENTS.md, .env.example and allowlist in Law 1`
@@ -52,7 +52,7 @@ Execute these steps in order on your local Linux or macOS machine immediately af
   git status --short --branch
   ls -la
   ```
-  Verify the directory contains **strictly** `.git`, `.env.example`, `AGENTS.md`, `SPEC.md`, `itrack-requirements.txt`, `itrack-server.py`, `itrack.py`, `tests`, and `todo.md`.
+  Verify the directory contains **strictly** `.git`, `.env.example`, `SPEC.md`, `itrack-requirements.txt`, `itrack-server.py`, `itrack.py`, `tests`, and `todo.md`.
 
 - [ ] **Step 0.2 — Create an EXTERNAL Python 3.12+ Virtual Environment & Disable Bytecode**:
   > **CRITICAL (Law 1 Clean-Root)**: Do **NOT** create `.venv` or `venv` inside `./itrack`! `assert_clean_repo_root()` (`tests/helpers.py:228-261`) fails immediately if any unlisted directory or `__pycache__` exists inside the repository root or `tests/`.
@@ -82,10 +82,7 @@ Execute these steps in order on your local Linux or macOS machine immediately af
   ```
   All environment variables (`ITRACK_ROOT`, `ITRACK_USER`, `ITRACK_AGENT`, `ITRACK_SERVER_SCRIPT`, `ITRACK_SURFACE_LOG`) are **optional** and have automatic local defaults. Do **not** create an un-allowlisted `.env` file inside the `itrack` repository root; export variables in your shell profile if desired.
 
-- [ ] **Step 0.6 — *(Optional)* Install Global `/swarm` Rules for Local Antigravity Desktop**:
-  On the Cloud VM, universal `/swarm` orchestration lived in `~/.gemini/GEMINI.md` and `~/.gemini/skills/swarm/SKILL.md` (outside Git). If using Antigravity locally and you want `/swarm` active across all projects globally, copy the rules documented in `AGENTS.md` into `~/.gemini/GEMINI.md` and `~/.gemini/skills/swarm/SKILL.md`.
-
-- [ ] **Step 0.7 — Run the Master Verification Suite (`tests/run_all.py`)**:
+- [ ] **Step 0.6 — Run the Master Verification Suite (`tests/run_all.py`)**:
   - **On Linux**: Run the full 3-stage parallel suite + `>=95%` Python coverage gate + `100%` CLI/API/UI surface gate (add `--serial` on `<=2`-vCPU machines):
     ```bash
     PYTHONDONTWRITEBYTECODE=1 python3 -B tests/run_all.py --all
@@ -95,7 +92,7 @@ Execute these steps in order on your local Linux or macOS machine immediately af
     PYTHONDONTWRITEBYTECODE=1 python3 -B tests/run_all.py --suite 01,02,03,04,05,06,07,08 --no-coverage-gate
     ```
 
-- [ ] **Step 0.8 — Smoke-Test CLI & Offline Web UI in an External Sandbox Git Repo**:
+- [ ] **Step 0.7 — Smoke-Test CLI & Offline Web UI in an External Sandbox Git Repo**:
   > **CRITICAL**: Never run `python3 -B itrack.py init` inside the `itrack` source repository itself, because creating `./itrack/itrack-issues/` violates `FORBIDDEN_ARTIFACT_NAMES` / `EXPECTED_ROOT_ENTRIES` (`tests/helpers.py:45-54, 214`). Always target a separate Git repo:
   ```bash
   mkdir -p /tmp/itrack-demo && git -C /tmp/itrack-demo init -q
@@ -262,7 +259,7 @@ All backend storage methods, REST endpoints, iQL operators, and CLI commands are
 ## 7. Architectural Decisions, Constraints & "Do Not Repeat" Log
 
 1. **Law 1 — Strict Clean-Root Allowlist (`tests/helpers.py:45-54`, `tests/test_01_guardrails_config_server_and_manual.py:180-191`)**:
-   - `assert_clean_repo_root()` (`tests/helpers.py:228-261`) asserts that `set(os.listdir(REPO_ROOT)) - {".git"}` equals **strictly** `EXPECTED_ROOT_ENTRIES` (`{"itrack.py", "itrack-server.py", "itrack-requirements.txt", "tests", "SPEC.md", "todo.md", "AGENTS.md", ".env.example"}`) and walks `tests/` to reject `__pycache__`, `.pytest_cache`, `.coverage*`, `.pyc`, `itrack-issues`, `requirements.txt`, `pyproject.toml`, `pytest.ini`, and `setup.cfg`.
+   - `assert_clean_repo_root()` (`tests/helpers.py:228-261`) asserts that `set(os.listdir(REPO_ROOT)) - {".git"}` equals **strictly** `EXPECTED_ROOT_ENTRIES` (`{"itrack.py", "itrack-server.py", "itrack-requirements.txt", "tests", "SPEC.md", "todo.md", ".env.example"}`) and walks `tests/` to reject `__pycache__`, `.pytest_cache`, `.coverage*`, `.pyc`, `itrack-issues`, `requirements.txt`, `pyproject.toml`, `pytest.ini`, and `setup.cfg`.
    - **Do Not Repeat**: Never create `.venv` inside the repo, never rename `itrack-requirements.txt` to `requirements.txt` (`test_01:178, 1029`), never run `itrack.py init` against the `itrack` repo itself, and always run Python/pytest with `PYTHONDONTWRITEBYTECODE=1` and `-B`.
 
 2. **Law 2 — Git-Root Pre-Flight & Exit Code `2` Exclusivity (`itrack.py:391-427`, `itrack.py:2926-2930`)**:

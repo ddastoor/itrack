@@ -49,7 +49,7 @@ def _assert_browser_clean(session: LiveUISession) -> None:
     assert session.external_requests == [], f"Unexpected external CDN requests: {session.external_requests}"
 
 
-_FETCH_IDLE_SCRIPT = """() => {
+_FETCH_IDLE_SCRIPT = """(() => {
     if (window.__itrackFetchWrapped) return;
     window.__itrackFetchWrapped = true;
     window.__itrackInFlight = 0;
@@ -81,7 +81,7 @@ _FETCH_IDLE_SCRIPT = """() => {
             setTimeout(() => { window.__itrackInFlight--; }, 0);
         }
     };
-}"""
+})()"""
 
 
 def _install_fetch_idle_tracker(session: LiveUISession) -> None:

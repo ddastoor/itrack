@@ -49,7 +49,6 @@ EXPECTED_ROOT_ENTRIES: set[str] = {
     "tests",
     "SPEC.md",
     "todo.md",
-    "AGENTS.md",
     ".env.example",
 }
 
@@ -341,6 +340,55 @@ def create_git_worktree(
     return wt
 
 
+def _read_ps_process_table() -> list[tuple[int, str, str]]:
+    """POSIX / macOS fallback process listing via `ps -axww -o pid=,stat=,command=` (untruncated)."""
+    ps_env = {k: v for k, v in os.environ.items() if k != "COLUMNS"}
+    try:
+        proc = subprocess.run(
+            ["ps", "-axww", "-o", "pid=,stat=,command="],
+            capture_output=True,
+            text=True,
+            env=ps_env,
+            timeout=5.0,
+            check=False,
+        )
+    except OSError:
+        return []
+    if proc.returncode != 0 or not proc.stdout:
+        return []
+
+    rows: list[tuple[int, str, str]] = []
+    for raw_line in proc.stdout.splitlines():
+        parts = raw_line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid_s, stat_s, cmd_s = parts[0], parts[1], parts[2]
+        if not pid_s.isdigit():
+            continue
+        rows.append((int(pid_s), stat_s, cmd_s))
+    return rows
+
+
+def _extract_server_args_from_ps_command(cmd_s: str) -> tuple[list[str], str | None, int]:
+    """Extract argv-like tokens, `--root` (preserving spaces), and `--port` from a `ps` command line."""
+    root_arg: str | None = None
+    port_arg: int = 0
+    m_eq = re.search(r"(?:^|\s)--root=(.+?)(?=\s+--(host|port|init)\b|$)", cmd_s)
+    if m_eq:
+        root_arg = m_eq.group(1).strip()
+    else:
+        m_sp = re.search(r"(?:^|\s)--root\s+(.+?)(?=\s+--(host|port|init)\b|$)", cmd_s)
+        if m_sp:
+            root_arg = m_sp.group(1).strip()
+    m_port = re.search(r"(?:^|\s)--port(?:=|\s+)(\d+)\b", cmd_s)
+    if m_port:
+        try:
+            port_arg = int(m_port.group(1))
+        except ValueError:
+            port_arg = 0
+    return cmd_s.split(), root_arg, port_arg
+
+
 def _is_pid_running(pid: int) -> bool:
     """Return True if pid is alive and not a zombie ('Z') process."""
     if pid <= 0:
@@ -352,17 +400,24 @@ def _is_pid_running(pid: int) -> bool:
     except PermissionError:
         return True
 
-    stat_path = Path(f"/proc/{pid}/stat")
-    if stat_path.exists():
-        try:
-            raw = stat_path.read_text(encoding="utf-8", errors="replace")
-            rparen = raw.rfind(")")
-            if rparen != -1:
-                fields = raw[rparen + 2 :].split()
-                if fields and fields[0] == "Z":
-                    return False
-        except OSError:
-            return False
+    proc_root = Path("/proc")
+    if proc_root.exists():
+        stat_path = proc_root / str(pid) / "stat"
+        if stat_path.exists():
+            try:
+                raw = stat_path.read_text(encoding="utf-8", errors="replace")
+                rparen = raw.rfind(")")
+                if rparen != -1:
+                    fields = raw[rparen + 2 :].split()
+                    if fields and fields[0].upper().startswith("Z"):
+                        return False
+            except OSError:
+                return False
+        return True
+
+    for row_pid, stat_s, _cmd_s in _read_ps_process_table():
+        if row_pid == pid:
+            return not stat_s.upper().startswith("Z")
     return True
 
 
@@ -374,8 +429,29 @@ def _is_port_open(host: str, port: int) -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
+def _root_matches_prefix(
+    root_arg: str | None,
+    prefix_str: str | None,
+    prefix_resolved: str | None,
+) -> bool:
+    if prefix_str is None:
+        return True
+    if not root_arg:
+        return False
+    try:
+        root_resolved = str(Path(root_arg).resolve())
+    except OSError:
+        root_resolved = root_arg
+    return bool(
+        root_arg.startswith(prefix_str)
+        or (prefix_resolved and root_arg.startswith(prefix_resolved))
+        or root_resolved.startswith(prefix_str)
+        or (prefix_resolved and root_resolved.startswith(prefix_resolved))
+    )
+
+
 def find_itrack_daemons(tmp_prefix: str | Path | None = None) -> list[dict[str, Any]]:
-    """Scan /proc for running itrack-server.py processes (optionally scoped to tmp_prefix)."""
+    """Scan /proc (or POSIX `ps` fallback on macOS) for running itrack-server.py processes."""
     my_pid = os.getpid()
     prefix_str: str | None = None
     prefix_resolved: str | None = None
@@ -389,6 +465,24 @@ def find_itrack_daemons(tmp_prefix: str | Path | None = None) -> list[dict[str, 
     results: list[dict[str, Any]] = []
     proc_root = Path("/proc")
     if not proc_root.exists():
+        for pid, stat_s, cmd_s in _read_ps_process_table():
+            if pid == my_pid or stat_s.upper().startswith("Z"):
+                continue
+            if "itrack-server.py" not in cmd_s:
+                continue
+            argv, root_arg, port_arg = _extract_server_args_from_ps_command(cmd_s)
+            if not _root_matches_prefix(root_arg, prefix_str, prefix_resolved):
+                continue
+            if not _is_pid_running(pid):
+                continue
+            results.append(
+                {
+                    "pid": pid,
+                    "argv": argv,
+                    "repo_root": root_arg,
+                    "port": port_arg,
+                }
+            )
         return results
 
     for entry in proc_root.iterdir():
@@ -409,8 +503,8 @@ def find_itrack_daemons(tmp_prefix: str | Path | None = None) -> list[dict[str, 
         if not _is_pid_running(pid):
             continue
 
-        root_arg: str | None = None
-        port_arg: int = 0
+        root_arg = None
+        port_arg = 0
         for idx, tok in enumerate(argv):
             if tok == "--root" and idx + 1 < len(argv):
                 root_arg = argv[idx + 1]
@@ -422,22 +516,8 @@ def find_itrack_daemons(tmp_prefix: str | Path | None = None) -> list[dict[str, 
                 except ValueError:
                     pass
 
-        if prefix_str is not None:
-            matched = False
-            if root_arg:
-                try:
-                    root_resolved = str(Path(root_arg).resolve())
-                except OSError:
-                    root_resolved = root_arg
-                if (
-                    root_arg.startswith(prefix_str)
-                    or (prefix_resolved and root_arg.startswith(prefix_resolved))
-                    or root_resolved.startswith(prefix_str)
-                    or (prefix_resolved and root_resolved.startswith(prefix_resolved))
-                ):
-                    matched = True
-            if not matched:
-                continue
+        if not _root_matches_prefix(root_arg, prefix_str, prefix_resolved):
+            continue
 
         results.append(
             {
@@ -451,11 +531,27 @@ def find_itrack_daemons(tmp_prefix: str | Path | None = None) -> list[dict[str, 
 
 
 def find_headless_browsers() -> list[dict[str, Any]]:
-    """Scan /proc for running headless Chromium / Playwright browser processes."""
+    """Scan /proc (or POSIX `ps` fallback on macOS) for running headless Chromium / Playwright browser processes."""
     my_pid = os.getpid()
     found: list[dict[str, Any]] = []
     proc_root = Path("/proc")
     if not proc_root.exists():
+        for pid, stat_s, cmd_s in _read_ps_process_table():
+            if pid == my_pid or stat_s.upper().startswith("Z"):
+                continue
+            low = cmd_s.lower()
+            if (
+                (
+                    "chromium" in low
+                    or "headless_shell" in low
+                    or "chrome-linux" in low
+                    or "chrome-mac" in low
+                    or "chrome for testing" in low
+                )
+                and "--headless" in low
+                and _is_pid_running(pid)
+            ):
+                found.append({"pid": pid, "argv": cmd_s.split()})
         return found
 
     for entry in proc_root.iterdir():
@@ -472,9 +568,16 @@ def find_headless_browsers() -> list[dict[str, Any]]:
             continue
         argv = [part.decode("utf-8", errors="replace") for part in cmdline_bytes.split(b"\x00") if part]
         joined = " ".join(argv)
+        low = joined.lower()
         if (
-            ("chromium" in joined or "headless_shell" in joined or "chrome-linux" in joined)
-            and "--headless" in joined
+            (
+                "chromium" in low
+                or "headless_shell" in low
+                or "chrome-linux" in low
+                or "chrome-mac" in low
+                or "chrome for testing" in low
+            )
+            and "--headless" in low
             and _is_pid_running(pid)
         ):
             found.append({"pid": pid, "argv": argv})

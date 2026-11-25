@@ -9,7 +9,7 @@
 **iTrack** (`v2.0.0`) is a **Git-rooted, local-first, air-gapped issue tracker, Agile project management suite, and AI-agent collaboration engine** designed to store canonical project state directly inside a target Git repository's working tree (`<target-git-root>/itrack-issues/`) while serving fast, concurrent queries and a rich zero-CDN offline Web UI from a self-healing per-repository background daemon.
 
 ### 1.1 Core Architectural Laws & Design Goals
-1. **Law 1 — Clean Repository Root:** The iTrack codebase root contains strictly its allowed source, specification, and test entries (`itrack.py`, `itrack-server.py`, `itrack-requirements.txt`, `tests`, `SPEC.md`, `todo.md`, `AGENTS.md`, `.env.example`), with zero stray caches (`__pycache__`, `.pytest_cache`, `.coverage`), build metadata, or test workspace directories (`tests/helpers.py`, `L45–54`, `L208–262`).
+1. **Law 1 — Clean Repository Root:** The iTrack codebase root contains strictly its allowed source, specification, and test entries (`itrack.py`, `itrack-server.py`, `itrack-requirements.txt`, `tests`, `SPEC.md`, `todo.md`, `.env.example`), with zero stray caches (`__pycache__`, `.pytest_cache`, `.coverage`), build metadata, or test workspace directories (`tests/helpers.py`, `L45–54`, `L208–262`).
 2. **Law 2 — Strict Git-Root Execution Boundary:** Both `itrack.py` (`resolve_and_check_git_root`, `L391–427`) and `itrack-server.py` (`check_and_resolve_git_root`, `L395–440`) enforce that the target workspace directory is a valid Git repository root (supporting standard `.git/` directories, Git worktree `.git` files, and symlinks pointing directly to a Git root). Invoking either executable outside a Git repository or inside a Git subdirectory immediately aborts with **exit code `2`** (emitting a `git rev-parse --show-toplevel` directory hint when inside a subdirectory) without creating files or spawning processes.
 3. **Folder-Per-Issue Human-Readable Persistence:** Every issue is stored as an exact, human-readable directory `<target-git-root>/itrack-issues/issues/<Exact Issue Name>/` preserving spaces, punctuation, and Unicode characters verbatim (`itrack-server.py`, `L240–256`, `L2863`). Renaming an issue atomically renames its on-disk folder (`os.replace`, including two-hop case-only renames on case-insensitive filesystems) while preserving its immutable sequential key (`ITR-1`, `ITR-2`, ...) and updating cached link names across peer issues (`itrack-server.py`, `L2930–3004`).
 4. **Dual Issue Addressing Everywhere:** Every CLI command, REST API route (`{issue_ref}`), and Web UI permalink accepts **either** the immutable key (`ITR-1`, `itr-1`, `#ITR-1`) **or** the exact issue folder name with spaces (`"OAuth2 Token Refresh Race Condition"`) (`itrack-server.py`, `L1903–1941`; `itrack.py`, `L133–144`).
@@ -49,12 +49,11 @@
 ## 3. Annotated Repository Map
 
 ### 3.1 Codebase Repository Layout (`itrack/`)
-Per **Clean-Root Law** (`EXPECTED_ROOT_ENTRIES` in `tests/helpers.py`), the repository root contains strictly the following 8 top-level entries (excluding `.git/`):
+Per **Clean-Root Law** (`EXPECTED_ROOT_ENTRIES` in `tests/helpers.py`), the repository root contains strictly the following 7 top-level entries (excluding `.git/`):
 
 ```text
 itrack/
 ├── .env.example                                                     # Documented environment variables template (no secrets required)
-├── AGENTS.md                                                        # Operational guide, architecture invariants & /swarm rules for AI agents
 ├── SPEC.md                                                          # This exhaustive technical specification & verification baseline
 ├── todo.md                                                          # Prioritized engineering roadmap & backlog
 ├── itrack.py                                                        # (3,632 lines) Git-rooted CLI, Rich TUI, auto-daemon spawner & zero-arg manual
@@ -647,7 +646,7 @@ When `ITRACK_SURFACE_LOG` is set to a file path, `itrack.py`, `itrack-server.py`
 
 | Subsystem / Feature | Status | Primary Implementation Locations | Ground-Truth Details & As-Is Caveats |
 |---|---|---|---|
-| **Law 1: Clean-Root Guardrail** | `Implemented & Verified` | `tests/helpers.py` (`L45–54`, `L208–262`), `test_01` (`L169`) | Enforces exact root allowlist (`itrack.py`, `itrack-server.py`, `itrack-requirements.txt`, `tests`, `SPEC.md`, `todo.md`, `AGENTS.md`, `.env.example`) and zero `__pycache__`/`.pyc`/`.coverage` artifacts. |
+| **Law 1: Clean-Root Guardrail** | `Implemented & Verified` | `tests/helpers.py` (`L45–54`, `L208–262`), `test_01` (`L169`) | Enforces exact root allowlist (`itrack.py`, `itrack-server.py`, `itrack-requirements.txt`, `tests`, `SPEC.md`, `todo.md`, `.env.example`) and zero `__pycache__`/`.pyc`/`.coverage` artifacts. |
 | **Law 2: Git-Root & Worktree Pre-Flight** | `Implemented & Verified` | `itrack.py` (`L370–427`), `itrack-server.py` (`L395–440`) | Accepts `.git/` dir, `.git` worktree file, and symlinks to Git roots; rejects non-Git dirs and Git subdirectories with exit code `2` + `toplevel` hint. |
 | **Workspace Initialization & Config** | `Implemented & Verified` | `itrack.py` (`L1063–1252`), `itrack-server.py` (`L491–549`, `L2077–2202`) | Idempotent `init`, `config show`/`set`, WIP limits, preferences. *Nuance:* `itrack.py init` writes `"version"` and vestigial `"sequences"` dict (`L1110–1133`), whereas `StorageEngine` uses `next_*_seq` keys (`L463–471`). |
 | **Auto-Spawning Per-Repo Daemon & Socket** | `Implemented & Verified` | `itrack.py` (`L486–666`), `itrack-server.py` (`L4896–4921`, `L8736–8764`) | Pre-bound `AF_INET` ephemeral port `0`, `daemon-spawn.lock` stampede guard, `/api/v1/shutdown` + `SIGTERM` stop, stale dead-PID recovery. *Nuance:* `AF_INET` is IPv4-only (`--host ::` fails `bind()`). |
@@ -712,7 +711,7 @@ No `.env` file is auto-loaded by Python (`python-dotenv` is not used); environme
 
 ### 10.1 Prerequisites & Clean-Root External Virtualenv Setup
 > **CRITICAL — Do NOT Create `.venv` Inside the `itrack` Repository!**
-> `assert_clean_repo_root()` (`tests/helpers.py`, `L228–239`) strictly enforces that the repository root contains **only** the 8 allowed files/directories (`itrack.py`, `itrack-server.py`, `itrack-requirements.txt`, `tests`, `SPEC.md`, `todo.md`, `AGENTS.md`, `.env.example`). Creating `.venv/`, `venv/`, or `__pycache__/` inside the repository root will immediately fail `test_01` and `tests/run_all.py`! Always place your Python virtual environment **outside** the repository (for example, `~/.venvs/itrack`).
+> `assert_clean_repo_root()` (`tests/helpers.py`, `L228–239`) strictly enforces that the repository root contains **only** the 7 allowed files/directories (`itrack.py`, `itrack-server.py`, `itrack-requirements.txt`, `tests`, `SPEC.md`, `todo.md`, `.env.example`). Creating `.venv/`, `venv/`, or `__pycache__/` inside the repository root will immediately fail `test_01` and `tests/run_all.py`! Always place your Python virtual environment **outside** the repository (for example, `~/.venvs/itrack`).
 
 ```bash
 # 1. Clone repository and enter root
@@ -772,7 +771,6 @@ PYTHONDONTWRITEBYTECODE=1 ~/.venvs/itrack/bin/python -B tests/run_all.py --all
    - `itrack.py` and `itrack-server.py` use only cross-platform POSIX APIs (`fcntl.flock`, `os.kill(pid, 0)`, `AF_INET` sockets, `sqlite3`) and run identically on **Linux** and **macOS**.
    - However, in the test harness (`tests/helpers.py`), `find_itrack_daemons()` (`L377–450`), `find_headless_browsers()` (`L453–481`), and zombie detection in `_is_pid_running()` (`L355–366`) inspect Linux `/proc/<pid>/cmdline` and `/proc/<pid>/stat`. On macOS (`/proc` absent), `find_itrack_daemons()` and `find_headless_browsers()` safely return `[]`, and `cleanup_repo_daemon()` still cleanly terminates workspace daemons via `.runtime/daemon.json` + `/api/v1/shutdown` + `SIGTERM`; however, untracked orphan-process detection in `tests/run_all.py` (`L840–855`) is a no-op on macOS until a `ps -axo pid=,command=` fallback is added (tracked in `todo.md`).
 3. **Desktop Browser Launch vs Headless Cloud VM:** On the cloud Linux VM, Playwright drives headless Chromium directly (`itrack.py ui --no-browser`). On a local macOS/Linux desktop with a GUI session, `python -B itrack.py ui` invokes Python's `webbrowser.open("http://127.0.0.1:<port>")` (`itrack.py`, `L1378`) to open your default browser automatically.
-4. **User-Global Agent Workflow Files (`~/.gemini/`):** Any global Antigravity agent rules (`~/.gemini/GEMINI.md` and `~/.gemini/skills/swarm/SKILL.md`) reside in the VM's home directory outside the Git repository; see `AGENTS.md` for local agent workflow conventions.
 
 ### 10.5 Exact Handoff Verification Baseline
 

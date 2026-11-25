@@ -477,10 +477,18 @@ def default_config_dict(prefix: str = "ITR", title: str = "iTrack Workspace") ->
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.parent / f".{path.name}.{os.getpid()}.{threading.get_ident()}.{short_id()}.tmp"
-    with open(tmp, "wb") as f:
-        f.write(data)
-        f.flush()
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            # Power-loss durability: persist file bytes to stable storage before the atomic rename.
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        # Never leave orphaned `.tmp` remnants behind on write/fsync/rename failure.
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
 
 
 def _atomic_write_json_standalone(path: Path, obj: Any) -> None:
@@ -5486,11 +5494,26 @@ SPA_HTML = r"""<!DOCTYPE html>
       --text-main: #f1f5f9;
       --text-muted: #94a3b8;
       --border: #293548;
-      --accent: #3b82f6;
-      --accent-hover: #2563eb;
-      --danger: #ef4444;
-      --success: #10b981;
-      --warning: #f59e0b;
+      --accent: #1d4ed8;
+      --accent-hover: #1e40af;
+      --link: #60a5fa;
+      --danger: #b91c1c;
+      --success: #34d399;
+      --warning: #fbbf24;
+      --badge-overdue-bg: #450a0a;
+      --badge-overdue-fg: #fecaca;
+      --badge-overdue-border: #ef4444;
+      --badge-blocked-bg: #451a03;
+      --badge-blocked-fg: #fde68a;
+      --badge-blocked-border: #f59e0b;
+      --badge-done-bg: #064e3b;
+      --badge-done-fg: #a7f3d0;
+      --badge-done-border: #10b981;
+      --prio-critical-fg: #fca5a5;
+      --prio-high-fg: #fdba74;
+      --prio-medium-fg: #93c5fd;
+      --prio-low-fg: #6ee7b7;
+      --prio-trivial-fg: #cbd5e1;
       --shadow: 0 10px 30px rgba(0,0,0,0.45);
     }
     [data-theme="light"] {
@@ -5502,14 +5525,37 @@ SPA_HTML = r"""<!DOCTYPE html>
       --text-main: #0f172a;
       --text-muted: #475569;
       --border: #cbd5e1;
-      --accent: #2563eb;
-      --accent-hover: #1d4ed8;
-      --danger: #dc2626;
-      --success: #059669;
-      --warning: #d97706;
+      --accent: #1d4ed8;
+      --accent-hover: #1e3a8a;
+      --link: #1d4ed8;
+      --danger: #b91c1c;
+      --success: #047857;
+      --warning: #b45309;
+      --badge-overdue-bg: #fee2e2;
+      --badge-overdue-fg: #991b1b;
+      --badge-overdue-border: #dc2626;
+      --badge-blocked-bg: #fef3c7;
+      --badge-blocked-fg: #92400e;
+      --badge-blocked-border: #d97706;
+      --badge-done-bg: #d1fae5;
+      --badge-done-fg: #065f46;
+      --badge-done-border: #059669;
+      --prio-critical-fg: #b91c1c;
+      --prio-high-fg: #9a3412;
+      --prio-medium-fg: #1d4ed8;
+      --prio-low-fg: #065f46;
+      --prio-trivial-fg: #334155;
       --shadow: 0 10px 25px rgba(15,23,42,0.12);
     }
     * { box-sizing: border-box; }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+      }
+    }
     body {
       margin: 0;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Ubuntu, sans-serif;
@@ -5521,39 +5567,69 @@ SPA_HTML = r"""<!DOCTYPE html>
       overflow: hidden;
     }
     code, pre, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
-    a { color: var(--accent); text-decoration: none; }
+    a { color: var(--link); text-decoration: none; }
     a:hover { text-decoration: underline; }
+    :focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
     button, input, select, textarea {
       font: inherit;
       color: var(--text-main);
+      max-width: 100%;
     }
     input, select, textarea {
       background: var(--bg-input);
       border: 1px solid var(--border);
       border-radius: 6px;
       padding: 6px 8px;
+      min-height: 28px;
       outline: none;
+      text-overflow: ellipsis;
     }
-    input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+    input[type="checkbox"] {
+      width: 24px;
+      height: 24px;
+      min-width: 24px;
+      min-height: 24px;
+      margin: 0;
+      padding: 0;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    input:focus, select:focus, textarea:focus { border-color: var(--link); }
     .btn {
       display: inline-flex;
       align-items: center;
+      justify-content: center;
       gap: 5px;
       padding: 6px 11px;
+      min-height: 28px;
+      min-width: 28px;
       border-radius: 6px;
       border: 1px solid var(--border);
       background: var(--bg-card);
+      color: var(--text-main);
       cursor: pointer;
       font-weight: 500;
       white-space: nowrap;
+      flex-shrink: 0;
     }
+    a.btn, a.btn:hover { text-decoration: none; color: var(--text-main); }
     .btn:hover { background: var(--bg-hover); }
-    .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-    .btn-primary:hover { background: var(--accent-hover); }
-    .btn-danger { background: var(--danger); border-color: var(--danger); color: #fff; }
-    .btn-sm { padding: 3px 7px; font-size: 12px; }
+    .btn-primary, a.btn-primary, .btn-primary * { color: #ffffff; }
+    .btn-primary, a.btn-primary { background: var(--accent); border-color: var(--accent); }
+    .btn-primary:hover, a.btn-primary:hover { background: var(--accent-hover); color: #ffffff; }
+    .btn-danger, a.btn-danger, .btn-danger * { color: #ffffff; }
+    .btn-danger, a.btn-danger { background: var(--danger); border-color: var(--danger); }
+    .btn-sm { padding: 4px 8px; font-size: 12px; min-height: 28px; min-width: 28px; }
     .btn-ghost { background: transparent; border-color: transparent; }
     .btn-ghost:hover { background: var(--bg-hover); }
+    a.issue-open-link, a.subtask-open, a.link-target-open, a.md-issue-mention, a.md-att-link {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      min-width: 28px;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
 
     /* App Layout */
     #sidebar {
@@ -5577,59 +5653,63 @@ SPA_HTML = r"""<!DOCTYPE html>
       border-bottom: 1px solid var(--border);
       font-weight: 700;
       font-size: 15px;
+      gap: 8px;
     }
-    .nav-list { padding: 8px; display: flex; flex-direction: column; gap: 3px; flex: 1; overflow-y: auto; }
+    .nav-list { padding: 8px; display: flex; flex-direction: column; gap: 4px; flex: 1; overflow-y: auto; }
     .nav-item {
       display: flex; align-items: center; gap: 9px;
       width: 100%; text-align: left;
-      padding: 7px 10px; border-radius: 6px;
+      padding: 7px 10px; min-height: 30px; border-radius: 6px;
       border: none; background: transparent; cursor: pointer;
       color: var(--text-muted); font-weight: 500;
     }
     .nav-item:hover { background: var(--bg-hover); color: var(--text-main); }
-    .nav-item.active { background: var(--accent); color: #fff; }
+    .nav-item.active, .nav-item.active:hover { background: var(--accent); color: #ffffff; }
+    .nav-item.active * { color: #ffffff; }
     .sidebar-section-title {
       font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
       color: var(--text-muted); margin: 12px 8px 4px;
     }
     #main-shell { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
     #topbar {
-      height: 52px;
+      min-height: 52px;
       background: var(--bg-panel);
       border-bottom: 1px solid var(--border);
-      padding: 0 14px;
-      display: flex; align-items: center; gap: 10px;
+      padding: 8px 14px;
+      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
       flex-shrink: 0;
     }
-    #global-search-input { flex: 1; max-width: 560px; }
-    #content-area { flex: 1; overflow: auto; padding: 16px; }
-    .view-pane { display: none; }
+    #global-search-input { flex: 1 1 180px; min-width: 0; max-width: 560px; }
+    #content-area { flex: 1; overflow: auto; padding: 16px; min-width: 0; }
+    .view-pane { display: none; min-width: 0; }
     .view-pane.active { display: block; }
 
     /* Badges & Chips */
     .badge {
-      display: inline-flex; align-items: center; gap: 4px;
+      display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap;
       padding: 2px 7px; border-radius: 999px; font-size: 11px; font-weight: 600;
       background: var(--bg-hover); border: 1px solid var(--border);
+      max-width: 100%; overflow-wrap: anywhere; word-break: break-word;
     }
-    .badge-overdue { background: rgba(239,68,68,0.18); color: #f87171; border-color: #ef4444; }
-    .badge-blocked { background: rgba(245,158,11,0.18); color: #fbbf24; border-color: #f59e0b; }
-    .badge-done { background: rgba(16,185,129,0.18); color: #34d399; border-color: #10b981; }
-    .prio-critical { color: #ef4444; font-weight: 700; }
-    .prio-high { color: #f97316; font-weight: 600; }
-    .prio-medium { color: #3b82f6; }
-    .prio-low { color: #10b981; }
-    .prio-trivial { color: #94a3b8; }
+    .badge-overdue { background: var(--badge-overdue-bg); color: var(--badge-overdue-fg); border-color: var(--badge-overdue-border); }
+    .badge-blocked { background: var(--badge-blocked-bg); color: var(--badge-blocked-fg); border-color: var(--badge-blocked-border); }
+    .badge-done { background: var(--badge-done-bg); color: var(--badge-done-fg); border-color: var(--badge-done-border); }
+    .prio-critical { color: var(--prio-critical-fg); font-weight: 700; }
+    .prio-high { color: var(--prio-high-fg); font-weight: 600; }
+    .prio-medium { color: var(--prio-medium-fg); }
+    .prio-low { color: var(--prio-low-fg); }
+    .prio-trivial { color: var(--prio-trivial-fg); }
 
     /* Tabs, Filters & Table */
-    .preset-tabs { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 10px; }
+    .preset-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
     .tab-chip {
-      padding: 5px 11px; border-radius: 6px; border: 1px solid var(--border);
+      padding: 5px 11px; min-height: 28px; min-width: 28px; border-radius: 6px; border: 1px solid var(--border);
       background: var(--bg-panel); cursor: pointer; font-weight: 500; color: var(--text-muted);
     }
-    .tab-chip.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .tab-chip.active, .tab-chip.active:hover { background: var(--accent); border-color: var(--accent); color: #ffffff; }
+    .tab-chip.active * { color: #ffffff; }
     .filters-bar {
-      display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
       background: var(--bg-panel); padding: 8px 10px; border-radius: 8px;
       border: 1px solid var(--border); margin-bottom: 10px;
     }
@@ -5639,16 +5719,19 @@ SPA_HTML = r"""<!DOCTYPE html>
       padding: 8px 12px; border-radius: 8px; margin-bottom: 10px;
     }
     .bulk-bar.open { display: flex; }
+    #issues-table-wrap { overflow-x: auto; max-width: 100%; }
     table.issues-table {
       width: 100%; border-collapse: collapse; background: var(--bg-panel);
-      border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+      border: 1px solid var(--border); border-radius: 8px;
     }
     table.issues-table th, table.issues-table td {
       padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left;
+      overflow-wrap: anywhere; word-break: break-word;
     }
+    table.issues-table td.mono { white-space: nowrap; overflow-wrap: normal; word-break: normal; }
     table.issues-table th {
       background: var(--bg-card); color: var(--text-muted); font-size: 11px;
-      text-transform: uppercase; cursor: pointer; user-select: none;
+      text-transform: uppercase; cursor: pointer; user-select: none; white-space: nowrap;
     }
     table.issues-table tr:hover td { background: var(--bg-hover); }
     .pagination-bar {
@@ -5658,10 +5741,11 @@ SPA_HTML = r"""<!DOCTYPE html>
     }
 
     /* Kanban Board */
-    .swimlane-block { margin-bottom: 18px; }
+    .swimlane-block { margin-bottom: 18px; min-width: 0; }
     .swimlane-header {
       padding: 7px 12px; background: var(--bg-card); border: 1px solid var(--border);
       border-radius: 6px; font-weight: 700; margin-bottom: 8px; display: flex; justify-content: space-between;
+      gap: 8px; flex-wrap: wrap; overflow-wrap: anywhere; word-break: break-word;
     }
     .kanban-row { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 8px; }
     .kanban-column {
@@ -5669,20 +5753,22 @@ SPA_HTML = r"""<!DOCTYPE html>
       border: 1px solid var(--border); border-radius: 8px;
       display: flex; flex-direction: column; max-height: 70vh; flex-shrink: 0;
     }
-    .kanban-column.drag-over { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+    .kanban-column.drag-over { border-color: var(--link); box-shadow: 0 0 0 2px var(--link); }
     .kanban-col-head {
       padding: 8px 10px; border-bottom: 1px solid var(--border);
-      display: flex; justify-content: space-between; align-items: center; font-weight: 600;
+      display: flex; justify-content: space-between; align-items: center; font-weight: 600; gap: 6px;
     }
-    .wip-exceeded { background: rgba(239,68,68,0.2); border-color: var(--danger); color: #f87171; }
-    .kanban-cards { padding: 8px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; min-height: 110px; flex: 1; }
+    .wip-exceeded { background: var(--badge-overdue-bg); border-color: var(--badge-overdue-border); color: var(--badge-overdue-fg); }
+    .kanban-cards { padding: 8px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; min-height: 110px; flex: 1; min-width: 0; }
     .kanban-card {
       background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px;
       padding: 9px; cursor: grab; display: flex; flex-direction: column; gap: 5px;
+      min-width: 0; overflow-wrap: anywhere; word-break: break-word;
       user-select: none; -webkit-user-select: none; -webkit-user-drag: element;
     }
+    .kanban-card > div { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
     .kanban-card * { pointer-events: none; }
-    .kanban-card:hover { border-color: var(--accent); }
+    .kanban-card:hover { border-color: var(--link); }
 
     /* Drawer & Modals */
     .modal-backdrop {
@@ -5693,74 +5779,147 @@ SPA_HTML = r"""<!DOCTYPE html>
     .modal-box {
       background: var(--bg-panel); border: 1px solid var(--border); border-radius: 10px;
       box-shadow: var(--shadow); width: 100%; max-width: 720px; max-height: 90vh;
-      display: flex; flex-direction: column; overflow: hidden;
+      display: flex; flex-direction: column; overflow: hidden; min-width: 0;
     }
     .modal-header {
       padding: 12px 16px; border-bottom: 1px solid var(--border);
       display: flex; justify-content: space-between; align-items: center; font-weight: 700; font-size: 15px;
+      gap: 8px; flex-wrap: wrap; min-width: 0;
     }
-    .modal-body { padding: 16px; overflow-y: auto; flex: 1; }
-    .modal-footer { padding: 10px 16px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; }
+    .modal-body { padding: 16px; overflow-y: auto; flex: 1; min-width: 0; }
+    .modal-footer { padding: 10px 16px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 
     #issue-drawer {
       position: fixed; top: 0; right: 0; bottom: 0; width: min(980px, 94vw);
       background: var(--bg-panel); border-left: 1px solid var(--border);
-      box-shadow: var(--shadow); z-index: 900; display: none; flex-direction: column;
+      box-shadow: var(--shadow); z-index: 900; display: none; flex-direction: column; min-width: 0;
     }
     #issue-drawer.open { display: flex; }
-    .detail-grid { display: grid; grid-template-columns: 1fr 310px; gap: 16px; padding: 16px; overflow-y: auto; flex: 1; }
-    @media (max-width: 860px) { .detail-grid { grid-template-columns: 1fr; } }
-    .meta-sidebar { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 9px; }
-    .meta-row { display: flex; flex-direction: column; gap: 3px; }
-    .meta-row label { font-size: 11px; color: var(--text-muted); font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
+    .detail-grid { display: grid; grid-template-columns: minmax(0, 1fr) 310px; gap: 16px; padding: 16px; overflow-y: auto; flex: 1; min-width: 0; }
+    @media (max-width: 860px) { .detail-grid { grid-template-columns: minmax(0, 1fr); } }
+    .meta-sidebar { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 9px; min-width: 0; }
+    .meta-row { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+    .meta-row label { font-size: 11px; color: var(--text-muted); font-weight: 600; display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+    .form-grid-4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+    .form-grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+    .form-grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
     .progress-track { height: 7px; background: var(--bg-input); border-radius: 999px; overflow: hidden; border: 1px solid var(--border); }
     .progress-fill { height: 100%; background: var(--success); transition: width 0.2s; }
     .dropzone {
       border: 2px dashed var(--border); border-radius: 8px; padding: 12px;
       text-align: center; color: var(--text-muted); cursor: pointer;
+      overflow-wrap: anywhere; word-break: break-word;
     }
-    .dropzone.drag-over { border-color: var(--accent); background: rgba(59,130,246,0.08); }
+    .dropzone.drag-over { border-color: var(--link); background: rgba(59,130,246,0.08); }
 
-    /* Markdown Rendered Content */
-    .md-body { line-height: 1.55; word-break: break-word; }
+    /* Markdown & Card Content Containment */
+    .md-body { line-height: 1.55; overflow-wrap: anywhere; word-break: break-word; min-width: 0; }
     .md-body pre { background: var(--bg-input); padding: 10px; border-radius: 6px; border: 1px solid var(--border); overflow-x: auto; }
-    .md-body code { background: var(--bg-input); padding: 1px 5px; border-radius: 4px; }
-    .md-body blockquote { margin: 6px 0; padding: 4px 12px; border-left: 3px solid var(--accent); color: var(--text-muted); }
+    .md-body code { background: var(--bg-input); padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere; word-break: break-word; }
+    .md-body pre code { overflow-wrap: normal; word-break: normal; }
+    .md-body blockquote { margin: 6px 0; padding: 4px 12px; border-left: 3px solid var(--link); color: var(--text-muted); }
     .md-body table { border-collapse: collapse; width: 100%; margin: 8px 0; }
-    .md-body th, .md-body td { border: 1px solid var(--border); padding: 6px 8px; }
-    .md-inline-embed { max-width: 280px; max-height: 200px; border-radius: 6px; border: 1px solid var(--border); cursor: zoom-in; display: inline-block; margin: 4px 0; }
+    .md-body th, .md-body td { border: 1px solid var(--border); padding: 6px 8px; overflow-wrap: anywhere; word-break: break-word; }
+    .md-task-item { margin: 6px 0; }
+    .md-task-item label { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+    .md-inline-embed { max-width: min(280px, 100%); max-height: 200px; border-radius: 6px; border: 1px solid var(--border); cursor: zoom-in; display: inline-block; margin: 4px 0; }
     .deleted-att-badge {
       display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 4px;
-      background: rgba(239,68,68,0.15); border: 1px dashed var(--danger); color: #f87171; font-size: 11px;
+      background: var(--badge-overdue-bg); border: 1px dashed var(--badge-overdue-border); color: var(--badge-overdue-fg); font-size: 11px;
     }
-    .card-panel { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
-    .grid-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+    .card-panel {
+      background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin-bottom: 12px;
+      min-width: 0; overflow-wrap: anywhere; word-break: break-word;
+    }
+    .card-panel p, .card-panel div, .ac-row, .ac-row > span, .issue-att-row, .issue-att-row > div,
+    .comment-card, #detail-links-list > div, #detail-links-list > div > span,
+    #detail-subtasks-list > div, #detail-subtasks-list > div > span,
+    #detail-cf-list > div, #detail-cf-list > div > span,
+    #detail-worklogs-list > div, #detail-worklogs-list > div > span {
+      min-width: 0;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .grid-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(260px, 100%), 1fr)); gap: 12px; min-width: 0; }
 
-    /* Toast */
-    #toast-container { position: fixed; bottom: 16px; right: 16px; z-index: 2000; display: flex; flex-direction: column; gap: 6px; }
-    .toast {
-      padding: 9px 14px; border-radius: 8px; background: var(--bg-card);
-      border: 1px solid var(--accent); box-shadow: var(--shadow); font-weight: 500;
+    /* Toast (non-interactive status region so notifications never occlude controls underneath) */
+    #toast-container {
+      position: fixed; bottom: 16px; right: 16px; z-index: 2000;
+      display: flex; flex-direction: column; gap: 6px;
+      max-width: calc(100vw - 32px); pointer-events: none;
     }
-    .toast-error { border-color: var(--danger); background: #3b1219; color: #fecaca; }
+    .toast {
+      padding: 9px 14px; border-radius: 8px; background: var(--bg-panel); color: var(--text-main);
+      border: 1px solid var(--link); box-shadow: var(--shadow); font-weight: 500;
+      overflow-wrap: anywhere; word-break: break-word; pointer-events: none;
+    }
+    .toast-error { border-color: var(--badge-overdue-border); background: #450a0a; color: #fecaca; }
+
+    /* Responsive Tablet & Mobile Touch Ergonomics (<= 768px: >= 44x44 CSS px targets, zero horizontal bleed) */
+    @media (max-width: 768px) {
+      body { flex-direction: column; }
+      #sidebar, #sidebar.collapsed {
+        width: 100%;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+      }
+      .sidebar-header { padding: 8px 12px; }
+      .nav-list {
+        flex-direction: row;
+        flex-wrap: wrap;
+        overflow-x: visible;
+        overflow-y: visible;
+        padding: 6px 8px;
+        gap: 8px;
+        flex: 0 0 auto;
+      }
+      .nav-item {
+        width: auto;
+        flex: 0 0 auto;
+        justify-content: center;
+        padding: 8px 10px;
+      }
+      .sidebar-section-title, #sidebar-saved-views { display: none; }
+      #issue-drawer { width: 100vw; left: 0; border-left: none; }
+      .form-grid-4, .form-grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      button, .btn, .btn-sm, .tab-chip, .nav-item, select, textarea,
+      input:not([type="hidden"]), label.btn,
+      a.btn, a.issue-open-link, a.subtask-open, a.link-target-open,
+      a.md-issue-mention, a.md-att-link, .comment-card .badge a {
+        min-height: 44px !important;
+        min-width: 44px !important;
+      }
+      .comment-card .badge a { display: inline-flex; align-items: center; }
+      input[type="checkbox"], input[type="color"] {
+        width: 44px !important;
+        height: 44px !important;
+        min-width: 44px !important;
+        min-height: 44px !important;
+      }
+    }
+    @media (max-width: 560px) {
+      .nav-item .nav-label { display: none; }
+      .form-grid-4, .form-grid-3, .form-grid-2 { grid-template-columns: minmax(0, 1fr); }
+      #content-area { padding: 10px; }
+    }
   </style>
 </head>
 <body>
   <!-- Sidebar -->
-  <aside id="sidebar">
+  <aside id="sidebar" aria-label="Primary Navigation">
     <div class="sidebar-header">
       <span id="brand-title">iTrack</span>
-      <button id="btn-toggle-sidebar" class="btn btn-sm btn-ghost" title="Collapse/Expand Sidebar">&#9776;</button>
+      <button id="btn-toggle-sidebar" class="btn btn-sm btn-ghost" title="Collapse/Expand Sidebar" aria-label="Collapse or expand sidebar">&#9776;</button>
     </div>
-    <nav class="nav-list">
-      <button class="nav-item active" data-view="issues"><span>&#9776;</span><span class="nav-label">Issues List</span></button>
-      <button class="nav-item" data-view="board"><span>&#9638;</span><span class="nav-label">Kanban Board</span></button>
-      <button class="nav-item" data-view="sprints"><span>&#9889;</span><span class="nav-label">Backlog &amp; Sprints</span></button>
-      <button class="nav-item" data-view="milestones"><span>&#9873;</span><span class="nav-label">Milestones</span></button>
-      <button class="nav-item" data-view="views"><span>&#9733;</span><span class="nav-label">Saved Views</span></button>
-      <button class="nav-item" data-view="analytics"><span>&#9650;</span><span class="nav-label">Analytics Dashboard</span></button>
-      <button class="nav-item" data-view="tags"><span>&#9830;</span><span class="nav-label">Tags</span></button>
-      <button class="nav-item" data-view="settings"><span>&#9881;</span><span class="nav-label">Workspace Settings</span></button>
+    <nav class="nav-list" aria-label="Workspace Views">
+      <button class="nav-item active" data-view="issues" title="Issues List" aria-label="Issues List"><span>&#9776;</span><span class="nav-label">Issues List</span></button>
+      <button class="nav-item" data-view="board" title="Kanban Board" aria-label="Kanban Board"><span>&#9638;</span><span class="nav-label">Kanban Board</span></button>
+      <button class="nav-item" data-view="sprints" title="Backlog &amp; Sprints" aria-label="Backlog and Sprints"><span>&#9889;</span><span class="nav-label">Backlog &amp; Sprints</span></button>
+      <button class="nav-item" data-view="milestones" title="Milestones" aria-label="Milestones"><span>&#9873;</span><span class="nav-label">Milestones</span></button>
+      <button class="nav-item" data-view="views" title="Saved Views" aria-label="Saved Views"><span>&#9733;</span><span class="nav-label">Saved Views</span></button>
+      <button class="nav-item" data-view="analytics" title="Analytics Dashboard" aria-label="Analytics Dashboard"><span>&#9650;</span><span class="nav-label">Analytics Dashboard</span></button>
+      <button class="nav-item" data-view="tags" title="Tags" aria-label="Tags"><span>&#9830;</span><span class="nav-label">Tags</span></button>
+      <button class="nav-item" data-view="settings" title="Workspace Settings" aria-label="Workspace Settings"><span>&#9881;</span><span class="nav-label">Workspace Settings</span></button>
 
       <div class="sidebar-section-title">Saved Views</div>
       <div id="sidebar-saved-views"></div>
@@ -5770,10 +5929,10 @@ SPA_HTML = r"""<!DOCTYPE html>
   <!-- Main Shell -->
   <div id="main-shell">
     <header id="topbar">
-      <input id="global-search-input" type="text" placeholder="Search full-text or iQL (e.g. priority = critical AND state != done)... Press '/'" />
+      <input id="global-search-input" aria-label="Search issues or iQL query" type="text" placeholder="Search full-text or iQL (e.g. priority = critical AND state != done)... Press '/'" />
       <button id="btn-run-search" class="btn btn-sm">Search</button>
       <button id="btn-save-current-view" class="btn btn-sm" title="Save current filter as Named View">Save View</button>
-      <div style="flex:1"></div>
+      <div style="flex:1 1 0;min-width:0;"></div>
       <button id="btn-open-create" class="btn btn-primary">+ New Issue (c)</button>
       <button id="btn-reindex" class="btn btn-sm" title="Rebuild SQLite + FTS5 index from disk">Reindex</button>
       <button id="btn-theme-toggle" class="btn btn-sm" title="Toggle Dark/Light Mode">Theme</button>
@@ -5794,15 +5953,15 @@ SPA_HTML = r"""<!DOCTYPE html>
         </div>
 
         <div class="filters-bar">
-          <select id="filter-category"><option value="">All Categories</option></select>
-          <select id="filter-state"><option value="">All States</option></select>
-          <select id="filter-priority"><option value="">All Priorities</option></select>
-          <select id="filter-severity"><option value="">All Severities</option></select>
-          <input id="filter-assignee" type="text" placeholder="Assignee..." style="width:110px" />
-          <select id="filter-tag"><option value="">All Tags</option></select>
-          <select id="filter-sprint"><option value="">All Sprints</option></select>
-          <select id="filter-milestone"><option value="">All Milestones</option></select>
-          <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer">
+          <select id="filter-category" aria-label="Filter by category"><option value="">All Categories</option></select>
+          <select id="filter-state" aria-label="Filter by state"><option value="">All States</option></select>
+          <select id="filter-priority" aria-label="Filter by priority"><option value="">All Priorities</option></select>
+          <select id="filter-severity" aria-label="Filter by severity"><option value="">All Severities</option></select>
+          <input id="filter-assignee" aria-label="Filter by assignee" type="text" placeholder="Assignee..." style="width:110px" />
+          <select id="filter-tag" aria-label="Filter by tag"><option value="">All Tags</option></select>
+          <select id="filter-sprint" aria-label="Filter by sprint"><option value="">All Sprints</option></select>
+          <select id="filter-milestone" aria-label="Filter by milestone"><option value="">All Milestones</option></select>
+          <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">
             <input id="filter-overdue" type="checkbox" /> Overdue
           </label>
           <button id="btn-clear-filters" class="btn btn-sm">Clear Filters</button>
@@ -5811,11 +5970,11 @@ SPA_HTML = r"""<!DOCTYPE html>
 
         <div id="bulk-action-bar" class="bulk-bar">
           <strong><span id="bulk-selected-count">0</span> selected:</strong>
-          <select id="bulk-state"><option value="">Set State...</option></select>
-          <select id="bulk-priority"><option value="">Set Priority...</option></select>
-          <input id="bulk-assignee" type="text" placeholder="Assignee..." style="width:110px" />
-          <input id="bulk-tag" type="text" placeholder="Add Tag..." style="width:100px" />
-          <select id="bulk-sprint"><option value="">Assign Sprint...</option></select>
+          <select id="bulk-state" aria-label="Bulk set state"><option value="">Set State...</option></select>
+          <select id="bulk-priority" aria-label="Bulk set priority"><option value="">Set Priority...</option></select>
+          <input id="bulk-assignee" aria-label="Bulk set assignee" type="text" placeholder="Assignee..." style="width:110px" />
+          <input id="bulk-tag" aria-label="Bulk add tag" type="text" placeholder="Add Tag..." style="width:100px" />
+          <select id="bulk-sprint" aria-label="Bulk assign sprint"><option value="">Assign Sprint...</option></select>
           <button id="btn-bulk-apply" class="btn btn-sm btn-primary">Apply Bulk Update</button>
           <button id="btn-bulk-archive" class="btn btn-sm">Archive</button>
           <button id="btn-bulk-delete" class="btn btn-sm btn-danger">Bulk Delete</button>
@@ -5825,7 +5984,7 @@ SPA_HTML = r"""<!DOCTYPE html>
           <table class="issues-table">
             <thead>
               <tr>
-                <th style="width:32px"><input type="checkbox" id="check-all-issues" /></th>
+                <th style="width:40px"><input type="checkbox" id="check-all-issues" aria-label="Select all issues" /></th>
                 <th data-sort="key">Key</th>
                 <th data-sort="name">Name</th>
                 <th data-sort="category">Category</th>
@@ -5954,7 +6113,7 @@ SPA_HTML = r"""<!DOCTYPE html>
       <section id="view-settings" class="view-pane">
         <div class="card-panel" style="max-width:640px;">
           <h3 style="margin-top:0">Workspace Configuration</h3>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+          <div class="form-grid-2">
             <label class="meta-row">Project Title <input id="cfg-project-title" type="text" /></label>
             <label class="meta-row">Project Prefix <input id="cfg-project-prefix" type="text" /></label>
             <label class="meta-row">Default Category <select id="cfg-default-category"></select></label>
@@ -5981,21 +6140,21 @@ SPA_HTML = r"""<!DOCTYPE html>
   </div>
 
   <!-- Slide-Over Issue Detail Drawer (data-modal="issue-detail") -->
-  <div id="issue-drawer" data-modal="issue-detail">
+  <div id="issue-drawer" data-modal="issue-detail" role="dialog" aria-label="Issue Detail">
     <div class="modal-header">
-      <div style="display:flex;align-items:center;gap:8px;flex:1;min-width:0;">
-        <span id="detail-key-badge" class="badge mono"></span>
-        <input id="detail-title-input" type="text" style="flex:1;font-weight:700;font-size:15px;" />
+      <div style="display:flex;align-items:center;gap:8px;flex:1 1 220px;min-width:0;">
+        <span id="detail-key-badge" class="badge mono" style="flex-shrink:0;"></span>
+        <input id="detail-title-input" aria-label="Issue title" type="text" style="flex:1;min-width:0;font-weight:700;font-size:15px;" />
         <button id="btn-save-title" class="btn btn-sm">Rename</button>
       </div>
-      <div style="display:flex;gap:5px;align-items:center;margin-left:8px;">
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
         <button id="btn-open-permalink" class="btn btn-sm" title="Open Full-Page Permalink">Permalink</button>
         <button id="btn-clone-issue" class="btn btn-sm">Clone</button>
         <button id="btn-copy-context" class="btn btn-sm">Copy Agent Context</button>
         <button id="btn-archive-issue" class="btn btn-sm">Archive</button>
         <button id="btn-unarchive-issue" class="btn btn-sm" style="display:none;">Unarchive</button>
         <button id="btn-delete-issue" class="btn btn-sm btn-danger">Delete</button>
-        <button id="btn-close-drawer" class="btn btn-sm btn-ghost">&#10005;</button>
+        <button id="btn-close-drawer" class="btn btn-sm btn-ghost" aria-label="Close issue detail">&#10005;</button>
       </div>
     </div>
     <div id="drawer-detail-body" class="detail-grid">
@@ -6068,7 +6227,7 @@ SPA_HTML = r"""<!DOCTYPE html>
           <strong>Whole-Issue Attachments</strong>
           <div id="detail-attach-dropzone" class="dropzone" style="margin:8px 0;">
             Drag &amp; drop files here or
-            <label style="color:var(--accent);cursor:pointer;font-weight:600;">
+            <label style="color:var(--link);cursor:pointer;font-weight:600;">
               browse <input id="detail-attach-input" type="file" multiple style="display:none" />
             </label>
           </div>
@@ -6119,52 +6278,52 @@ SPA_HTML = r"""<!DOCTYPE html>
 
       <!-- Right Metadata Sidebar -->
       <div class="meta-sidebar">
-        <div class="meta-row"><label>Category</label><select id="detail-category"></select></div>
-        <div class="meta-row"><label>State</label><select id="detail-state"></select></div>
-        <div class="meta-row"><label>Priority</label><select id="detail-priority"></select></div>
-        <div class="meta-row"><label>Severity</label><select id="detail-severity"></select></div>
+        <div class="meta-row"><label for="detail-category">Category</label><select id="detail-category"></select></div>
+        <div class="meta-row"><label for="detail-state">State</label><select id="detail-state"></select></div>
+        <div class="meta-row"><label for="detail-priority">Priority</label><select id="detail-priority"></select></div>
+        <div class="meta-row"><label for="detail-severity">Severity</label><select id="detail-severity"></select></div>
         <div class="meta-row">
-          <label>Resolution <button id="btn-clear-resolution" class="btn btn-sm btn-ghost">Clear</button></label>
+          <label for="detail-resolution">Resolution <button id="btn-clear-resolution" class="btn btn-sm btn-ghost">Clear</button></label>
           <select id="detail-resolution"><option value="">(Unresolved)</option></select>
         </div>
         <div class="meta-row">
-          <label>Assignee <button id="btn-clear-assignee" class="btn btn-sm btn-ghost">Clear</button></label>
+          <label for="detail-assignee">Assignee <button id="btn-clear-assignee" class="btn btn-sm btn-ghost">Clear</button></label>
           <input id="detail-assignee" type="text" placeholder="Unassigned" />
         </div>
         <div class="meta-row">
-          <label>Reporter <button id="btn-clear-reporter" class="btn btn-sm btn-ghost">Clear</button></label>
+          <label for="detail-reporter">Reporter <button id="btn-clear-reporter" class="btn btn-sm btn-ghost">Clear</button></label>
           <input id="detail-reporter" type="text" placeholder="Reporter" />
         </div>
         <div class="meta-row">
-          <label>Parent / Epic <button id="btn-clear-parent" class="btn btn-sm btn-ghost">Clear</button></label>
+          <label for="detail-parent">Parent / Epic <button id="btn-clear-parent" class="btn btn-sm btn-ghost">Clear</button></label>
           <input id="detail-parent" type="text" placeholder="ITR-N or Name" />
         </div>
         <div class="meta-row">
-          <label>Sprint <button id="btn-clear-sprint" class="btn btn-sm btn-ghost">Clear</button></label>
+          <label for="detail-sprint">Sprint <button id="btn-clear-sprint" class="btn btn-sm btn-ghost">Clear</button></label>
           <select id="detail-sprint"><option value="">(No Sprint)</option></select>
         </div>
         <div class="meta-row">
-          <label>Milestone <button id="btn-clear-milestone" class="btn btn-sm btn-ghost">Clear</button></label>
+          <label for="detail-milestone">Milestone <button id="btn-clear-milestone" class="btn btn-sm btn-ghost">Clear</button></label>
           <select id="detail-milestone"><option value="">(No Milestone)</option></select>
         </div>
         <div class="meta-row">
-          <label>Story Points <button id="btn-clear-points" class="btn btn-sm btn-ghost">Clear</button></label>
+          <label for="detail-points">Story Points <button id="btn-clear-points" class="btn btn-sm btn-ghost">Clear</button></label>
           <input id="detail-points" type="number" step="0.5" min="0" />
         </div>
         <div class="meta-row">
-          <label>Estimate (min) <button id="btn-clear-estimate" class="btn btn-sm btn-ghost">Clear</button></label>
+          <label for="detail-estimate">Estimate (min) <button id="btn-clear-estimate" class="btn btn-sm btn-ghost">Clear</button></label>
           <input id="detail-estimate" type="number" step="1" min="0" />
         </div>
         <div class="meta-row">
-          <label>Due Date <span id="detail-overdue-badge"></span> <button id="btn-clear-due" class="btn btn-sm btn-ghost">Clear</button></label>
+          <label for="detail-due">Due Date <span id="detail-overdue-badge"></span> <button id="btn-clear-due" class="btn btn-sm btn-ghost">Clear</button></label>
           <input id="detail-due" type="date" />
         </div>
         <div class="meta-row">
-          <label>Tags (comma-sep) <button id="btn-clear-tags" class="btn btn-sm btn-ghost">Clear</button></label>
+          <label for="detail-tags">Tags (comma-sep) <button id="btn-clear-tags" class="btn btn-sm btn-ghost">Clear</button></label>
           <input id="detail-tags" type="text" placeholder="auth, backend" />
         </div>
         <div class="meta-row">
-          <label>Components (comma-sep) <button id="btn-clear-components" class="btn btn-sm btn-ghost">Clear</button></label>
+          <label for="detail-components">Components (comma-sep) <button id="btn-clear-components" class="btn btn-sm btn-ghost">Clear</button></label>
           <input id="detail-components" type="text" placeholder="api, ui" />
         </div>
 
@@ -6172,10 +6331,10 @@ SPA_HTML = r"""<!DOCTYPE html>
         <div class="meta-row" style="border-top:1px solid var(--border);padding-top:8px;">
           <label>Custom Fields <button id="btn-clear-cf" class="btn btn-sm btn-ghost">Clear All</button></label>
           <div id="detail-cf-list" style="display:flex;flex-direction:column;gap:4px;"></div>
-          <div style="display:flex;gap:4px;margin-top:4px;">
-            <input id="detail-cf-key" type="text" placeholder="key" style="width:42%" />
-            <input id="detail-cf-val" type="text" placeholder="value" style="width:42%" />
-            <button id="btn-add-cf" class="btn btn-sm">+</button>
+          <div style="display:flex;gap:6px;margin-top:4px;flex-wrap:wrap;">
+            <input id="detail-cf-key" aria-label="Custom field key" type="text" placeholder="key" style="flex:1 1 80px;min-width:0;" />
+            <input id="detail-cf-val" aria-label="Custom field value" type="text" placeholder="value" style="flex:1 1 80px;min-width:0;" />
+            <button id="btn-add-cf" class="btn btn-sm" aria-label="Add custom field">+</button>
           </div>
         </div>
 
@@ -6190,23 +6349,23 @@ SPA_HTML = r"""<!DOCTYPE html>
   </div>
 
   <!-- Modal 1: Create Issue (data-modal="create-issue") -->
-  <div id="modal-create-issue" class="modal-backdrop" data-modal="create-issue">
+  <div id="modal-create-issue" class="modal-backdrop" data-modal="create-issue" role="dialog" aria-modal="true" aria-label="Create Issue">
     <div class="modal-box">
       <div class="modal-header">
         <span>Create Issue</span>
-        <button class="btn btn-sm btn-ghost" data-close-modal="create-issue">&#10005;</button>
+        <button class="btn btn-sm btn-ghost" data-close-modal="create-issue" aria-label="Close create issue modal">&#10005;</button>
       </div>
       <div class="modal-body" style="display:flex;flex-direction:column;gap:10px;">
         <label class="meta-row">Issue Name (Spaces &amp; Unicode supported — creates exact folder) *
           <input id="create-name" type="text" placeholder="e.g. OAuth2 Token Refresh Race Condition" />
         </label>
-        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;">
+        <div class="form-grid-4">
           <label class="meta-row">Category <select id="create-category"></select></label>
           <label class="meta-row">Initial State <select id="create-state"></select></label>
           <label class="meta-row">Priority <select id="create-priority"></select></label>
           <label class="meta-row">Severity <select id="create-severity"></select></label>
         </div>
-        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">
+        <div class="form-grid-3">
           <label class="meta-row">Assignee <input id="create-assignee" type="text" /></label>
           <label class="meta-row">Parent / Epic <input id="create-parent" type="text" placeholder="ITR-N or Name" /></label>
           <label class="meta-row">Due Date <input id="create-due" type="date" /></label>
@@ -6214,7 +6373,7 @@ SPA_HTML = r"""<!DOCTYPE html>
           <label class="meta-row">Milestone <select id="create-milestone"><option value="">(None)</option></select></label>
           <label class="meta-row">Story Points <input id="create-points" type="number" step="0.5" min="0" /></label>
         </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
+        <div class="form-grid-3">
           <label class="meta-row">Estimate (min) <input id="create-estimate" type="number" min="0" /></label>
           <label class="meta-row">Tags (comma-sep) <input id="create-tags" type="text" /></label>
           <label class="meta-row">Components (comma-sep) <input id="create-components" type="text" /></label>
@@ -6236,7 +6395,7 @@ SPA_HTML = r"""<!DOCTYPE html>
         </label>
         <div id="create-attach-dropzone" class="dropzone">
           Drag &amp; drop whole-issue attachments or
-          <label style="color:var(--accent);cursor:pointer;font-weight:600;">
+          <label style="color:var(--link);cursor:pointer;font-weight:600;">
             choose files <input id="create-attach-input" type="file" multiple style="display:none" />
           </label>
           <div id="create-attach-queued" style="font-size:12px;margin-top:4px;"></div>
@@ -6250,11 +6409,11 @@ SPA_HTML = r"""<!DOCTYPE html>
   </div>
 
   <!-- Modal 3: Delete Confirm (data-modal="delete-confirm") -->
-  <div id="modal-delete-confirm" class="modal-backdrop" data-modal="delete-confirm">
+  <div id="modal-delete-confirm" class="modal-backdrop" data-modal="delete-confirm" role="alertdialog" aria-modal="true" aria-label="Confirm Permanent Delete">
     <div class="modal-box" style="max-width:440px;">
       <div class="modal-header">
         <span>Confirm Permanent Delete</span>
-        <button class="btn btn-sm btn-ghost" data-close-modal="delete-confirm">&#10005;</button>
+        <button class="btn btn-sm btn-ghost" data-close-modal="delete-confirm" aria-label="Close delete confirmation">&#10005;</button>
       </div>
       <div class="modal-body">
         <p id="delete-confirm-message">Permanently delete this issue folder and all its attachments &amp; comments?</p>
@@ -6267,15 +6426,15 @@ SPA_HTML = r"""<!DOCTYPE html>
   </div>
 
   <!-- Modal 4: Link Issue & Hierarchy Tree (data-modal="link-issue") -->
-  <div id="modal-link-issue" class="modal-backdrop" data-modal="link-issue">
+  <div id="modal-link-issue" class="modal-backdrop" data-modal="link-issue" role="dialog" aria-modal="true" aria-label="Link Issue and Hierarchy Tree">
     <div class="modal-box" style="max-width:580px;">
       <div class="modal-header">
         <span>Link Issue &amp; Dependency / Hierarchy Tree</span>
-        <button class="btn btn-sm btn-ghost" data-close-modal="link-issue">&#10005;</button>
+        <button class="btn btn-sm btn-ghost" data-close-modal="link-issue" aria-label="Close link issue modal">&#10005;</button>
       </div>
       <div class="modal-body" style="display:flex;flex-direction:column;gap:12px;">
         <div id="link-form-row" style="display:flex;gap:8px;flex-wrap:wrap;">
-          <select id="link-modal-type">
+          <select id="link-modal-type" aria-label="Link type">
             <option value="blocks">blocks</option>
             <option value="blocked-by">blocked-by</option>
             <option value="relates-to">relates-to</option>
@@ -6283,7 +6442,7 @@ SPA_HTML = r"""<!DOCTYPE html>
             <option value="parent-of">parent-of</option>
             <option value="clones">clones</option>
           </select>
-          <input id="link-modal-target" type="text" placeholder="Target Key (ITR-2) or Exact Issue Name" style="flex:1" />
+          <input id="link-modal-target" aria-label="Target issue key or name" type="text" placeholder="Target Key (ITR-2) or Exact Issue Name" style="flex:1 1 160px;min-width:0;" />
           <button id="btn-submit-link" class="btn btn-primary">Add Link</button>
         </div>
         <div>
@@ -6298,11 +6457,11 @@ SPA_HTML = r"""<!DOCTYPE html>
   </div>
 
   <!-- Modal 5: Log Work (data-modal="log-work") -->
-  <div id="modal-log-work" class="modal-backdrop" data-modal="log-work">
+  <div id="modal-log-work" class="modal-backdrop" data-modal="log-work" role="dialog" aria-modal="true" aria-label="Log Work">
     <div class="modal-box" style="max-width:460px;">
       <div class="modal-header">
         <span>Log Work</span>
-        <button class="btn btn-sm btn-ghost" data-close-modal="log-work">&#10005;</button>
+        <button class="btn btn-sm btn-ghost" data-close-modal="log-work" aria-label="Close log work modal">&#10005;</button>
       </div>
       <div class="modal-body" style="display:flex;flex-direction:column;gap:10px;">
         <label class="meta-row">Duration (e.g. 90, 1h 30m, 45m)
@@ -6320,11 +6479,11 @@ SPA_HTML = r"""<!DOCTYPE html>
   </div>
 
   <!-- Modal 6: Sprint Rollover (data-modal="sprint-rollover") -->
-  <div id="modal-sprint-rollover" class="modal-backdrop" data-modal="sprint-rollover">
+  <div id="modal-sprint-rollover" class="modal-backdrop" data-modal="sprint-rollover" role="dialog" aria-modal="true" aria-label="Complete Sprint and Rollover">
     <div class="modal-box" style="max-width:480px;">
       <div class="modal-header">
         <span>Complete Sprint &amp; Rollover Incomplete Issues</span>
-        <button class="btn btn-sm btn-ghost" data-close-modal="sprint-rollover">&#10005;</button>
+        <button class="btn btn-sm btn-ghost" data-close-modal="sprint-rollover" aria-label="Close sprint rollover modal">&#10005;</button>
       </div>
       <div class="modal-body" style="display:flex;flex-direction:column;gap:10px;">
         <p id="rollover-modal-info" style="margin:0;"></p>
@@ -6340,13 +6499,13 @@ SPA_HTML = r"""<!DOCTYPE html>
   </div>
 
   <!-- Modal 7: Image Lightbox (data-modal="image-lightbox") -->
-  <div id="modal-image-lightbox" class="modal-backdrop" data-modal="image-lightbox">
+  <div id="modal-image-lightbox" class="modal-backdrop" data-modal="image-lightbox" role="dialog" aria-modal="true" aria-label="Image Preview">
     <div class="modal-box" style="max-width:88vw;">
       <div class="modal-header">
         <span id="lightbox-title">Image Preview</span>
         <div style="display:flex;gap:8px;align-items:center;">
           <a id="lightbox-download-link" class="btn btn-sm" href="#" download>Download</a>
-          <button class="btn btn-sm btn-ghost" data-close-modal="image-lightbox">&#10005;</button>
+          <button class="btn btn-sm btn-ghost" data-close-modal="image-lightbox" aria-label="Close image preview">&#10005;</button>
         </div>
       </div>
       <div class="modal-body" style="text-align:center;background:var(--bg-input);">
@@ -6356,13 +6515,13 @@ SPA_HTML = r"""<!DOCTYPE html>
   </div>
 
   <!-- Modal 8: Attachment Text/Code Preview (data-modal="attachment-preview") -->
-  <div id="modal-attachment-preview" class="modal-backdrop" data-modal="attachment-preview">
+  <div id="modal-attachment-preview" class="modal-backdrop" data-modal="attachment-preview" role="dialog" aria-modal="true" aria-label="Attachment Preview">
     <div class="modal-box" style="max-width:740px;">
       <div class="modal-header">
         <span id="att-preview-title">Attachment Preview</span>
         <div style="display:flex;gap:8px;align-items:center;">
           <a id="att-preview-download" class="btn btn-sm" href="#" download>Download</a>
-          <button class="btn btn-sm btn-ghost" data-close-modal="attachment-preview">&#10005;</button>
+          <button class="btn btn-sm btn-ghost" data-close-modal="attachment-preview" aria-label="Close attachment preview">&#10005;</button>
         </div>
       </div>
       <div class="modal-body">
@@ -6373,14 +6532,14 @@ SPA_HTML = r"""<!DOCTYPE html>
   </div>
 
   <!-- Modal 9: Link Existing Issue Attachment Picker (data-modal="link-attachment") -->
-  <div id="modal-link-attachment" class="modal-backdrop" data-modal="link-attachment">
+  <div id="modal-link-attachment" class="modal-backdrop" data-modal="link-attachment" role="dialog" aria-modal="true" aria-label="Link Existing Issue Attachment">
     <div class="modal-box" style="max-width:500px;">
       <div class="modal-header">
         <span>Link Existing Issue Attachment</span>
-        <button class="btn btn-sm btn-ghost" data-close-modal="link-attachment">&#10005;</button>
+        <button class="btn btn-sm btn-ghost" data-close-modal="link-attachment" aria-label="Close link attachment picker">&#10005;</button>
       </div>
       <div class="modal-body">
-        <div id="link-att-picker-list" style="display:flex;flex-direction:column;gap:6px;"></div>
+        <div id="link-att-picker-list" style="display:flex;flex-direction:column;gap:8px;"></div>
       </div>
       <div class="modal-footer">
         <button class="btn" data-close-modal="link-attachment">Cancel</button>
@@ -6390,16 +6549,16 @@ SPA_HTML = r"""<!DOCTYPE html>
   </div>
 
   <!-- Modal 10: Save Named View (data-modal="save-view") -->
-  <div id="modal-save-view" class="modal-backdrop" data-modal="save-view">
+  <div id="modal-save-view" class="modal-backdrop" data-modal="save-view" role="dialog" aria-modal="true" aria-label="Save Named View">
     <div class="modal-box" style="max-width:480px;">
       <div class="modal-header">
         <span>Save Named View</span>
-        <button class="btn btn-sm btn-ghost" data-close-modal="save-view">&#10005;</button>
+        <button class="btn btn-sm btn-ghost" data-close-modal="save-view" aria-label="Close save view modal">&#10005;</button>
       </div>
       <div class="modal-body" style="display:flex;flex-direction:column;gap:10px;">
         <label class="meta-row">View Name * <input id="save-view-name" type="text" placeholder="Critical Auth Bugs" /></label>
         <label class="meta-row">iQL Query <input id="save-view-query" type="text" placeholder="priority = critical AND category = bug" /></label>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+        <div class="form-grid-2">
           <label class="meta-row">Preset Tab <select id="save-view-tab"></select></label>
           <label class="meta-row">Description <input id="save-view-desc" type="text" /></label>
         </div>
@@ -6411,7 +6570,7 @@ SPA_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <div id="toast-container"></div>
+  <div id="toast-container" role="status" aria-live="polite"></div>
 """
 
 SPA_HTML += r"""  <script>
@@ -6444,6 +6603,7 @@ SPA_HTML += r"""  <script>
       pageSize: 25,
       selectedKeys: new Set(),
       activeIssue: null,
+      renderedIssueKey: null,
       permalinkMode: false,
       sprints: [],
       milestones: [],
@@ -6468,6 +6628,15 @@ SPA_HTML += r"""  <script>
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;');
+    }
+
+    function contrastTextForHex(hex) {
+      const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || '').trim());
+      if (!m) return '#ffffff';
+      const v = parseInt(m[1], 16);
+      const lin = (c) => { const s = c / 255; return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4); };
+      const lum = 0.2126 * lin((v >> 16) & 255) + 0.7152 * lin((v >> 8) & 255) + 0.0722 * lin(v & 255);
+      return lum > 0.179 ? '#000000' : '#ffffff';
     }
 
     function toast(msg, isError) {
@@ -7291,9 +7460,11 @@ SPA_HTML += r"""  <script>
       box.innerHTML = details.map((sp) => `
         <div class="card-panel sprint-card" data-sprint-id="${esc(sp.id)}">
           <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-            <div>
-              <strong style="font-size:15px">${esc(sp.id)} — ${esc(sp.name)}</strong>
-              <span class="badge" style="margin-left:8px">${esc(sp.state)}</span>
+            <div style="min-width:0;">
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                <strong style="font-size:15px">${esc(sp.id)} — ${esc(sp.name)}</strong>
+                <span class="badge">${esc(sp.state)}</span>
+              </div>
               <div style="color:var(--text-muted);font-size:12px;margin-top:3px;">Goal: ${esc(sp.goal || '—')} | ${esc(sp.start_date || '?')} &rarr; ${esc(sp.end_date || '?')} | ${sp.done_issues}/${sp.total_issues} done (${sp.progress_pct}%)</div>
             </div>
             <div style="display:flex;gap:6px;flex-wrap:wrap;">
@@ -7303,8 +7474,8 @@ SPA_HTML += r"""  <script>
               <button class="btn btn-sm btn-danger btn-sprint-delete" data-id="${esc(sp.id)}">Delete</button>
             </div>
           </div>
-          <div style="display:flex;gap:6px;margin-top:10px;">
-            <input type="text" class="sprint-assign-input" data-id="${esc(sp.id)}" placeholder="Assign issue (ITR-1 or Exact Name)..." style="width:240px" />
+          <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
+            <input type="text" aria-label="Assign issue to sprint ${esc(sp.id)}" class="sprint-assign-input" data-id="${esc(sp.id)}" placeholder="Assign issue (ITR-1 or Exact Name)..." style="width:240px" />
             <button class="btn btn-sm btn-sprint-assign" data-id="${esc(sp.id)}">Assign to Sprint</button>
           </div>
           <div style="margin-top:8px;display:flex;flex-direction:column;gap:4px;">
@@ -7491,8 +7662,10 @@ SPA_HTML += r"""  <script>
       }
       box.innerHTML = appState.views.map((v) => `
         <div class="card-panel" data-saved-view="${esc(v.id)}">
-          <strong>${esc(v.name)}</strong> <span class="badge mono">${esc(v.id)}</span>
-          <div class="mono" style="margin:6px 0;font-size:12px;color:var(--accent);">${esc(v.query || '(all issues)')}</div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <strong>${esc(v.name)}</strong> <span class="badge mono">${esc(v.id)}</span>
+          </div>
+          <div class="mono" style="margin:6px 0;font-size:12px;color:var(--link);">${esc(v.query || '(all issues)')}</div>
           <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">Tab: ${esc(v.tab)} | ${esc(v.description || '')}</div>
           <div style="display:flex;gap:6px;">
             <button class="btn btn-sm btn-primary btn-view-run" data-id="${esc(v.id)}">Run View</button>
@@ -7583,20 +7756,23 @@ SPA_HTML += r"""  <script>
         box.innerHTML = '<div class="card-panel">No tags created yet.</div>';
         return;
       }
-      box.innerHTML = appState.tags.map((t) => `
+      box.innerHTML = appState.tags.map((t) => {
+        const fg = contrastTextForHex(t.color);
+        return `
         <div class="card-panel" data-tag-card="${esc(t.name)}">
-          <div style="display:flex;justify-content:space-between;align-items:center;">
-            <span class="badge" style="background:${esc(t.color)};color:#fff;border:none;">${esc(t.name)}</span>
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+            <span class="badge" style="background:${esc(t.color)};color:${fg};border:none;">${esc(t.name)}</span>
             <span class="mono" style="font-size:12px;">${t.issue_count || 0} issues</span>
           </div>
           <p style="color:var(--text-muted);margin:8px 0;">${esc(t.description || 'No description')}</p>
-          <div style="display:flex;gap:6px;align-items:center;">
-            <input type="color" class="tag-edit-color" data-name="${esc(t.name)}" value="${esc(t.color || '#3b82f6')}" style="width:36px;height:28px;padding:1px;" />
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <input type="color" aria-label="Color for tag ${esc(t.name)}" class="tag-edit-color" data-name="${esc(t.name)}" value="${esc(t.color || '#3b82f6')}" style="width:36px;height:28px;padding:1px;" />
             <button class="btn btn-sm btn-tag-save" data-name="${esc(t.name)}">Save Color</button>
             <button class="btn btn-sm btn-danger btn-tag-delete" data-name="${esc(t.name)}">Delete</button>
           </div>
         </div>
-      `).join('');
+      `;
+      }).join('');
 
       box.querySelectorAll('.btn-tag-save').forEach((b) => {
         b.addEventListener('click', async () => {
@@ -7776,6 +7952,21 @@ SPA_HTML += r"""
     // ----------------------------------------------------------------------
     // Issue Detail (Slide-Over Drawer & Full-Page #/issues/<ref> Permalink)
     // ----------------------------------------------------------------------
+    function syncPermalinkDrawerInset() {
+      const drawer = $('issue-drawer');
+      if (!appState.permalinkMode || !drawer.classList.contains('open')) return;
+      if (window.innerWidth <= 768) {
+        const tbRect = $('topbar').getBoundingClientRect();
+        drawer.style.inset = `${Math.max(0, Math.round(tbRect.bottom))}px 0 0 0`;
+      } else {
+        const sbW = Math.round($('sidebar').getBoundingClientRect().width) || 230;
+        const tbH = Math.round($('topbar').getBoundingClientRect().height) || 52;
+        drawer.style.inset = `${tbH}px 0 0 ${sbW}px`;
+      }
+      drawer.style.width = 'auto';
+    }
+    window.addEventListener('resize', syncPermalinkDrawerInset);
+
     let issueDetailLoadSeq = 0;
     async function openIssueDetail(issueRef, opts) {
       const seq = ++issueDetailLoadSeq;
@@ -7790,8 +7981,8 @@ SPA_HTML += r"""
         if (options.fullPage) {
           appState.permalinkMode = true;
           document.querySelectorAll('.view-pane').forEach((p) => p.classList.toggle('active', p.id === 'view-issue-permalink'));
-          drawer.style.inset = '52px 0 0 230px';
-          drawer.style.width = 'auto';
+          drawer.classList.add('open');
+          syncPermalinkDrawerInset();
           if (!options.skipHash) {
             appState.suppressHashHandler = true;
             location.hash = `#/issues/${encodeURIComponent(iss.key)}`;
@@ -7801,8 +7992,8 @@ SPA_HTML += r"""
           appState.permalinkMode = false;
           drawer.style.inset = '';
           drawer.style.width = '';
+          drawer.classList.add('open');
         }
-        drawer.classList.add('open');
 
         renderIssueDetailDOM(iss);
       } catch (err) {
@@ -7814,7 +8005,10 @@ SPA_HTML += r"""
       $('issue-drawer').classList.remove('open');
       $('issue-drawer').style.inset = '';
       $('issue-drawer').style.width = '';
+      $('detail-desc-editor').style.display = 'none';
+      $('detail-desc-rendered').style.display = 'block';
       appState.activeIssue = null;
+      appState.renderedIssueKey = null;
       if (appState.permalinkMode) {
         appState.permalinkMode = false;
         switchView('issues', true);
@@ -7829,8 +8023,12 @@ SPA_HTML += r"""
     });
 
     function renderIssueDetailDOM(iss) {
+      const sameOpenIssue = Boolean(appState.renderedIssueKey === iss.key && $('issue-drawer').classList.contains('open'));
+      appState.renderedIssueKey = iss.key;
       $('detail-key-badge').textContent = iss.key;
-      $('detail-title-input').value = iss.name;
+      if (!(sameOpenIssue && document.activeElement === $('detail-title-input'))) {
+        $('detail-title-input').value = iss.name;
+      }
       $('btn-archive-issue').style.display = iss.archived ? 'none' : 'inline-flex';
       $('btn-unarchive-issue').style.display = iss.archived ? 'inline-flex' : 'none';
 
@@ -7871,10 +8069,15 @@ SPA_HTML += r"""
       });
 
       // Description & Description Embeds
-      $('detail-desc-editor').style.display = 'none';
-      $('detail-desc-rendered').style.display = 'block';
       $('detail-desc-rendered').innerHTML = renderMarkdown(iss.description || '', iss);
-      $('detail-desc-textarea').value = iss.description || '';
+      if (sameOpenIssue && $('detail-desc-editor').style.display !== 'none') {
+        $('detail-desc-editor').style.display = 'block';
+        $('detail-desc-rendered').style.display = 'none';
+      } else {
+        $('detail-desc-editor').style.display = 'none';
+        $('detail-desc-rendered').style.display = 'block';
+        $('detail-desc-textarea').value = iss.description || '';
+      }
       $('detail-desc-embeds-bar').innerHTML = (iss.description_embeds || []).map((emb) => `
         <span class="badge">
           ${esc(emb.filename)} (${esc(emb.id)})
@@ -7971,12 +8174,12 @@ SPA_HTML += r"""
       $('detail-attachments-list').innerHTML = (iss.attachments || []).map((att) => {
         const dlUrl = `/api/v1/issues/${encodeURIComponent(iss.key)}/attachments/${encodeURIComponent(att.id)}/download`;
         return `
-          <div class="issue-att-row" data-att-id="${esc(att.id)}" style="display:flex;justify-content:space-between;align-items:center;background:var(--bg-card);padding:6px 8px;border-radius:5px;">
-            <div>
-              <strong class="mono">${esc(att.id)}</strong> ${esc(att.filename)}
+          <div class="issue-att-row" data-att-id="${esc(att.id)}" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;background:var(--bg-card);padding:6px 8px;border-radius:5px;">
+            <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0;">
+              <strong class="mono">${esc(att.id)}</strong> <span>${esc(att.filename)}</span>
               <span style="color:var(--text-muted);font-size:11px;">(${att.size_bytes} B, ${esc(att.mime_type)})</span>
             </div>
-            <div style="display:flex;gap:5px;">
+            <div style="display:flex;gap:6px;flex-wrap:wrap;">
               ${att.is_image
                 ? `<button class="btn btn-sm btn-att-lightbox" data-src="${dlUrl}" data-name="${esc(att.filename)}">Preview Image</button>`
                 : `<button class="btn btn-sm btn-att-preview" data-id="${esc(att.id)}" data-src="${dlUrl}">Preview</button>`}
@@ -8226,7 +8429,11 @@ SPA_HTML += r"""
     $('btn-clear-components').addEventListener('click', () => patchIssue({ clear_components: true }));
     $('btn-clear-cf').addEventListener('click', () => patchIssue({ clear_fields: true }));
     $('btn-clear-ac').addEventListener('click', () => patchIssue({ clear_ac: true }));
-    $('btn-clear-desc').addEventListener('click', () => patchIssue({ clear_desc: true }));
+    $('btn-clear-desc').addEventListener('click', () => {
+      $('detail-desc-editor').style.display = 'none';
+      $('detail-desc-rendered').style.display = 'block';
+      patchIssue({ clear_desc: true });
+    });
 
     $('btn-add-cf').addEventListener('click', () => {
       const k = $('detail-cf-key').value.trim();
@@ -8237,14 +8444,21 @@ SPA_HTML += r"""
     });
 
     $('btn-edit-desc').addEventListener('click', () => {
+      $('detail-desc-textarea').value = (appState.activeIssue && appState.activeIssue.description) || '';
       $('detail-desc-rendered').style.display = 'none';
       $('detail-desc-editor').style.display = 'block';
     });
     $('btn-cancel-desc').addEventListener('click', () => {
+      $('detail-desc-textarea').value = (appState.activeIssue && appState.activeIssue.description) || '';
       $('detail-desc-editor').style.display = 'none';
       $('detail-desc-rendered').style.display = 'block';
     });
-    $('btn-save-desc').addEventListener('click', () => patchIssue({ description: $('detail-desc-textarea').value }));
+    $('btn-save-desc').addEventListener('click', () => {
+      const nextDesc = $('detail-desc-textarea').value;
+      $('detail-desc-editor').style.display = 'none';
+      $('detail-desc-rendered').style.display = 'block';
+      patchIssue({ description: nextDesc });
+    });
 
     $('detail-desc-embed-input').addEventListener('change', async (e) => {
       if (!appState.activeIssue || !e.target.files || !e.target.files.length) return;
